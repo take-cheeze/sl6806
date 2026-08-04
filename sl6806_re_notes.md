@@ -105,8 +105,32 @@ This is the header the bootloader's `sdupdate` validates (`header pass`/`mark pa
 - **(inferred)** ~0x5862 bytes are copied to SRAM at 0x00804C00 (vectors + startup);
   the bulk runs XIP from `0x00C10000+`.
 
-**Open thread:** finish decoding this header + find the "mark" magic and which CRC
-covers the app body, to produce a valid SD-update file (the no-USB install channel).
+**RESOLVED — the SD-update (`.up`) format.** Decoded from the HLKJ bootloader,
+which *is* stored verbatim in flash (file 0x60 → `0x0081FC00`; file + 0x81FBA0
+= address). Validator at `0x00824110`, file is `0:\update.up` /
+`0:\restore.up`:
+
+| Offset | Field | Check |
+|---|---|---|
+| +0x00 | `"CONFIG"` | `memcmp(file, "CONFIG", 5)` — header magic |
+| +0x06 | u32 | `codeOffsetInByte`, added to `partition_start` |
+| +0x16 | `"SL6806"` | `memcmp(file+22, "SL6806", 6)` — **the "mark"** |
+| +0x20 | u32 | `partition_start`, defaults to `0x3000` if zero |
+
+Flow: read 512-byte header → magic → `header pass` → mark → `mark pass` →
+compare timestamp (equal ⇒ skip the update) → length check → erase
+`((len)>>12)+1` 4 KB blocks → write → verify.
+
+**The body CRC is a write-verify, not a stored field.** `crc cmp %x %x`
+compares two CRC16s the bootloader computes itself (both init `0xFFFF`): one
+over the data read from the file, one over the data read back from flash. So
+nothing in the payload needs a precomputed checksum.
+
+**Still open:** the boot-time FIRM loader prints
+`firmware_header_len ... loadCrc 0x%x`, implying a `loadCrc` check at boot, but
+that code was not found — those format strings appear nowhere as 32-bit
+pointers in the bootloader image (unlike `CONFIG` and `restore.up`, which do),
+so they are dead strings. Whether `loadCrc` is verified at boot is unresolved.
 
 ## 7. UI framework: "w10 xframe" over LVGL
 

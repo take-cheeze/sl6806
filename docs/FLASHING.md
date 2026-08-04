@@ -7,10 +7,48 @@ this framework works in payload mode.** Use it.
 This document is about the other path: replacing the vendor application in the
 FIRM partition so your code runs standalone, off USB.
 
-## Current status: unproven
+## The SD-update format is now decoded
 
-`tools/sl6806-pack` will build you an image. Nobody has booted one. The
-blocker is that the FIRM application header is only partly decoded:
+The bootloader's `sdupdate` path - the no-USB install channel - has been read
+out of the HLKJ bootloader, which unlike the application is stored verbatim in
+flash (file `0x60` -> `0x0081FC00`, so file + `0x81FBA0` = address). The
+validation function is at `0x00824110`.
+
+An update file is `0:\update.up` (or `0:\restore.up` for a forced restore) on
+the card. The checks it must pass, in order:
+
+| Offset | Field | Check |
+|---|---|---|
+| +0x00 | `"CONFIG"` | `memcmp(file, "CONFIG", 5)` — the header magic |
+| +0x06 | u32 `codeOffsetInByte` | added to `partition_start` to locate the payload |
+| +0x16 | `"SL6806"` | `memcmp(file+22, "SL6806", 6)` — **the "mark"** |
+| +0x20 | u32 `partition_start` | defaults to `0x3000` when zero |
+
+The bootloader reads a 512-byte header block, checks the magic, prints
+`header pass`, checks the mark, prints `mark pass`, then compares the file's
+timestamp against the installed one: **matching timestamps skip the update**
+(`time is not same` is the message on the path that proceeds).
+
+**There is no body checksum to precompute.** The `crc cmp %x %x` message
+compares two CRC16s that the bootloader computes itself - one over the data it
+read from the file, one over what it read back from flash, both starting at
+`0xFFFF`. It is a write-verify, not a stored field. That removes what looked
+like the hardest obstacle: nothing in the payload has to be signed or
+checksummed in advance.
+
+Still open: the boot-time path that loads FIRM from flash prints
+`firmware_header_len ... loadCrc 0x%x`, which implies a `loadCrc` field is
+checked at boot. That code was not located - those format strings appear
+nowhere as pointers in the bootloader image, so they are dead strings from a
+build where the code was compiled out or relocated. Whether a running system
+verifies `loadCrc` is therefore unresolved.
+
+## Writing FIRM directly: still unproven
+
+`tools/sl6806-pack` will build you an image. Nobody has booted one. It patches
+the FIRM partition directly rather than going through `update.up`, so the
+decode above does not yet apply to it. The application header it writes is
+only partly understood:
 
 | Offset | Field | Status |
 |---|---|---|
