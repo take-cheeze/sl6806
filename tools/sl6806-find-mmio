@@ -1,17 +1,24 @@
 #!/usr/bin/env python3
 """
-sl6806-find-mmio - suggest candidate peripheral base addresses in a dump.
+sl6806-find-mmio - find candidate peripheral base addresses in a dump.
 
-The SL6806 peripheral map is unknown, which is the one thing blocking GPIO,
-ADC and PWM in this framework. This narrows the search.
+The SL6806 peripheral map is unknown, which is what blocks GPIO, ADC and PWM.
+This narrows the search.
 
-The idea: Cortex-M code reaches a peripheral by loading its base address from
-a literal pool (`ldr rN, [pc, #imm]`) and then using fixed offsets. So a
-peripheral base shows up as a 32-bit constant that (a) is word-aligned in the
-image, (b) does not point into ROM, SRAM or flash - those are data pointers,
-not MMIO - and (c) repeats, because many functions touch the same block.
+HOW IT WORKS
+Cortex-M code cannot embed an arbitrary 32-bit constant in an instruction, so
+a peripheral base always arrives through a PC-relative load - `LDR Rn,[PC,#x]`
+- pointing at a literal pool. This decodes those instructions and follows them
+to the pool, so every candidate it reports is a constant the code genuinely
+loads.
 
-This is a ranking heuristic, not an answer. It tells you where to point
+WHY NOT JUST SCAN FOR 32-BIT WORDS: because Thumb-2 instructions are two or
+four bytes, and reading aligned words out of a code section mostly yields
+instruction encodings. `0x46202000` looks like a tidy peripheral base but is
+really `mov r0,r4; movs r0,#0` - one of the most common instruction pairs
+there is. Scanning raw words produces a confident, completely wrong ranking.
+
+This is still a ranking heuristic, not an answer. It tells you where to point
 Ghidra. Confirm anything it suggests by reading the code around the hits, then
 on hardware with examples/MmioProbe.
 
@@ -24,16 +31,18 @@ import collections
 import struct
 import sys
 
-# Known non-MMIO windows (see cores/sl6806/sl6806.h).
+FLASH_BASE = 0x00C00000
+FIRM_OFF = 0x010000
+FIRM_SIZE = 0x1B80D0
+
+# Known non-MMIO windows (see cores/sl6806/sl6806.h). A constant landing in
+# one of these is a pointer, not a peripheral.
 KNOWN = [
     (0x00000000, 0x00080000, "mask ROM"),
     (0x00800000, 0x00840000, "SRAM"),
     (0x00C00000, 0x01000000, "flash XIP"),
     (0xE0000000, 0xE0100000, "ARM core peripherals"),
 ]
-
-FIRM_OFF = 0x010000
-FIRM_SIZE = 0x1B80D0
 
 
 def classify(addr):
@@ -43,59 +52,89 @@ def classify(addr):
     return None
 
 
+def iter_literal_loads(blob, base):
+    """Yield (instr_addr, literal_addr) for every Thumb PC-relative load.
+
+    Two encodings cover essentially all of them:
+      T1  LDR Rt,[PC,#imm8*4]     0100 1ttt iiii iiii
+      T2  LDR.W Rt,[PC,#+/-imm12] 1111 1000 U101 1111 | tttt iiii iiii iiii
+    In both, PC reads as (instruction address + 4) rounded down to a word.
+    """
+    n = len(blob)
+    for off in range(0, n - 3, 2):
+        hw = blob[off] | (blob[off + 1] << 8)
+
+        if 0x4800 <= hw <= 0x4FFF:              # T1
+            imm = (hw & 0xFF) * 4
+            pc = (base + off + 4) & ~3
+            yield base + off, pc + imm
+
+        elif hw in (0xF85F, 0xF8DF):            # T2, U=0 / U=1
+            hw2 = blob[off + 2] | (blob[off + 3] << 8)
+            imm = hw2 & 0x0FFF
+            pc = (base + off + 4) & ~3
+            yield base + off, (pc + imm) if hw == 0xF8DF else (pc - imm)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("dump")
     p.add_argument("--top", type=int, default=25, help="how many to show")
-    p.add_argument("--min-count", type=int, default=3,
-                   help="ignore constants seen fewer than this many times")
+    p.add_argument("--min-count", type=int, default=2,
+                   help="ignore constants loaded fewer than this many times")
+    p.add_argument("--all", action="store_true",
+                   help="also list constants inside known ROM/SRAM/flash "
+                        "windows (normally filtered out as pointers)")
     p.add_argument("--whole-file", action="store_true",
-                   help="scan the entire file instead of just the FIRM "
-                        "partition (FIRM is where the code is)")
+                   help="scan the entire file rather than just FIRM")
     args = p.parse_args()
 
     with open(args.dump, "rb") as f:
         data = f.read()
 
     if args.whole_file:
-        blob, base = data, 0
+        blob, base = data, FLASH_BASE
     else:
         if len(data) < FIRM_OFF + 0x1000:
             sys.exit("error: file is too short to contain FIRM; use "
                      "--whole-file if this is not a full flash dump")
         blob = data[FIRM_OFF:FIRM_OFF + FIRM_SIZE]
-        base = FIRM_OFF
+        base = FLASH_BASE + FIRM_OFF
 
+    lo, hi = base, base + len(blob)
     counts = collections.Counter()
-    for off in range(0, len(blob) - 3, 4):
-        (word,) = struct.unpack_from("<I", blob, off)
-        if word == 0 or word == 0xFFFFFFFF:
+    loads = 0
+
+    for _instr, lit in iter_literal_loads(blob, base):
+        if not (lo <= lit < hi - 3):
             continue
-        # A peripheral base is page-ish aligned. Requiring the low 8 bits to
-        # be clear throws away most string pointers and immediates.
-        if word & 0xFF:
+        loads += 1
+        (word,) = struct.unpack_from("<I", blob, lit - base)
+        if word in (0, 0xFFFFFFFF):
             continue
-        if classify(word):
+        if not args.all and classify(word):
             continue
         counts[word] += 1
+
+    print("decoded %d PC-relative loads; %d distinct constants outside the "
+          "known windows\n" % (loads, len(counts)))
 
     if not counts:
         print("no candidates found - is this a real dump? "
               "(run tools/sl6806-checkdump)")
         return 1
 
-    # Group into 4 KiB blocks: several registers in the same peripheral often
-    # appear as several nearby constants.
+    # Group into 4 KiB blocks: a peripheral usually shows up as several
+    # nearby constants rather than one.
     blocks = collections.Counter()
     for addr, n in counts.items():
         blocks[addr & 0xFFFFF000] += n
 
     print("Candidate peripheral blocks (4 KiB granularity), most-referenced "
-          "first.")
-    print("These are guesses ranked by how often the code loads them.\n")
-    print("  %-12s %-7s  %s" % ("block", "refs", "distinct addresses in it"))
-    print("  %-12s %-7s  %s" % ("-" * 12, "-" * 7, "-" * 40))
+          "first:\n")
+    print("  %-12s %-6s  %s" % ("block", "loads", "distinct addresses in it"))
+    print("  %-12s %-6s  %s" % ("-" * 12, "-" * 6, "-" * 44))
 
     shown = 0
     for block, n in blocks.most_common():
@@ -105,7 +144,10 @@ def main():
         desc = " ".join("0x%08X" % a for a in members[:4])
         if len(members) > 4:
             desc += " (+%d)" % (len(members) - 4)
-        print("  0x%08X   %-7d  %s" % (block, n, desc))
+        note = ""
+        if args.all and classify(block):
+            note = "   [%s]" % classify(block)
+        print("  0x%08X   %-6d  %s%s" % (block, n, desc, note))
         shown += 1
         if shown >= args.top:
             break
