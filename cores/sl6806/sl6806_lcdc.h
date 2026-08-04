@@ -132,41 +132,63 @@
 /*
  * THE COMMAND LIST
  *
- * The descriptor is a list of 32-bit word pairs built in SRAM - at
- * 0x00829908 in the application, on the stack in the bootloader - by the
- * builder at 0x00827E?? (bootloader) / 0x00D3E728 (application). Layout as
- * read from the bootloader:
+ * The list is built in SRAM - at 0x00829908 in the application, at
+ * 0x0082ED9C in the bootloader - by the builder at 0x00827E18 (bootloader) /
+ * 0x00D3E728 (application), whose signature is (x0, x1, y0, y1).
  *
- *   +0x00  opcode              +0x04  3
- *   +0x08  opcode              +0x0C  operand
- *   +0x10  column window, coordinates byte-swapped into big-endian pairs
- *   +0x14  opcode              +0x18  opcode
- *   +0x1C  3                   +0x20  operand
- *   +0x24  MADCTL value << 8   (config byte 0x0E)
- *   +0x28  row window, same packing
- *   +0x2C  opcode
- *   +0x30  opcode chosen by interface type (1, 2 or 3)
+ * [V] It is a sequence of variable-length records, each introduced by a tag
+ * word, and terminated by 0xFFFFFFFC. The one the bootloader emits for a
+ * windowed pixel write is:
+ *
+ *   +0x00  CDCD6203     tag
+ *   +0x04  3            payload length - 1  (a window is 4 bytes)
+ *   +0x08  desc[0x09]
+ *   +0x0C  desc[0x0D] << 8
+ *   +0x10  column window: bswap16(x0) | bswap16(x1-1) << 16
+ *   +0x14  ABAB0005     end of record
+ *   +0x18  CDCD6203     tag
+ *   +0x1C  3
+ *   +0x20  desc[0x09]
+ *   +0x24  desc[0x0E] << 8
+ *   +0x28  row window: bswap16(y0) | bswap16(y1-1) << 16
+ *   +0x2C  ABAB0005
+ *   +0x30  CDCD0A03     tag, chosen by interface type - see below
  *   +0x34  pixel count - 1
- *   +0x38  0x32                (also byte +0x0C of the panel descriptor)
- *   +0x3C  config byte 0x0B << 8
- *   +0x40  0xFFFFFFFC
+ *   +0x38  0x32         also byte +0x0C of the panel descriptor
+ *   +0x3C  desc[0x0B] << 8
+ *   +0x40  FFFFFFFC     end of list
  *
- * Transfers longer than 0x10000 pixels take a second branch that emits a
- * longer list ending at +0x50, so the controller has a 64 K element limit
- * per entry.
+ * So the shape is `<tag> <len-1> <a> <b> [inline payload] <ABAB0005>`, with
+ * the byte-swapping being exactly what CASET and RASET want. That the length
+ * word is 3 for a 4-byte window and count-1 for the pixel record is what
+ * pins it down as a length.
  *
- * [?] The opcodes themselves are not decoded. The observed values are
- * 0xABAB0005 and 0xCDCDxx03 / 0xCDCDxx02 with xx in
- * {0x0A, 0x12, 0x8A, 0x92, 0x9A, 0x62, 0x08, 0x18}; the two 16-bit halves
- * are clearly a tag and a small field, but which is which, and whether the
- * low byte is a length or a register index, is guesswork until someone can
- * watch the bus.
+ * [I] The tags are structured. The pixel-write tag is
+ *
+ *     0xCDCD_(0x0A + 8*(type-1))_03      transfers up to 0x10000 elements
+ *     0xCDCD_(0x8A + 8*(type-1))_03      the long form
+ *     0xCDCD_(0x08 + 8*(type-1))_02      the long form's second record
+ *
+ * for interface type 1, 2 or 3 - so bits of the middle byte select the
+ * interface and bit 7 selects the long form, and the low byte is a small
+ * opcode (2, 3, 5). Transfers over 0x10000 elements take the long branch and
+ * emit a list ending at +0x50, so that is the per-record limit.
+ *
+ * [?] What is NOT decoded: what the tag's low byte actually means, and the
+ * `a`/`b` fields. `b` is a descriptor byte shifted left 8 and differs between
+ * the two window records (desc[0x0D] vs desc[0x0E]), which is the shape a
+ * command opcode would have - but the panel descriptor the *application*
+ * uses keeps CASET/RASET at +0x11/+0x12, not +0x0D/+0x0E, so either the
+ * bootloader's descriptor has a different layout or these are not command
+ * bytes. Do not guess: the two readings differ by whether the controller or
+ * the driver emits the DCS opcode.
  *
  * WHAT IS STILL NEEDED FOR A WORKING BUS
- *   1. Decode the opcodes above.
- *   2. The config struct the vendor passes to HAL_lcdc_module_init: 20
- *      bytes, byte 0 = interface type, bytes 1..4 = 9, and a 0x300 halfword
- *      at +6. Its meaning per byte is only partly known.
+ *   1. Resolve the `b` field above, which is the difference between "write a
+ *      window" and "write a window preceded by the wrong command".
+ *   2. The config struct passed to HAL_lcdc_module_init: 20 bytes, byte 0 =
+ *      interface type, bytes 1..4 = 9, a 0x300 halfword at +6. Only partly
+ *      understood.
  *   3. The clock setup in sl6806_cru.h, which is understood but untested.
  * None of that can be finished from a flash dump alone - it needs a device
  * and a logic analyser, or the mask ROM (docs/DUMPING.md).

@@ -415,15 +415,31 @@ Register map (offsets from `0x400D9000`), read out of the bootloader:
 **That answers the old open thread.** The handoff is: build the descriptor,
 store its address to `+0x88`, set `+0x80` bit 0, set `+0x84` bit 0.
 
-The command list is word pairs built by `0x00827E??` (bootloader) /
-`0x00D3E728` (application): opcode/operand pairs, the column and row windows
-byte-swapped into big-endian as CASET/RASET need, MADCTL, then pixel count − 1
-and `0x32`. Transfers over `0x10000` pixels take a longer variant, so that is
-the per-entry limit.
+The command list is built by `0x00827E18` (bootloader, signature
+`(x0, x1, y0, y1)`) / `0x00D3E728` (application). It is a sequence of
+variable-length records terminated by `0xFFFFFFFC`, each shaped
 
-**Still undecoded:** the opcodes themselves — `0xABAB0005` and `0xCDCDxx03` /
-`0xCDCDxx02` with `xx` ∈ {0A, 12, 8A, 92, 9A, 62, 08, 18} — and most of the
-20-byte config struct. Full map in `cores/sl6806/sl6806_lcdc.h`.
+```
+<tag> <length-1> <a> <b> [inline payload] 0xABAB0005
+```
+
+For a windowed pixel write: two records carrying the column and row windows,
+byte-swapped into big-endian pairs exactly as CASET and RASET want, then one
+record whose length field is the pixel count − 1. The length reading is
+pinned down by the window records, whose length word is 3 for a 4-byte
+payload.
+
+The tags are structured: `0xCDCD_(0x0A + 8*(type−1))_03` for a transfer up to
+`0x10000` elements, `0x8A + 8*(type−1)` for the long form, where type is the
+interface type 1–3. Over `0x10000` elements the builder takes a second branch
+emitting a longer list, so that is the per-record limit.
+
+**Still undecoded:** the tag's low byte, the `a`/`b` fields — `b` is a
+descriptor byte shifted left 8 and differs between the two window records,
+which is the shape a command opcode would have, but the offsets it reads
+(`+0x0D`, `+0x0E`) are not where the application's descriptor keeps
+CASET/RASET — and most of the 20-byte config struct. Full map in
+`cores/sl6806/sl6806_lcdc.h`.
 
 ## 12. Next actions (pick up here)
 
