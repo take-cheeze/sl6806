@@ -2,3 +2,6 @@ build/
 *.o
 *.elf
 *.map
+tests/host/test_console
+tests/host/test_gfx
+tests/host/*.ppm

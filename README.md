@@ -33,13 +33,15 @@ so it is worth being precise about which parts are real:
 |---|---|
 | Build → link → load → run | **Works.** Verified end to end; entry lands at 0x820000 with the correct Thumb entry. |
 | `setup()` / `loop()` | **Works.** Driven from the boot ROM's idle callback so USB stays alive. |
-| `Serial` (print, printf, String, Stream) | **Works.** Over a RAM ring buffer polled by `make monitor` — there is no UART. |
+| `Serial` — bidirectional USB serial | **Works.** Print, printf, String, Stream, and `Serial.read()` from an interactive monitor. Not a UART: see below. |
 | `millis()` / `micros()` / `delay()` | **Works**, but scaled by an unverified clock — see below. |
 | Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~38 KB heap in payload mode, ~190 KB in firmware mode. |
 | Flash image format (HLKJ, CRC16, partitions) | **Works.** Both CRCs verify and round-trip. |
+| Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM. |
+| Getting those pixels onto the LCD | **Not yet.** Needs one panel driver — see [docs/LCD.md](docs/LCD.md). |
 | `pinMode` / `digitalWrite` / `digitalRead` | **Not yet.** The GPIO registers are unknown. Calls report instead of silently doing nothing. |
 | `analogRead` / `analogWrite` | **Not yet.** Same reason. |
-| LCD, audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
+| Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
 Two honest caveats worth reading before you trust output:
@@ -64,6 +66,45 @@ digital call prints:
 
 That is deliberate. A GPIO API that quietly does nothing costs you an
 afternoon debugging your wiring.
+
+### Serial is not a UART
+
+This chip has no known debug UART, and in payload mode the boot ROM owns the
+only USB link. So `Serial` is a pair of ring buffers in the sketch's RAM,
+serviced by a vendor SCSI command the sketch answers from inside the ROM's USB
+loop. `tools/sl6806-monitor` drives it with the stock `smtlink_dump`.
+
+Output is one USB round trip per poll, and the device reports exactly how many
+bytes were lost if polling fell behind — those appear as `[lost output]`
+rather than a silently mangled stream. Typing in the monitor feeds
+`Serial.read()`, so sketches can be interactive.
+
+### The display draws, but nothing shows yet
+
+`Screen` is a complete graphics stack — framebuffer, primitives, text, and a
+`Print` interface so `Screen.print(x)` works like `Serial.print(x)`. It is
+verified natively (`make -C tests/host`), including clipping and the font.
+
+What is missing is the panel driver: one `sl6806_panel_t` struct giving the
+controller, resolution, bus and init sequence. Those facts live in the stock
+firmware's `lv_lcd_init` at `0x00D3E34C`, so they need a real dump.
+[docs/LCD.md](docs/LCD.md) walks through extracting them. Until then drawing
+works and lands in RAM — you can build and test a UI now, and it will appear
+the moment the driver exists.
+
+## Testing
+
+The hardware-independent parts of the core are tested natively, under
+AddressSanitizer and UBSan:
+
+```sh
+make -C tests/host
+```
+
+This covers the console ring (wrapping, overflow accounting, framing) and all
+drawing primitives (clipping, shapes, text). `tests/host/host_stub.h` is
+force-included so core sources compile for the host without a single `#ifdef`
+for testing. The graphics test also writes `gfx_demo.ppm` for visual checks.
 
 ## Getting started
 
@@ -163,19 +204,22 @@ In rough order of how much they unlock:
    finding the PLL registers does it exactly.
 3. **The FIRM header's mark field and body CRC** — makes standalone firmware
    possible, and yields the SD-update format as a safer install channel.
-4. **The LCD** — `lv_lcd_init` at `0x00D3E34C` in the stock image is the
-   vendor porting layer, and the highest-value single function in the dump.
+4. **The panel driver** — everything above it is written and tested, so
+   `lv_lcd_init` at `0x00D3E34C` is the highest-value single function left in
+   the dump. See [docs/LCD.md](docs/LCD.md).
 
 ## Layout
 
 ```
 cores/sl6806/     the core: Arduino.h, Print/Stream/String, timing, GPIO HAL,
-                  startup for both modes, boot ROM ABI
+                  USB serial, startup for both modes, boot ROM ABI
+cores/sl6806/gfx/ framebuffer, font, panel interface, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, ClockCalibrate, MmioProbe
-docs/             DUMPING.md, FLASHING.md
+examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe
+tests/host/       native tests for console + graphics
+docs/             DUMPING.md, FLASHING.md, LCD.md
 3rd/              smartlink_flash submodule
 ```
 

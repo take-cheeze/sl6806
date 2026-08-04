@@ -46,12 +46,12 @@ void sl6806_run_loop(void);
 
 static int payload_scsi_cb(uint8_t *cdb)
 {
-    uint32_t len;
-    uint8_t *addr;
+    uint32_t len, addr;
 
     /* Not a vendor command, or not ours: hand it back so the ROM applies its
      * own handling. This is what keeps read_flash/write_mem working while a
-     * sketch is resident. */
+     * sketch is resident, and it is what lets the monitor push input with
+     * write_mem. */
     if (cdb[0] != SL6806_SCSI_VENDOR_OP)
         return SL6806_USB_ERROR;
 
@@ -59,12 +59,25 @@ static int payload_scsi_cb(uint8_t *cdb)
         return SL6806_USB_ERROR;
 
     len  = *(uint32_t *)(cdb + 2);
-    addr = *(uint8_t **)(cdb + 6);
+    addr = *(uint32_t *)(cdb + 6);
 
     if (len > SL6806_USB_RET_BUF_SIZE)
         return SL6806_USB_ERROR;
 
-    rom_memcpy(SL6806_USB_RET_BUF, addr, len);
+    /* The sentinel address means "console poll", not "read this memory". It
+     * is far outside any valid SL6806 address, so a genuine read can never
+     * land here by accident. One round trip fetches the data and consumes
+     * it, which a plain memory read cannot do. */
+    if (addr == SL6806_CONSOLE_POLL_ADDR) {
+        sl6806_console_pkt_t pkt;
+
+        sl6806_console_poll(&pkt);
+        rom_memcpy(SL6806_USB_RET_BUF, &pkt, sizeof(pkt));
+        SL6806_USB_RET_LEN = sizeof(pkt);
+        return SL6806_USB_DATA;
+    }
+
+    rom_memcpy(SL6806_USB_RET_BUF, (const void *)addr, len);
     SL6806_USB_RET_LEN = (uint16_t)len;
     return SL6806_USB_DATA;
 }
