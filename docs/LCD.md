@@ -94,8 +94,12 @@ An RGB565 framebuffer costs `width * height * 2` bytes:
 |---|---|---|---|
 | 128x64 | 16 KB | yes | yes |
 | 160x128 | 40 KB | no | yes |
-| 240x135 | 63 KB | no | yes |
+| **240x296 (this board)** | **139 KB** | **no** | yes |
 | 320x240 | 150 KB | no | yes |
+
+At 240x296 a full framebuffer is 139 KB. That rules it out in payload mode
+entirely, and leaves little room in firmware mode, so band rendering is the
+realistic approach on this board rather than an optimisation.
 
 Payload mode has the whole 64 KB window for code *and* data, so a full-screen
 buffer is out of reach for anything but a small panel. Render a band and push

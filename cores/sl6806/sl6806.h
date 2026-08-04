@@ -49,10 +49,25 @@ extern "C" {
 #define SL6806_ROM_SCRATCH     0x003FB000u  /* [V] */
 #define SL6806_ROM_TRAMPOLINE  0x00800E81u  /* [V] thumb entry used with it */
 
-/* Peripheral MMIO region. NOT established for this SoC - see hal_gpio.h.
- * 0x40000000 is only the ARM-recommended peripheral window, and this SoC
- * already ignores the recommended code/SRAM windows, so do not assume it. */
-/* #define SL6806_PERIPH_BASE  [?] unknown */
+/* Peripheral MMIO region. Established by decoding every PC-relative load in
+ * the stock FIRM image (tools/sl6806-find-mmio): the constants the code
+ * actually loads cluster tightly in 0x4000_0000, and the LCD driver's
+ * register accesses land there. Individual peripherals within it are still
+ * being identified. */
+#define SL6806_PERIPH_BASE     0x40000000u  /* [V] */
+
+/* LCD controller. Found by cross-referencing the MMIO candidates against the
+ * stock LCD code: these four registers are read-modify-written by functions
+ * called from lv_lcd_init's op table. Bit 15 of +0x64 and +0x74 gates the
+ * controller (cleared, delayed, then set again on reset); +0x10C carries a
+ * field at 0xF10 plus a start bit 0. The DMA descriptor programming lives in
+ * RAM-resident code that is not present in the flash image, so the sequence
+ * that actually moves pixels is still unknown - see docs/LCD.md. */
+#define SL6806_LCDC_BASE       0x40080000u  /* [V] */
+#define SL6806_LCDC_CTRL0      (SL6806_LCDC_BASE + 0x064u)  /* [V] bit15 enable */
+#define SL6806_LCDC_CTRL1      (SL6806_LCDC_BASE + 0x074u)  /* [V] bit15 enable */
+#define SL6806_LCDC_CFG        (SL6806_LCDC_BASE + 0x10Cu)  /* [V] bit0 start */
+#define SL6806_LCDC_REG120     (SL6806_LCDC_BASE + 0x120u)  /* [V] purpose unknown */
 
 /* ------------------------------------------------------------------ */
 /* Flash layout (partition table lives at flash offset 0x0000F000)      */
@@ -68,7 +83,18 @@ extern "C" {
 #define SL6806_PICS_SIZE       0x000E447Cu  /* [V] */
 #define SL6806_PICS_ADDR       0x00DDB000u  /* [V] */
 #define SL6806_FONT_OFF        0x002C0000u  /* [V] glyph data */
+#define SL6806_FONT_SIZE       0x000CA39Cu  /* [V] */
 #define SL6806_FONT_ADDR       0x00EC0000u  /* [V] */
+/* The partition table declares 5 entries, not 3. TONE and PSMP were missed in
+ * earlier analysis; PSMP is 16 KiB with a trailer word of 4 rather than a
+ * checksum, so it is plausibly settings/NVRAM - the one region worth
+ * preserving if you ever rewrite flash. */
+#define SL6806_TONE_OFF        0x003F9000u  /* [V] */
+#define SL6806_TONE_SIZE       0x00001571u  /* [V] */
+#define SL6806_TONE_ADDR       0x00FF9000u  /* [V] */
+#define SL6806_PSMP_OFF        0x003FC000u  /* [V] */
+#define SL6806_PSMP_SIZE       0x00004000u  /* [V] */
+#define SL6806_PSMP_ADDR       0x00FFC000u  /* [V] */
 
 /* ------------------------------------------------------------------ */
 /* Cortex-M4 core peripherals - architectural, identical on every M4 [A] */
