@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+sl6806-monitor - serial monitor for a running SL6806 sketch.
+
+There is no UART to open. The sketch writes into a ring buffer in its own RAM
+(see cores/sl6806/sl6806_console.h) and this polls that buffer over USB with
+the stock tool's read_mem2 command, which the sketch's own SCSI handler
+serves. So "Serial" here is really "read the device's memory in a loop".
+
+The buffer's address is not hardcoded: the build writes it to <sketch>.sym and
+this reads it from there.
+
+    tools/sl6806-monitor build/Blink.sym
+
+The device must still be in bootloader mode with the sketch resident. Nothing
+here writes to the device unless you pass --send.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+
+MAGIC = 0x36384C53          # "SL68"
+HDR_FMT = "<IIIIII"         # magic, size, head, rx_head, rx_tail, version
+HDR_LEN = struct.calcsize(HDR_FMT)
+RX_LEN = 256
+
+
+def find_tool(explicit):
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in [os.path.join(here, "..", "3rd", "smartlink_flash", "smtlink_dump"),
+              shutil.which("smtlink_dump") or ""]:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    sys.exit("error: smtlink_dump not found; pass --tool <path>")
+
+
+def console_addr_from_sym(path):
+    """Read the console address out of the .sym file the build emits."""
+    with open(path) as f:
+        for line in f:
+            m = re.match(r"([0-9a-fA-F]+)\s+\S+\s+_sl6806_console", line)
+            if m:
+                return int(m.group(1), 16)
+    sys.exit("error: no _sl6806_console symbol in %s (was the sketch built "
+             "by this framework?)" % path)
+
+
+class Device:
+    def __init__(self, tool, sudo):
+        self.tool = tool
+        self.sudo = sudo
+        self.tmp = tempfile.mkdtemp(prefix="sl6806mon.")
+
+    def _run(self, args):
+        cmd = (["sudo"] if self.sudo else []) + [self.tool, "chip", "6806"] + args
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def read(self, addr, size):
+        """Read `size` bytes of device memory, or None on failure."""
+        if size <= 0:
+            return b""
+        out = os.path.join(self.tmp, "r.bin")
+        r = self._run(["read_mem2", hex(addr), hex(size), out])
+        if r.returncode != 0 or not os.path.isfile(out):
+            return None
+        with open(out, "rb") as f:
+            data = f.read()
+        return data if len(data) == size else None
+
+    def write(self, addr, data):
+        src = os.path.join(self.tmp, "w.bin")
+        with open(src, "wb") as f:
+            f.write(data)
+        r = self._run(["write_mem", hex(addr), "0", hex(len(data)), src])
+        return r.returncode == 0
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("sym", help="the .sym file emitted next to the build")
+    p.add_argument("--tool", help="path to smtlink_dump")
+    p.add_argument("--no-sudo", action="store_true")
+    p.add_argument("--interval", type=float, default=0.2,
+                   help="seconds between polls (default 0.2)")
+    p.add_argument("--send", metavar="TEXT",
+                   help="push TEXT to the sketch's Serial input once, then "
+                        "keep monitoring")
+    args = p.parse_args()
+
+    addr = console_addr_from_sym(args.sym)
+    dev = Device(find_tool(args.tool), not args.no_sudo)
+
+    print("monitoring console at 0x%08x (ctrl-c to stop)" % addr,
+          file=sys.stderr)
+
+    last_head = None
+    warned_wait = False
+
+    while True:
+        hdr = dev.read(addr, HDR_LEN)
+        if hdr is None:
+            if not warned_wait:
+                print("(no response from device - is it in bootloader mode "
+                      "with the sketch loaded?)", file=sys.stderr)
+                warned_wait = True
+            time.sleep(args.interval)
+            continue
+
+        magic, size, head, rx_head, rx_tail, _ver = struct.unpack(HDR_FMT, hdr)
+
+        if magic != MAGIC:
+            if not warned_wait:
+                print("(waiting for the sketch to initialise its console...)",
+                      file=sys.stderr)
+                warned_wait = True
+            time.sleep(args.interval)
+            continue
+        warned_wait = False
+
+        if args.send is not None:
+            payload = args.send.encode() + b"\n"
+            if len(payload) > RX_LEN:
+                payload = payload[:RX_LEN]
+            # Write the bytes first, then publish them by bumping rx_head -
+            # same ordering the device uses on its side.
+            off = addr + HDR_LEN + size
+            pos = rx_head % RX_LEN
+            if pos + len(payload) <= RX_LEN:
+                ok = dev.write(off + pos, payload)
+            else:
+                split = RX_LEN - pos
+                ok = (dev.write(off + pos, payload[:split]) and
+                      dev.write(off, payload[split:]))
+            if ok:
+                dev.write(addr + 12, struct.pack("<I", rx_head + len(payload)))
+            else:
+                print("(send failed)", file=sys.stderr)
+            args.send = None
+
+        if last_head is None:
+            # Start from what is already buffered, capped at one bufferful.
+            last_head = max(0, head - size)
+
+        if head == last_head:
+            time.sleep(args.interval)
+            continue
+
+        pending = head - last_head
+        if pending > size:
+            # The sketch outran our polling and overwrote data. Say so rather
+            # than printing a silently corrupted stream.
+            print("\n[monitor: lost %d bytes - device outran the poll rate]"
+                  % (pending - size), file=sys.stderr)
+            last_head = head - size
+            pending = size
+
+        start = last_head % size
+        if start + pending <= size:
+            data = dev.read(addr + HDR_LEN + start, pending)
+        else:
+            first = size - start
+            a = dev.read(addr + HDR_LEN + start, first)
+            b = dev.read(addr + HDR_LEN, pending - first)
+            data = (a + b) if (a is not None and b is not None) else None
+
+        if data is None:
+            time.sleep(args.interval)
+            continue
+
+        sys.stdout.write(data.decode("utf-8", errors="replace"))
+        sys.stdout.flush()
+        last_head = head
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(file=sys.stderr)

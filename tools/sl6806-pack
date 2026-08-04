@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+sl6806-pack - build a flashable image by patching a known-good dump.
+
+=======================================================================
+ THIS PRODUCES AN IMAGE THAT HAS NOT BEEN PROVEN TO BOOT
+=======================================================================
+The FIRM application header is only partly decoded. These fields are known:
+
+    +0x00  header length   (0x30)
+    +0x04  build timestamp (compared by the SD-update path)
+    +0x10  loadToRam
+    +0x14  runFrom (Thumb, so entry|1)
+    +0x1C  length copied to RAM
+
+but the "mark" field the bootloader validates, and which CRC covers the
+application body, are NOT. So this tool cannot synthesise a header from
+nothing. Instead it takes your existing dump as a template and changes only
+the fields it understands, leaving every unknown byte exactly as the vendor
+left it. That is the best that can be done honestly today, and it still may
+not satisfy a check we have not found yet.
+
+Flashing is recoverable - USB download mode is in mask ROM, not in flash - but
+only if you can re-enter bootloader mode and write your golden dump back.
+Read docs/FLASHING.md first. The payload workflow (`make upload`) needs none
+of this and cannot brick anything.
+
+    tools/sl6806-pack --template dump.bin --firm build/Blink.bin -o new.bin
+"""
+
+import argparse
+import struct
+import sys
+
+FIRM_OFF = 0x010000
+FIRM_MAX = 0x1B80D0
+HDR_LEN = 0x30
+DEFAULT_LOAD = 0x00804C00
+
+
+def crc16_ccitt_false(buf, crc=0xFFFF):
+    for b in buf:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def repack_hlkj(fw):
+    """Recompute the HLKJ bootloader CRCs. Verified recipe - payload CRC
+    first, header CRC last, because the header CRC covers the payload CRC."""
+    seglen = struct.unpack_from("<I", fw, 0x10)[0]
+    struct.pack_into("<I", fw, 0x14, crc16_ccitt_false(fw[0x60:0x60 + seglen]))
+    struct.pack_into("<I", fw, 0x5C, crc16_ccitt_false(fw[0x00:0x5C]))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--template", required=True,
+                   help="a known-good 4 MiB dump to patch")
+    p.add_argument("--firm", required=True,
+                   help="firmware .bin from `make MODE=firmware`")
+    p.add_argument("-o", "--output", required=True)
+    p.add_argument("--load", type=lambda s: int(s, 0), default=DEFAULT_LOAD,
+                   help="RAM load address (default 0x%08X, must match "
+                        "ld/sl6806_firmware.ld)" % DEFAULT_LOAD)
+    p.add_argument("--timestamp", type=lambda s: int(s, 0),
+                   help="build stamp to write at +0x04 (default: template's "
+                        "value plus one, so the SD-update path sees a change)")
+    args = p.parse_args()
+
+    with open(args.template, "rb") as f:
+        fw = bytearray(f.read())
+    with open(args.firm, "rb") as f:
+        app = f.read()
+
+    if len(fw) < FIRM_OFF + HDR_LEN:
+        sys.exit("error: template is too small to be a flash image")
+    if fw[:4] != b"HLKJ":
+        sys.exit("error: template does not start with HLKJ - run "
+                 "tools/sl6806-checkdump on it first")
+
+    total = HDR_LEN + len(app)
+    if total > FIRM_MAX:
+        sys.exit("error: firmware is %d bytes; FIRM holds at most %d"
+                 % (total, FIRM_MAX - HDR_LEN))
+
+    old_ts = struct.unpack_from("<I", fw, FIRM_OFF + 0x04)[0]
+    ts = args.timestamp if args.timestamp is not None else (old_ts + 1) & 0xFFFFFFFF
+
+    # Keep the vendor header and overwrite only the understood fields.
+    hdr = bytearray(fw[FIRM_OFF:FIRM_OFF + HDR_LEN])
+    struct.pack_into("<I", hdr, 0x00, HDR_LEN)
+    struct.pack_into("<I", hdr, 0x04, ts)
+    struct.pack_into("<I", hdr, 0x10, args.load)
+    struct.pack_into("<I", hdr, 0x14, args.load | 1)     # Thumb entry
+    struct.pack_into("<I", hdr, 0x1C, len(app))
+
+    fw[FIRM_OFF:FIRM_OFF + HDR_LEN] = hdr
+    fw[FIRM_OFF + HDR_LEN:FIRM_OFF + HDR_LEN + len(app)] = app
+
+    # The bootloader partition is untouched, but recompute its CRCs anyway so
+    # the output is self-consistent if you later patch it.
+    repack_hlkj(fw)
+
+    with open(args.output, "wb") as f:
+        f.write(fw)
+
+    print("wrote %s" % args.output)
+    print("  FIRM header : len=0x%02X ts=0x%08X (was 0x%08X)"
+          % (HDR_LEN, ts, old_ts))
+    print("  loadToRam   : 0x%08X" % args.load)
+    print("  runFrom     : 0x%08X" % (args.load | 1))
+    print("  body        : %d bytes" % len(app))
+    print()
+    print("UNVERIFIED. The header's mark field and body CRC are not decoded,")
+    print("so the bootloader may reject this. Before flashing, confirm you")
+    print("can re-enter bootloader mode and write %s back."
+          % args.template)
+
+
+if __name__ == "__main__":
+    main()

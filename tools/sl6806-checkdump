@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""
+sl6806-checkdump - tell you whether a flash dump is actually a flash dump.
+
+A failed SL6806 dump does not look like an error. The tool exits 0 and writes
+a file of exactly the size you asked for, but the device answered every read
+with whatever was already in its USB buffer. The result is a plausible-looking
+binary full of repeated SCSI replies. Run this before spending any time
+analysing a dump.
+
+    tools/sl6806-checkdump dump.bin
+
+Checks, in order of how much time they save you:
+  1. Is the whole file one short block repeated? (the classic failed dump)
+  2. Does it start with the HLKJ bootloader magic?
+  3. Do the HLKJ header and payload CRC16s verify?
+  4. Is the partition table where it should be, naming FIRM/PICS/FONT?
+  5. Is the size right for this chip? (SL6806 is 4 MiB)
+"""
+
+import argparse
+import hashlib
+import sys
+
+FLASH_SIZE = 4 * 1024 * 1024
+HLKJ_MAGIC = b"HLKJ"
+PART_TABLE_OFF = 0x0F000
+
+
+def crc16_ccitt_false(buf, crc=0xFFFF):
+    """poly 0x1021, init 0xFFFF, no reflection, no final xor."""
+    for b in buf:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+class Report:
+    def __init__(self):
+        self.fatal = False
+
+    def ok(self, msg):
+        print("  \033[32mok\033[0m    %s" % msg)
+
+    def warn(self, msg):
+        print("  \033[33mwarn\033[0m  %s" % msg)
+
+    def bad(self, msg):
+        print("  \033[31mFAIL\033[0m  %s" % msg)
+        self.fatal = True
+
+
+def check_repetition(data, r):
+    """The failed-dump signature: the entire file is one block, repeated."""
+    for block in (0x40, 0x200, 0x1000):
+        if len(data) <= block:
+            continue
+        first = data[:block]
+        if data == first * (len(data) // block) + first[:len(data) % block]:
+            r.bad("the entire file is a %d-byte block repeated %d times."
+                  % (block, len(data) // block))
+            printable = bytes(c if 32 <= c < 127 else 46 for c in first[:64])
+            print("        the repeated block is: %r" % printable.decode())
+            if b"SMTLINK" in first or b"SSTLINK" in first:
+                print()
+                print("        That block is a SCSI INQUIRY reply, not flash "
+                      "content. The device")
+                print("        never performed a read: it answered every "
+                      "request with its identity")
+                print("        string. This dump contains no firmware at all.")
+                print()
+                print("        Almost always one of:")
+                print("          - the device was in CARD READER mode "
+                      "(dump from bootloader mode)")
+                print("          - the chip type was not selected "
+                      "(pass `chip 6806`)")
+                print("          - the wrong --id was given for this chip")
+                print()
+                print("        See docs/DUMPING.md for the command that works.")
+            return True
+
+    # Weaker signal: very few distinct sectors.
+    sectors = {}
+    for i in range(0, len(data), 0x1000):
+        sectors[hashlib.md5(data[i:i + 0x1000]).digest()] = 1
+    n = len(data) // 0x1000
+    if n and len(sectors) < max(2, n // 100):
+        r.bad("only %d distinct 4 KiB sectors in %d - this is not a real dump."
+              % (len(sectors), n))
+        return True
+
+    r.ok("content varies across the file (not a stuck-response dump)")
+    return False
+
+
+def check_hlkj(data, r):
+    if len(data) < 0x60 or data[:4] != HLKJ_MAGIC:
+        r.bad("no HLKJ magic at offset 0 - this is not an SL6806 flash image "
+              "(or the dump starts at the wrong offset)")
+        return
+    r.ok("HLKJ bootloader magic at offset 0")
+
+    import struct
+    load, entry, hlen = struct.unpack_from("<III", data, 4)
+    seglen = struct.unpack_from("<I", data, 0x10)[0]
+    seg_crc = struct.unpack_from("<I", data, 0x14)[0] & 0xFFFF
+    hdr_crc = struct.unpack_from("<I", data, 0x5C)[0] & 0xFFFF
+
+    print("        load=0x%08X entry=0x%08X hdrlen=0x%X seglen=0x%X"
+          % (load, entry, hlen, seglen))
+
+    calc = crc16_ccitt_false(data[0x00:0x5C])
+    if calc == hdr_crc:
+        r.ok("HLKJ header CRC16 verifies (0x%04X)" % calc)
+    else:
+        r.bad("HLKJ header CRC16 is 0x%04X, header says 0x%04X"
+              % (calc, hdr_crc))
+
+    if 0x60 + seglen <= len(data):
+        calc = crc16_ccitt_false(data[0x60:0x60 + seglen])
+        if calc == seg_crc:
+            r.ok("HLKJ payload CRC16 verifies (0x%04X)" % calc)
+        else:
+            r.bad("HLKJ payload CRC16 is 0x%04X, header says 0x%04X"
+                  % (calc, seg_crc))
+    else:
+        r.bad("HLKJ segment length 0x%X runs past the end of the file" % seglen)
+
+
+def check_partitions(data, r):
+    if len(data) < PART_TABLE_OFF + 0x200:
+        r.warn("file is too short to contain the partition table")
+        return
+
+    table = data[PART_TABLE_OFF:PART_TABLE_OFF + 0x200]
+    found = [n for n in (b"FIRM", b"PICS", b"FONT") if n in table]
+
+    if len(found) == 3:
+        r.ok("partition table at 0x%05X names FIRM, PICS and FONT"
+             % PART_TABLE_OFF)
+    elif found:
+        r.warn("partition table at 0x%05X names only %s"
+               % (PART_TABLE_OFF, b", ".join(found).decode()))
+    else:
+        r.bad("no FIRM/PICS/FONT names at 0x%05X - partition table missing"
+              % PART_TABLE_OFF)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("dump")
+    args = p.parse_args()
+
+    with open(args.dump, "rb") as f:
+        data = f.read()
+
+    print("checking %s (%d bytes)" % (args.dump, len(data)))
+    r = Report()
+
+    if len(data) == FLASH_SIZE:
+        r.ok("size is 4 MiB, the full SL6806 flash")
+    elif len(data) < FLASH_SIZE:
+        r.warn("size is %.2f MiB; SL6806 flash is 4 MiB, so this is partial. "
+               "PICS starts at 0x1DB000 and FONT at 0x2C0000, so a short dump "
+               "silently loses them." % (len(data) / 1048576.0))
+    else:
+        r.warn("size is larger than the 4 MiB SL6806 flash")
+
+    if check_repetition(data, r):
+        print("\nverdict: THIS DUMP IS NOT USABLE.")
+        return 1
+
+    check_hlkj(data, r)
+    check_partitions(data, r)
+
+    print()
+    if r.fatal:
+        print("verdict: this dump has real problems - do not trust analysis "
+              "based on it.")
+        return 1
+
+    print("verdict: looks like a valid SL6806 flash image.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""
+sl6806-find-mmio - suggest candidate peripheral base addresses in a dump.
+
+The SL6806 peripheral map is unknown, which is the one thing blocking GPIO,
+ADC and PWM in this framework. This narrows the search.
+
+The idea: Cortex-M code reaches a peripheral by loading its base address from
+a literal pool (`ldr rN, [pc, #imm]`) and then using fixed offsets. So a
+peripheral base shows up as a 32-bit constant that (a) is word-aligned in the
+image, (b) does not point into ROM, SRAM or flash - those are data pointers,
+not MMIO - and (c) repeats, because many functions touch the same block.
+
+This is a ranking heuristic, not an answer. It tells you where to point
+Ghidra. Confirm anything it suggests by reading the code around the hits, then
+on hardware with examples/MmioProbe.
+
+    tools/sl6806-find-mmio dump.bin
+    tools/sl6806-find-mmio dump.bin --top 40
+"""
+
+import argparse
+import collections
+import struct
+import sys
+
+# Known non-MMIO windows (see cores/sl6806/sl6806.h).
+KNOWN = [
+    (0x00000000, 0x00080000, "mask ROM"),
+    (0x00800000, 0x00840000, "SRAM"),
+    (0x00C00000, 0x01000000, "flash XIP"),
+    (0xE0000000, 0xE0100000, "ARM core peripherals"),
+]
+
+FIRM_OFF = 0x010000
+FIRM_SIZE = 0x1B80D0
+
+
+def classify(addr):
+    for lo, hi, name in KNOWN:
+        if lo <= addr < hi:
+            return name
+    return None
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("dump")
+    p.add_argument("--top", type=int, default=25, help="how many to show")
+    p.add_argument("--min-count", type=int, default=3,
+                   help="ignore constants seen fewer than this many times")
+    p.add_argument("--whole-file", action="store_true",
+                   help="scan the entire file instead of just the FIRM "
+                        "partition (FIRM is where the code is)")
+    args = p.parse_args()
+
+    with open(args.dump, "rb") as f:
+        data = f.read()
+
+    if args.whole_file:
+        blob, base = data, 0
+    else:
+        if len(data) < FIRM_OFF + 0x1000:
+            sys.exit("error: file is too short to contain FIRM; use "
+                     "--whole-file if this is not a full flash dump")
+        blob = data[FIRM_OFF:FIRM_OFF + FIRM_SIZE]
+        base = FIRM_OFF
+
+    counts = collections.Counter()
+    for off in range(0, len(blob) - 3, 4):
+        (word,) = struct.unpack_from("<I", blob, off)
+        if word == 0 or word == 0xFFFFFFFF:
+            continue
+        # A peripheral base is page-ish aligned. Requiring the low 8 bits to
+        # be clear throws away most string pointers and immediates.
+        if word & 0xFF:
+            continue
+        if classify(word):
+            continue
+        counts[word] += 1
+
+    if not counts:
+        print("no candidates found - is this a real dump? "
+              "(run tools/sl6806-checkdump)")
+        return 1
+
+    # Group into 4 KiB blocks: several registers in the same peripheral often
+    # appear as several nearby constants.
+    blocks = collections.Counter()
+    for addr, n in counts.items():
+        blocks[addr & 0xFFFFF000] += n
+
+    print("Candidate peripheral blocks (4 KiB granularity), most-referenced "
+          "first.")
+    print("These are guesses ranked by how often the code loads them.\n")
+    print("  %-12s %-7s  %s" % ("block", "refs", "distinct addresses in it"))
+    print("  %-12s %-7s  %s" % ("-" * 12, "-" * 7, "-" * 40))
+
+    shown = 0
+    for block, n in blocks.most_common():
+        if n < args.min_count:
+            break
+        members = sorted(a for a in counts if a & 0xFFFFF000 == block)
+        desc = " ".join("0x%08X" % a for a in members[:4])
+        if len(members) > 4:
+            desc += " (+%d)" % (len(members) - 4)
+        print("  0x%08X   %-7d  %s" % (block, n, desc))
+        shown += 1
+        if shown >= args.top:
+            break
+
+    print("\nNext step: open the dump in Ghidra (Raw Binary, ARM:LE:32:Cortex,")
+    print("base 0x00C00000) and look at what reads and writes these. GPIO")
+    print("looks like a set of registers at a small fixed stride where one is")
+    print("written with (1 << pin) and another is read back.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
