@@ -49,14 +49,16 @@ so it is worth being precise about which parts are real:
 Two honest caveats worth reading before you trust output:
 
 **The CPU clock is a guess.** `F_CPU` defaults to 120 MHz as a placeholder.
-Nothing in the dump establishes the real frequency, so every `delay()` and
-`millis()` is off by one constant ratio. It is a single scale factor —
+The clock and reset unit has since been found at `0x40080000`, but it holds
+dividers and gates, not a PLL multiplier, and nothing in the dump establishes
+the crystal frequency. So every `delay()` and `millis()` is still off by one
+constant ratio. It is a single scale factor —
 `make SKETCH=examples/ClockCalibrate run`, time it with a stopwatch, then
 build with `F_CPU=<measured>` and all timing is correct.
 
-**GPIO needs one of two holes filled in.** The driver is complete; what is
-missing is either the register addresses or a way to reach the vendor's own
-GPIO routine.
+**GPIO has one hole, with two ways to fill it.** The driver is complete;
+what is missing is either the register addresses or a way to reach the
+vendor's own GPIO routine.
 
 The stock firmware never writes a GPIO register — it calls
 `gpio_write(id, value)` at `0x00811C7C` with a packed pin id, from code that
@@ -266,7 +268,7 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe
+examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe
 tests/host/       native tests for console, graphics and the panel
 docs/             DUMPING.md, FLASHING.md, LCD.md
 3rd/              smartlink_flash submodule
