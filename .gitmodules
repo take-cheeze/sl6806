@@ -1,0 +1,3 @@
+[submodule "3rd/smartlink_flash"]
+	path = 3rd/smartlink_flash
+	url = https://github.com/ilyakurdyukov/smartlink_flash.git
