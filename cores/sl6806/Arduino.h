@@ -115,6 +115,9 @@ template <typename T> inline const T &sl_max(const T &a, const T &b) { return a 
 #include "Stream.h"
 #include "WString.h"
 #include "HardwareSerial.h"
+#include "gfx/Framebuffer.h"
+#include "gfx/Panel.h"
+#include "gfx/Display.h"
 
 #else /* C */
 

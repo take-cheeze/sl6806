@@ -34,10 +34,11 @@ VARIANT_DIR := variants/$(BOARD)
 # ---------------------------------------------------------------- sources
 CORE_C   := $(CORE_DIR)/wiring_time.c $(CORE_DIR)/wiring_digital.c \
             $(CORE_DIR)/hal_gpio.c $(CORE_DIR)/sl6806_console.c \
-            $(CORE_DIR)/syscalls.c
+            $(CORE_DIR)/syscalls.c \
+            $(CORE_DIR)/gfx/Framebuffer.c $(CORE_DIR)/gfx/font5x7.c
 CORE_CXX := $(CORE_DIR)/main.cpp $(CORE_DIR)/Print.cpp $(CORE_DIR)/Stream.cpp \
             $(CORE_DIR)/WString.cpp $(CORE_DIR)/HardwareSerial.cpp \
-            $(CORE_DIR)/cxx_support.cpp
+            $(CORE_DIR)/cxx_support.cpp $(CORE_DIR)/gfx/Display.cpp
 
 ifeq ($(MODE),firmware)
 CORE_C  += $(CORE_DIR)/startup_firmware.c

@@ -1,35 +1,51 @@
 #!/usr/bin/env python3
 """
-sl6806-monitor - serial monitor for a running SL6806 sketch.
+sl6806-monitor - interactive serial monitor for a running SL6806 sketch.
 
-There is no UART to open. The sketch writes into a ring buffer in its own RAM
-(see cores/sl6806/sl6806_console.h) and this polls that buffer over USB with
-the stock tool's read_mem2 command, which the sketch's own SCSI handler
-serves. So "Serial" here is really "read the device's memory in a loop".
-
-The buffer's address is not hardcoded: the build writes it to <sketch>.sym and
-this reads it from there.
+There is no UART to open. The sketch answers a vendor SCSI command from
+inside the boot ROM's USB loop; this drives that command with the stock
+smtlink_dump. See cores/sl6806/sl6806_console.h for the protocol.
 
     tools/sl6806-monitor build/Blink.sym
 
-The device must still be in bootloader mode with the sketch resident. Nothing
-here writes to the device unless you pass --send.
+Output is fetched one USB round trip per poll, and the device reports how many
+bytes were lost if polling fell behind - those show up as a [lost N bytes]
+marker rather than a silently corrupted stream.
+
+Anything you type is sent to the sketch's Serial.read(). Ctrl-C to quit.
+
+The device must still be in bootloader mode with the sketch resident. Without
+--send or typed input, this only reads.
 """
 
 import argparse
 import os
 import re
+import select
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import tty
 
 MAGIC = 0x36384C53          # "SL68"
-HDR_FMT = "<IIIIII"         # magic, size, head, rx_head, rx_tail, version
+VERSION = 2
+POLL_ADDR = 0x434F4E53      # "CONS" - the console-poll sentinel
+
+# struct sl6806_console_t header: magic,size,version,head,tail,dropped,
+#                                 rx_head,rx_tail
+HDR_FMT = "<IIIIIIII"
 HDR_LEN = struct.calcsize(HDR_FMT)
-RX_LEN = 256
+
+# struct sl6806_console_pkt_t: len,flags,pending,data[60]
+PKT_FMT = "<BBH60s"
+PKT_LEN = struct.calcsize(PKT_FMT)
+
+F_OVERFLOW = 0x01
+RX_SIZE = 256
 
 
 def find_tool(explicit):
@@ -44,14 +60,17 @@ def find_tool(explicit):
 
 
 def console_addr_from_sym(path):
-    """Read the console address out of the .sym file the build emits."""
-    with open(path) as f:
-        for line in f:
-            m = re.match(r"([0-9a-fA-F]+)\s+\S+\s+_sl6806_console", line)
-            if m:
-                return int(m.group(1), 16)
-    sys.exit("error: no _sl6806_console symbol in %s (was the sketch built "
-             "by this framework?)" % path)
+    """Read the console address from the .sym file the build emits."""
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r"([0-9a-fA-F]+)\s+\S+\s+_sl6806_console", line)
+                if m:
+                    return int(m.group(1), 16)
+    except OSError as e:
+        sys.exit("error: %s" % e)
+    sys.exit("error: no _sl6806_console symbol in %s (was the sketch built by "
+             "this framework?)" % path)
 
 
 class Device:
@@ -65,10 +84,14 @@ class Device:
         return subprocess.run(cmd, capture_output=True, text=True)
 
     def read(self, addr, size):
-        """Read `size` bytes of device memory, or None on failure."""
+        """Read device memory, or None on failure."""
         if size <= 0:
             return b""
         out = os.path.join(self.tmp, "r.bin")
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
         r = self._run(["read_mem2", hex(addr), hex(size), out])
         if r.returncode != 0 or not os.path.isfile(out):
             return None
@@ -83,6 +106,74 @@ class Device:
         r = self._run(["write_mem", hex(addr), "0", hex(len(data)), src])
         return r.returncode == 0
 
+    def poll_console(self):
+        """One round trip: fetch and consume queued output.
+
+        Returns (data, overflowed, pending) or None if the device did not
+        answer."""
+        raw = self.read(POLL_ADDR, PKT_LEN)
+        if raw is None or len(raw) != PKT_LEN:
+            return None
+        n, flags, pending, data = struct.unpack(PKT_FMT, raw)
+        if n > 60:
+            return None
+        return data[:n], bool(flags & F_OVERFLOW), pending
+
+
+def push_input(dev, base, hdr_size, text):
+    """Append bytes to the rx ring, then publish them by bumping rx_head."""
+    payload = text.encode() if isinstance(text, str) else text
+    if not payload:
+        return True
+    if len(payload) > RX_SIZE:
+        payload = payload[-RX_SIZE:]
+
+    hdr = dev.read(base, HDR_LEN)
+    if hdr is None:
+        return False
+    magic, size, version, _h, _t, _d, rx_head, rx_tail = struct.unpack(HDR_FMT, hdr)
+    if magic != MAGIC:
+        return False
+
+    # Do not overrun input the sketch has not consumed yet.
+    if (rx_head - rx_tail) + len(payload) > RX_SIZE:
+        return False
+
+    rx_off = base + hdr_size + size
+    pos = rx_head % RX_SIZE
+
+    if pos + len(payload) <= RX_SIZE:
+        ok = dev.write(rx_off + pos, payload)
+    else:
+        split = RX_SIZE - pos
+        ok = (dev.write(rx_off + pos, payload[:split]) and
+              dev.write(rx_off, payload[split:]))
+    if not ok:
+        return False
+
+    # rx_head is the 7th u32 in the header.
+    return dev.write(base + 24, struct.pack("<I", rx_head + len(payload)))
+
+
+def wait_for_console(dev, base, quiet):
+    """Block until the sketch has published a valid console header."""
+    warned = False
+    while True:
+        hdr = dev.read(base, HDR_LEN)
+        if hdr is not None:
+            magic, size, version = struct.unpack_from("<III", hdr)
+            if magic == MAGIC:
+                if version != VERSION:
+                    sys.exit("error: sketch console is v%d, this monitor "
+                             "speaks v%d - rebuild the sketch"
+                             % (version, VERSION))
+                return size
+        if not warned and not quiet:
+            print("(waiting for the device - is it in bootloader mode with "
+                  "the sketch loaded?)", file=sys.stderr)
+            warned = True
+        time.sleep(0.3)
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__,
@@ -90,100 +181,75 @@ def main():
     p.add_argument("sym", help="the .sym file emitted next to the build")
     p.add_argument("--tool", help="path to smtlink_dump")
     p.add_argument("--no-sudo", action="store_true")
-    p.add_argument("--interval", type=float, default=0.2,
-                   help="seconds between polls (default 0.2)")
+    p.add_argument("--interval", type=float, default=0.1,
+                   help="seconds between polls when idle (default 0.1)")
     p.add_argument("--send", metavar="TEXT",
-                   help="push TEXT to the sketch's Serial input once, then "
-                        "keep monitoring")
+                   help="send TEXT (plus newline) once, then keep monitoring")
+    p.add_argument("--no-input", action="store_true",
+                   help="do not forward what you type to the sketch")
     args = p.parse_args()
 
-    addr = console_addr_from_sym(args.sym)
+    base = console_addr_from_sym(args.sym)
     dev = Device(find_tool(args.tool), not args.no_sudo)
 
-    print("monitoring console at 0x%08x (ctrl-c to stop)" % addr,
+    print("monitoring console at 0x%08x (ctrl-c to quit)" % base,
           file=sys.stderr)
 
-    last_head = None
-    warned_wait = False
+    size = wait_for_console(dev, base, quiet=False)
 
-    while True:
-        hdr = dev.read(addr, HDR_LEN)
-        if hdr is None:
-            if not warned_wait:
-                print("(no response from device - is it in bootloader mode "
-                      "with the sketch loaded?)", file=sys.stderr)
-                warned_wait = True
-            time.sleep(args.interval)
-            continue
+    if args.send is not None:
+        if not push_input(dev, base, HDR_LEN, args.send + "\n"):
+            print("(send failed)", file=sys.stderr)
 
-        magic, size, head, rx_head, rx_tail, _ver = struct.unpack(HDR_FMT, hdr)
+    interactive = (not args.no_input) and sys.stdin.isatty()
+    old_termios = None
+    if interactive:
+        old_termios = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
 
-        if magic != MAGIC:
-            if not warned_wait:
-                print("(waiting for the sketch to initialise its console...)",
-                      file=sys.stderr)
-                warned_wait = True
-            time.sleep(args.interval)
-            continue
-        warned_wait = False
+    pending_in = b""
 
-        if args.send is not None:
-            payload = args.send.encode() + b"\n"
-            if len(payload) > RX_LEN:
-                payload = payload[:RX_LEN]
-            # Write the bytes first, then publish them by bumping rx_head -
-            # same ordering the device uses on its side.
-            off = addr + HDR_LEN + size
-            pos = rx_head % RX_LEN
-            if pos + len(payload) <= RX_LEN:
-                ok = dev.write(off + pos, payload)
-            else:
-                split = RX_LEN - pos
-                ok = (dev.write(off + pos, payload[:split]) and
-                      dev.write(off, payload[split:]))
-            if ok:
-                dev.write(addr + 12, struct.pack("<I", rx_head + len(payload)))
-            else:
-                print("(send failed)", file=sys.stderr)
-            args.send = None
+    try:
+        while True:
+            got = dev.poll_console()
 
-        if last_head is None:
-            # Start from what is already buffered, capped at one bufferful.
-            last_head = max(0, head - size)
+            if got is None:
+                time.sleep(args.interval)
+                continue
 
-        if head == last_head:
-            time.sleep(args.interval)
-            continue
+            data, overflowed, pending = got
 
-        pending = head - last_head
-        if pending > size:
-            # The sketch outran our polling and overwrote data. Say so rather
-            # than printing a silently corrupted stream.
-            print("\n[monitor: lost %d bytes - device outran the poll rate]"
-                  % (pending - size), file=sys.stderr)
-            last_head = head - size
-            pending = size
+            if overflowed:
+                sys.stdout.write("\n[lost output - device outran the poll "
+                                 "rate]\n")
 
-        start = last_head % size
-        if start + pending <= size:
-            data = dev.read(addr + HDR_LEN + start, pending)
-        else:
-            first = size - start
-            a = dev.read(addr + HDR_LEN + start, first)
-            b = dev.read(addr + HDR_LEN, pending - first)
-            data = (a + b) if (a is not None and b is not None) else None
+            if data:
+                sys.stdout.write(data.decode("utf-8", errors="replace"))
+                sys.stdout.flush()
 
-        if data is None:
-            time.sleep(args.interval)
-            continue
+            # Collect anything typed, without blocking the poll loop.
+            if interactive:
+                while select.select([sys.stdin], [], [], 0)[0]:
+                    ch = os.read(sys.stdin.fileno(), 1)
+                    if not ch:
+                        break
+                    pending_in += b"\n" if ch == b"\r" else ch
 
-        sys.stdout.write(data.decode("utf-8", errors="replace"))
-        sys.stdout.flush()
-        last_head = head
+            if pending_in:
+                if push_input(dev, base, HDR_LEN, pending_in):
+                    pending_in = b""
+                # else: the sketch's input buffer is full; retry next poll.
+
+            # Keep fetching without pausing while output is still queued.
+            if pending == 0 and not data:
+                time.sleep(args.interval)
+
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+    finally:
+        if old_termios is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_termios)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(file=sys.stderr)
+    main()

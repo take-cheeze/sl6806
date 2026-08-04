@@ -41,9 +41,10 @@ void HardwareSerial::flush()
 
 int HardwareSerial::availableForWrite()
 {
-    /* The ring always accepts data - it overwrites the oldest bytes rather
-     * than blocking, so the sketch is never stalled by a slow host. */
-    return SL6806_CONSOLE_SIZE;
+    /* Free space before the ring starts overwriting its oldest bytes. Writes
+     * never block regardless - a sketch must not stall because nobody is
+     * running the monitor - so this is advisory. */
+    return sl6806_console_space();
 }
 
 size_t HardwareSerial::write(uint8_t c)

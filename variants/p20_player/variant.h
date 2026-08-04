@@ -26,6 +26,33 @@
 #define SL6806_VARIANT_NAME "p20_player"
 
 /*
+ * Display geometry, read out of the stock firmware's panel descriptor
+ * (flash 0x00C519FC). See variants/p20_player/panel.c for the full decode.
+ * These are real values - size your framebuffers with them - even though the
+ * panel driver's flush path is not implemented yet.
+ */
+#define SL6806_PANEL_WIDTH     240   /* [V] */
+#define SL6806_PANEL_HEIGHT    296   /* [V] */
+#define SL6806_PANEL_X_OFFSET  0     /* [V] */
+#define SL6806_PANEL_Y_OFFSET  12    /* [V] */
+
+/* MIPI DCS commands the panel answers. [V] from the same descriptor. */
+#define SL6806_DCS_SLPIN       0x10
+#define SL6806_DCS_SLPOUT      0x11
+#define SL6806_DCS_DISPOFF     0x28
+#define SL6806_DCS_DISPON      0x29
+#define SL6806_DCS_CASET       0x2A
+#define SL6806_DCS_RASET       0x2B
+#define SL6806_DCS_RAMWR       0x2C
+#define SL6806_DCS_RAMRD       0x2E
+#define SL6806_DCS_MADCTL      0x36
+
+/* Panel reset line. The vendor code calls its GPIO writer with this pin id
+ * and the sequence high / 10ms / low / 20ms / high / 120ms. The encoding of
+ * the id is not yet understood, which is why GPIO is still unconfigured. */
+#define SL6806_PANEL_RESET_PIN_ID  0x13800   /* [V] as an opaque vendor id */
+
+/*
  * Named pins. These are placeholders: they are indices into an empty pin
  * table, so using them reports "GPIO not configured" rather than driving a
  * pin. They exist so example sketches compile and so the names are in one

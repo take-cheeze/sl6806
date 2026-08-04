@@ -76,13 +76,18 @@ struct.pack_into('<I', fw, 0x14, crc16(fw[0x60:0x60+seglen]))  # payload CRC
 struct.pack_into('<I', fw, 0x5c, crc16(fw[0x00:0x5c]))         # header CRC (LAST)
 ```
 
-## 5. Partition table (file 0xf000)
+## 5. Partition table (file 0xf000) — CORRECTED: 5 entries, not 3
 
-| Name | Flash off | Run addr     | Size      | Contents |
-|------|-----------|--------------|-----------|----------|
-| FIRM | 0x010000  | `0x00C10000` | 0x1B80D0  | application code (**the target**) |
-| PICS | 0x1DB000  | `0x00DDB000` | 0x0E447C  | image/UI resources (data) |
-| FONT | 0x2C0000  | `0x00EC0000` | ~0xCA39C  | glyphs (data) |
+Header is `{u32 count=5; u32 3; u32 0x30; u32 0}` then 16-byte entries of
+`{char name[4]; u32 offset; u32 size; u32 trailer}`.
+
+| Name | Flash off | Run addr     | Size      | Trailer      | Contents |
+|------|-----------|--------------|-----------|--------------|----------|
+| FIRM | 0x010000  | `0x00C10000` | 0x1B80D0  | 0x17770000   | application code (**the target**) |
+| PICS | 0x1DB000  | `0x00DDB000` | 0x0E447C  | 0x71170000   | image/UI resources (data) |
+| FONT | 0x2C0000  | `0x00EC0000` | 0x0CA39C  | 0xBC590000   | glyphs (data) |
+| TONE | 0x3F9000  | `0x00FF9000` | 0x001571  | 0xFFA90000   | **(new)** tones/sound effects |
+| PSMP | 0x3FC000  | `0x00FFC000` | 0x004000  | 0x00000004   | **(new)** 16 KiB; trailer is 4, not a checksum — plausibly settings/NVRAM, so preserve it when rewriting flash |
 
 FIRM run range = **`0x00C10000` .. `0x00DC80D0`** (note DC, not CC).
 
@@ -100,8 +105,32 @@ This is the header the bootloader's `sdupdate` validates (`header pass`/`mark pa
 - **(inferred)** ~0x5862 bytes are copied to SRAM at 0x00804C00 (vectors + startup);
   the bulk runs XIP from `0x00C10000+`.
 
-**Open thread:** finish decoding this header + find the "mark" magic and which CRC
-covers the app body, to produce a valid SD-update file (the no-USB install channel).
+**RESOLVED — the SD-update (`.up`) format.** Decoded from the HLKJ bootloader,
+which *is* stored verbatim in flash (file 0x60 → `0x0081FC00`; file + 0x81FBA0
+= address). Validator at `0x00824110`, file is `0:\update.up` /
+`0:\restore.up`:
+
+| Offset | Field | Check |
+|---|---|---|
+| +0x00 | `"CONFIG"` | `memcmp(file, "CONFIG", 5)` — header magic |
+| +0x06 | u32 | `codeOffsetInByte`, added to `partition_start` |
+| +0x16 | `"SL6806"` | `memcmp(file+22, "SL6806", 6)` — **the "mark"** |
+| +0x20 | u32 | `partition_start`, defaults to `0x3000` if zero |
+
+Flow: read 512-byte header → magic → `header pass` → mark → `mark pass` →
+compare timestamp (equal ⇒ skip the update) → length check → erase
+`((len)>>12)+1` 4 KB blocks → write → verify.
+
+**The body CRC is a write-verify, not a stored field.** `crc cmp %x %x`
+compares two CRC16s the bootloader computes itself (both init `0xFFFF`): one
+over the data read from the file, one over the data read back from flash. So
+nothing in the payload needs a precomputed checksum.
+
+**Still open:** the boot-time FIRM loader prints
+`firmware_header_len ... loadCrc 0x%x`, implying a `loadCrc` check at boot, but
+that code was not found — those format strings appear nowhere as 32-bit
+pointers in the bootloader image (unlike `CONFIG` and `restore.up`, which do),
+so they are dead strings. Whether `loadCrc` is verified at boot is unresolved.
 
 ## 7. UI framework: "w10 xframe" over LVGL
 
@@ -135,6 +164,84 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
   photo_display/dict_play/fm_menu/share_menu/app_menu/screen_saver/setting_poweroff.
 - Music player entry points: `music_play.main` referenced from `0x00CDE6F8`,
   `0x00CDEE94`, `0x00CE62D0`.
+
+## 7b. Display — IDENTIFIED
+
+- **Panel: 240 x 296, drawn at offset (0, 12).** Descriptor in flash at
+  `0x00C519FC`, copied to SRAM `0x0081C1CC`. Layout:
+  `+00 u16 width=240, +02 u16 height=296, +04 u16 xoff=0, +06 u16 yoff=12,`
+  `+08 u8 mode=1, +0A u8 2, +0C u8 50, +0D u8 devid=2, +0E u8 0x0B,`
+  `+0F RAMWR 0x2C, +10 RAMRD 0x2E, +11 CASET 0x2A, +12 RASET 0x2B, +13 MADCTL 0x36,`
+  `+14 init=0x00D3F46D, +18 sleep=0x00D3F8CD, +1C wake=0x00D3F8F9,`
+  `+20 0x00D3F941, +24 0x00D3F925`
+  Found by scanning flash for `+17/+18 == 0x2A/0x2B`; exactly one match, and
+  its function pointers match the disassembled routines.
+- **Standard MIPI DCS panel** behind a **hardware LCDC with DMA**, not an RGB
+  scanout panel. Sleep = DISPOFF 0x28 / 10ms / SLPIN 0x10 / 120ms; wake =
+  SLPOUT 0x11 / 120ms / DISPON 0x29 / 10ms.
+- Vendor init at `0x00D3F46C` sends commands `0xFD`, `0x61`, `0x62` plus data,
+  so it is a vendor variant rather than a stock ST7789.
+- **LCDC MMIO base `0x40080000`.** `+0x64` and `+0x74` bit 15 gate the
+  controller (cleared, 100 delay units, set again). `+0x10C` clears field
+  `0xF10`, sets `0x910`, then sets bit 0. `+0x120` also touched.
+- Reset over GPIO id `0x13800`: high / 10ms / low / 20ms / high / 120ms
+  (`0x00D3E1A4`).
+- `lv_lcd_init` (`0x00D3E34C`) installs 8 ops into a struct at `0x008298B8`;
+  the resolution getter returns `[[0x008298B8]+0]` / `+2`.
+- `lcdc_set_descriptor` (`0x00D3E728`) builds a DMA descriptor in SRAM at
+  `0x00829908` using magic words `0xABAB0005`, `0xCDCD6203`, `0xCDCD0A03`,
+  packing coordinates big-endian as CASET/RASET require.
+
+**Open thread:** the code that hands the descriptor to the LCDC and starts it.
+
+## 7c. Peripheral map
+
+- **Peripheral MMIO region is `0x40000000`.** Established by decoding every
+  PC-relative literal load in FIRM (29696 of them). Candidate blocks by load
+  count: `0x40030000` (16-bit registers, heavily used), `0x40009000`,
+  `0x400E2000`, `0x40011000`, `0x40040000`, `0x40020000`, and the pair
+  `0x40028000`/`0x40029000` which share an offset pattern 0x1000 apart —
+  two instances of one peripheral.
+- Scanning raw 32-bit words does NOT work for this: Thumb-2 instruction
+  encodings dominate (`0x46202000` is `mov r0,r4; movs r0,#0`). Use
+  `tools/sl6806-find-mmio`, which decodes LDR-literal instructions.
+
+## 7d. RAM-resident code — the current blocker
+
+Several drivers live in SRAM and are **not** in the flash image at any linear
+offset:
+
+| Address | Role |
+|---|---|
+| `0x0080E842` | LCD write command (`r0`, devid, cmd) |
+| `0x0080E8D8` | LCD write data |
+| `0x00811C7C` | **GPIO write (pin id, value)** |
+| `0x008072E4`, `0x00807214` | delay |
+
+The FIRM header copies only `0x5862` bytes to `0x00804C00`; these are past
+that. A copy must exist — the flash panel descriptor at `0x00C519FC` contains
+a pointer to `0x0081C1FC`, its own SRAM destination plus 0x30. Finding that
+copy unlocks GPIO *and* the LCDC programming at once.
+
+**Two routes tried and eliminated:**
+
+1. *Dump SRAM off a running device* — **does not work.** In card-reader mode
+   the stock app services SCSI and does not implement the vendor read command:
+   `read_mem` → `LIBUSB_ERROR_PIPE` (endpoint stall), and the attempt resets
+   the device. Plain `inquiry` works, so the device is healthy; the app simply
+   refuses the command. (Unrelated but worth recording: fwupd probing was
+   causing the device to drop off USB ~1.3 s after enumerating. Stop fwupd
+   before doing any USB work with this board.)
+2. *Contiguous flash→RAM copy* — **ruled out.** A search over every 2-byte
+   offset for a delta mapping the known RAM entry points onto Thumb prologues
+   gives one candidate, verified as a false positive (the bytes are XIP code
+   at `0x00CE25DE`: 100% of BL targets valid there vs 28% under the
+   candidate). No aligned linker-style copy table exists either.
+
+So the RAM image is **not stored verbatim in flash** — likely compressed,
+assembled at runtime, or loaded from the card. Next: disassemble the
+0x5862-byte blob the FIRM header does copy to `0x00804C00` and follow its
+early init; a decompressor there would name its source.
 
 ## 8. LVGL — confirmed **v8.x**
 
@@ -184,8 +291,10 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
 
 ## 12. Next actions (pick up here)
 
-1. **Trace `lv_lcd_init` (`0x00D3E34C`)** → reconstruct `lv_disp_drv_t`: framebuffer
-   address, flush callback, panel resolution + color depth. Needed to draw anything.
+1. ~~Trace `lv_lcd_init`~~ **DONE** — see §7b. Panel is 240x296 at offset
+   (0,12), MIPI DCS behind an LCDC at `0x40080000`. What remains is the
+   descriptor-to-LCDC handoff, which needs the RAM-resident code (§7d).
+   Quickest route: dump SRAM off a running device.
 2. **Finish the FIRM/SD-update header** (§6): mark magic + body CRC → valid update file.
 3. **Enumerate vtable slots / message-id enum** via the central `__act_on_request`
    dispatcher (turns `method_20` + siblings into named methods across all scenes).

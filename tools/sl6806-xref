@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+sl6806-xref - find the code that loads a given constant.
+
+Cortex-M code reaches any 32-bit value - a peripheral base, a string, a
+struct - through a PC-relative load from a literal pool. So "who uses this
+address?" becomes "which LDR (literal) instructions point at a pool entry
+holding it", which is exactly what this decodes.
+
+    tools/sl6806-xref dump.bin 0x00C75CE3        # who references this string?
+    tools/sl6806-xref dump.bin --string lcdc_dma_write
+    tools/sl6806-xref dump.bin 0x40030000 --context 12
+
+With --string, the string is located first and then cross-referenced, which
+is the quickest way into a function: firmware here embeds __func__ names for
+its own logging, so a name string is usually loaded by the function it names.
+"""
+
+import argparse
+import struct
+import subprocess
+import sys
+
+FLASH_BASE = 0x00C00000
+FIRM_OFF = 0x010000
+FIRM_SIZE = 0x1B80D0
+
+
+def iter_literal_loads(blob, base):
+    """Yield (instr_addr, literal_addr) for Thumb PC-relative loads.
+
+      T1  LDR Rt,[PC,#imm8*4]     0100 1ttt iiii iiii
+      T2  LDR.W Rt,[PC,#+/-imm12] 1111 1000 U101 1111 | tttt iiii iiii iiii
+    PC reads as (instruction address + 4) rounded down to a word.
+    """
+    n = len(blob)
+    for off in range(0, n - 3, 2):
+        hw = blob[off] | (blob[off + 1] << 8)
+        if 0x4800 <= hw <= 0x4FFF:
+            yield base + off, ((base + off + 4) & ~3) + (hw & 0xFF) * 4
+        elif hw in (0xF85F, 0xF8DF):
+            hw2 = blob[off + 2] | (blob[off + 3] << 8)
+            imm = hw2 & 0x0FFF
+            pc = (base + off + 4) & ~3
+            yield base + off, (pc + imm) if hw == 0xF8DF else (pc - imm)
+
+
+def find_string(data, text):
+    """Return every address whose C string equals `text`."""
+    needle = text.encode() + b"\x00"
+    out, pos = [], 0
+    while True:
+        i = data.find(needle, pos)
+        if i < 0:
+            return out
+        # Must be the start of the string, not a suffix of a longer one.
+        if i == 0 or data[i - 1] == 0 or not (0x20 <= data[i - 1] < 0x7F):
+            out.append(FLASH_BASE + i)
+        pos = i + 1
+
+
+def disassemble(path, addr, count):
+    """Disassemble `count` instructions' worth of bytes around addr."""
+    start = addr & ~1
+    r = subprocess.run(
+        ["arm-none-eabi-objdump", "-D", "-b", "binary", "-m", "arm",
+         "-M", "force-thumb", "--adjust-vma=0x%X" % FLASH_BASE,
+         "--start-address=0x%X" % start,
+         "--stop-address=0x%X" % (start + count * 2)],
+        input=open(path, "rb").read(), capture_output=True)
+    lines = r.stdout.decode("utf-8", "replace").splitlines()
+    return [l for l in lines if l.strip() and ":\t" in l]
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("dump")
+    p.add_argument("value", nargs="?", help="constant to cross-reference")
+    p.add_argument("--string", help="find this C string, then xref it")
+    p.add_argument("--context", type=int, default=0,
+                   help="disassemble N instructions before each hit")
+    p.add_argument("--whole-file", action="store_true")
+    args = p.parse_args()
+
+    with open(args.dump, "rb") as f:
+        data = f.read()
+
+    targets = []
+    if args.string:
+        targets = find_string(data, args.string)
+        if not targets:
+            sys.exit("error: string %r not found" % args.string)
+        for a in targets:
+            print("string %r at 0x%08X" % (args.string, a))
+    elif args.value:
+        targets = [int(args.value, 0)]
+    else:
+        sys.exit("error: give a value or --string")
+
+    if args.whole_file:
+        blob, base = data, FLASH_BASE
+    else:
+        blob = data[FIRM_OFF:FIRM_OFF + FIRM_SIZE]
+        base = FLASH_BASE + FIRM_OFF
+    lo, hi = base, base + len(blob)
+
+    wanted = set(targets)
+    hits = []
+    for instr, lit in iter_literal_loads(blob, base):
+        if not (lo <= lit < hi - 3):
+            continue
+        (word,) = struct.unpack_from("<I", blob, lit - base)
+        if word in wanted:
+            hits.append((instr, lit, word))
+
+    if not hits:
+        print("no references found")
+        return 1
+
+    print("\n%d reference(s):" % len(hits))
+    for instr, lit, word in hits:
+        print("\n  loaded at 0x%08X  (pool entry 0x%08X -> 0x%08X)"
+              % (instr, lit, word))
+        if args.context:
+            for line in disassemble(args.dump, instr - args.context * 2,
+                                    args.context + 6):
+                print("    " + line.strip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
