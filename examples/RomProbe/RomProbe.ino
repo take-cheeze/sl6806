@@ -80,10 +80,12 @@ typedef void (*rom_cmd_fn)(uint32_t last, uint32_t devid, uint32_t cmd);
 typedef void (*rom_data_fn)(uint32_t last, uint32_t byte);
 typedef void (*rom_gpio_fn)(uint32_t id, uint32_t value);
 
-/* The Thumb bit has to be set or the call faults immediately. */
-static const rom_cmd_fn  romCmd  = (rom_cmd_fn)(0x0080E842u | 1u);
-static const rom_data_fn romData = (rom_data_fn)(0x0080E8D8u | 1u);
-static const rom_gpio_fn romGpio = (rom_gpio_fn)(0x00811C7Cu | 1u);
+/* The Thumb bit has to be set or the call faults immediately. Written as
+ * macros rather than initialised pointers so nothing has to run before
+ * setup() for these to be valid. */
+#define romCmd   ((rom_cmd_fn)(0x0080E842u | 1u))
+#define romData  ((rom_data_fn)(0x0080E8D8u | 1u))
+#define romGpio  ((rom_gpio_fn)(0x00811C7Cu | 1u))
 
 /* The panel descriptor's device id field, +0x0D. */
 static const uint32_t kDevId = 2;
