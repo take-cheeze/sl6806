@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+sl6806-upload - load a payload build into RAM and run it.
+
+Wraps smtlink_dump, which does the actual USB work:
+
+    smtlink_dump init simple_exec <base> <image.bin>
+
+`init` puts the boot ROM into the state where it accepts RAM writes, and
+`simple_exec` writes the image to <base> and jumps to <base>|1 (Thumb).
+
+The device must be in BOOTLOADER mode: power off, hold a button, plug in USB.
+Which button varies by unit - it is trial and error. Card-reader mode looks
+similar over USB but will not run payloads, so this checks the mode first
+instead of letting the load fail in a confusing way.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+DEFAULT_BASE = 0x820000
+
+# Inquiry strings, from the smartlink_flash README and confirmed against the
+# device. Bootloader mode is the one that accepts payloads.
+BOOTLOADER_INQUIRY = "SMTLINK DEVICE"
+CARDREADER_INQUIRY = "SSTLINK DDVICE"   # sic - the typo is in the firmware
+
+
+def find_tool(explicit):
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "..", "3rd", "smartlink_flash", "smtlink_dump"),
+        shutil.which("smtlink_dump") or "",
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    sys.exit("error: smtlink_dump not found. Build 3rd/smartlink_flash "
+             "(run make there), or pass --tool <path>.")
+
+
+def run(tool, args, sudo, capture=False):
+    cmd = ([  "sudo"] if sudo else []) + [tool] + args
+    if capture:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    return subprocess.run(cmd)
+
+
+def check_mode(tool, sudo, chip_args):
+    """Warn clearly if the device is not in bootloader mode."""
+    r = run(tool, chip_args + ["inquiry"], sudo, capture=True)
+    text = (r.stdout or "") + (r.stderr or "")
+
+    if CARDREADER_INQUIRY in text:
+        sys.exit(
+            "error: the device is in CARD READER mode, not bootloader mode.\n"
+            "       Payloads only run from bootloader mode. Power the device\n"
+            "       off, hold a button, and plug the USB cable back in while\n"
+            "       still holding it. The button varies between units.")
+
+    if BOOTLOADER_INQUIRY not in text:
+        print("warning: could not confirm bootloader mode from the inquiry\n"
+              "         response; continuing anyway. If this hangs, the\n"
+              "         device is probably not in bootloader mode.",
+              file=sys.stderr)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("image", help="payload .bin from the build")
+    p.add_argument("--base", type=lambda s: int(s, 0), default=DEFAULT_BASE,
+                   help="load address (default 0x%x, must match the linker "
+                        "script)" % DEFAULT_BASE)
+    p.add_argument("--tool", help="path to smtlink_dump")
+    p.add_argument("--no-sudo", action="store_true",
+                   help="do not prefix with sudo (use if you installed the "
+                        "udev rules from 3rd/smartlink_flash/README.md)")
+    p.add_argument("--no-init", action="store_true",
+                   help="skip the init command")
+    p.add_argument("--skip-check", action="store_true",
+                   help="do not probe the USB mode first")
+    args = p.parse_args()
+
+    if not os.path.isfile(args.image):
+        sys.exit("error: no such file: %s" % args.image)
+
+    size = os.path.getsize(args.image)
+    if size == 0:
+        sys.exit("error: %s is empty" % args.image)
+    if size > 0x10000:
+        sys.exit("error: %s is %d bytes, which overflows the 64 KiB payload "
+                 "window at 0x%x" % (args.image, size, args.base))
+
+    tool = find_tool(args.tool)
+    sudo = not args.no_sudo
+
+    # SL6806 must be selected explicitly: the tool otherwise infers the chip
+    # from the USB serial, and one of the two SL6806 serials is commented out
+    # in its source, so inference can land on "unknown chip".
+    chip_args = ["chip", "6806"]
+
+    if not args.skip_check:
+        check_mode(tool, sudo, chip_args)
+
+    cmd = list(chip_args)
+    if not args.no_init:
+        cmd.append("init")
+    cmd += ["simple_exec", hex(args.base), args.image]
+
+    print("uploading %s (%d bytes) to 0x%x" % (args.image, size, args.base))
+    r = run(tool, cmd, sudo)
+    if r.returncode != 0:
+        sys.exit("error: smtlink_dump failed (exit %d).\n"
+                 "       If it reported a pipe/stall error, the device is\n"
+                 "       most likely not in bootloader mode." % r.returncode)
+
+    print("running. Use `make monitor` to see its output.")
+
+
+if __name__ == "__main__":
+    main()
