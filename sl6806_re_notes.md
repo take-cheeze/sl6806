@@ -199,9 +199,25 @@ that. A copy must exist — the flash panel descriptor at `0x00C519FC` contains
 a pointer to `0x0081C1FC`, its own SRAM destination plus 0x30. Finding that
 copy unlocks GPIO *and* the LCDC programming at once.
 
-**Faster alternative:** dump SRAM `0x00800000`-`0x00840000` off a running
-device instead of deriving it statically. `tools/sl6806-monitor` already reads
-device memory.
+**Two routes tried and eliminated:**
+
+1. *Dump SRAM off a running device* — **does not work.** In card-reader mode
+   the stock app services SCSI and does not implement the vendor read command:
+   `read_mem` → `LIBUSB_ERROR_PIPE` (endpoint stall), and the attempt resets
+   the device. Plain `inquiry` works, so the device is healthy; the app simply
+   refuses the command. (Unrelated but worth recording: fwupd probing was
+   causing the device to drop off USB ~1.3 s after enumerating. Stop fwupd
+   before doing any USB work with this board.)
+2. *Contiguous flash→RAM copy* — **ruled out.** A search over every 2-byte
+   offset for a delta mapping the known RAM entry points onto Thumb prologues
+   gives one candidate, verified as a false positive (the bytes are XIP code
+   at `0x00CE25DE`: 100% of BL targets valid there vs 28% under the
+   candidate). No aligned linker-style copy table exists either.
+
+So the RAM image is **not stored verbatim in flash** — likely compressed,
+assembled at runtime, or loaded from the card. Next: disassemble the
+0x5862-byte blob the FIRM header does copy to `0x00804C00` and follow its
+early init; a decompressor there would name its source.
 
 ## 8. LVGL — confirmed **v8.x**
 
