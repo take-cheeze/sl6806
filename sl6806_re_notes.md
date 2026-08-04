@@ -178,12 +178,17 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
   its function pointers match the disassembled routines.
 - **Standard MIPI DCS panel** behind a **hardware LCDC with DMA**, not an RGB
   scanout panel. Sleep = DISPOFF 0x28 / 10ms / SLPIN 0x10 / 120ms; wake =
-  SLPOUT 0x11 / 120ms / DISPON 0x29 / 10ms.
-- Vendor init at `0x00D3F46C` sends commands `0xFD`, `0x61`, `0x62` plus data,
-  so it is a vendor variant rather than a stock ST7789.
-- **LCDC MMIO base `0x40080000`.** `+0x64` and `+0x74` bit 15 gate the
-  controller (cleared, 100 delay units, set again). `+0x10C` clears field
-  `0xF10`, sets `0x910`, then sets bit 0. `+0x120` also touched.
+  SLPOUT 0x11 / 120ms / DISPON 0x29 / 10ms. Descriptor `+0x20` is display-on
+  (DISPON / 10ms), `+0x24` is display-off (DISPOFF / 10ms).
+- **The full init sequence is recovered.** It is not stored as a table: the
+  routine at `0x00D3F46C` is ~150 open-coded calls to the two writer helpers
+  with the byte to send as an immediate in each. `tools/sl6806-panelseq`
+  disassembles it back into a table; the result is 33 commands ending
+  INVON 0x21 / SLPOUT 0x11 / 120ms / DISPON 0x29 / 50ms, with COLMOD 0x55
+  (RGB565) and MADCTL 0x00. The vendor register set spans 0x61-0x68,
+  0xB1-0xB6, 0xDF-0xEC and 0xF1-0xF6, so it is a vendor variant rather than a
+  stock ST7789. The tables live in `variants/p20_player/panel.c` and are
+  checked byte for byte by `tests/host/test_panel.c`.
 - Reset over GPIO id `0x13800`: high / 10ms / low / 20ms / high / 120ms
   (`0x00D3E1A4`).
 - `lv_lcd_init` (`0x00D3E34C`) installs 8 ops into a struct at `0x008298B8`;
@@ -191,8 +196,15 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
 - `lcdc_set_descriptor` (`0x00D3E728`) builds a DMA descriptor in SRAM at
   `0x00829908` using magic words `0xABAB0005`, `0xCDCD6203`, `0xCDCD0A03`,
   packing coordinates big-endian as CASET/RASET require.
+- **CORRECTION: `0x40080000` is the clock & reset unit, not the LCDC.** The
+  whole display path in flash touches it at exactly four offsets - 0x64,
+  0x74, 0x10C, 0x120 - and never reads or writes a data path. The bootloader
+  uses the same block as a divider bank with a bit-31 "update busy" poll.
+  Map in `cores/sl6806/sl6806_cru.h`.
 
-**Open thread:** the code that hands the descriptor to the LCDC and starts it.
+**RESOLVED: the LCDC is at `0x400D9000`, and its driver is in flash.** See
+§12b - the descriptor goes to LCDC `+0x88` and the controller is started with
+`+0x80` bit 0 and `+0x84` bit 0.
 
 ## 7c. Peripheral map
 
@@ -206,24 +218,54 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
   encodings dominate (`0x46202000` is `mov r0,r4; movs r0,#0`). Use
   `tools/sl6806-find-mmio`, which decodes LDR-literal instructions.
 
-## 7d. RAM-resident code — the current blocker
+**Blocks identified so far.** Doing the same literal scan over the *HLKJ
+bootloader* rather than FIRM is what named most of these: the bootloader is a
+small self-contained program that touches each peripheral once, so its uses
+are legible where FIRM's are buried.
+
+| Base | What | Evidence |
+|---|---|---|
+| `0x40000000` | pad / pin function mux | `0x00820650` rewrites four byte-lanes of `+0x04` (per-pad function nibbles) and a 5-bit field at `+0x08`, switching one bus between two functions |
+| `0x40009000` | timers | channels at 0x100 stride (`+0x108`, `+0x208`) with write-1-clear flags and per-channel callbacks; register triples at 0x20 stride |
+| `0x40070000` | DMA | per-channel IRQ status at `+0x24`/`+0x2c`, callback table indexed by channel, request routing at `+0x00`/`+0x20`/`+0x28` |
+| `0x40080000` | **clock & reset unit** | dividers at `+0x40`/`+0x48` with a bit-31 busy poll; module gates at `+0x64`/`+0x74` bit 15; see `cores/sl6806/sl6806_cru.h` |
+| `0x400D9000` | **LCD controller** | the bootloader logs `HAL_lcdc_module_init` from the routine that caches this base; see §12b and `cores/sl6806/sl6806_lcdc.h` |
+| `0x400F7000` | storage host (SD/MMC + SPI flash) | `+0x100`/`+0x104` command registers with a bit-31 start/busy, `+0x108` argument, `+0x10C`/`+0x110` response, `sdio(e):rx error` strings nearby |
+
+## 7d. RAM-resident code — explained: it belongs to the mask ROM
 
 Several drivers live in SRAM and are **not** in the flash image at any linear
-offset:
+offset. Enumerating every `BL`/`BLX` in FIRM whose target lands in
+`0x00800000`–`0x0083FFFF` gives **251 distinct entry points**, which is the
+whole callable surface. The most-used ones:
 
-| Address | Role |
-|---|---|
-| `0x0080E842` | LCD write command (`r0`, devid, cmd) |
-| `0x0080E8D8` | LCD write data |
-| `0x00811C7C` | **GPIO write (pin id, value)** |
-| `0x008072E4`, `0x00807214` | delay |
+| Address | Calls | Role |
+|---|---|---|
+| `0x00805454` | 6743 | logging / printf |
+| `0x0080E8D8` | 94 | LCD write data (`last`, byte) |
+| `0x008072E4` | 56 | delay, milliseconds |
+| `0x00807214` | 39 | delay |
+| `0x0080E842` | 39 | LCD write command (`last`, devid, cmd) |
+| `0x00811C90` | 23 | GPIO configure (pin id, value) |
+| `0x00811CB4` | 18 | GPIO, third entry point |
+| `0x00811C7C` | 13 | **GPIO write (pin id, value)** |
 
-The FIRM header copies only `0x5862` bytes to `0x00804C00`; these are past
-that. A copy must exist — the flash panel descriptor at `0x00C519FC` contains
-a pointer to `0x0081C1FC`, its own SRAM destination plus 0x30. Finding that
-copy unlocks GPIO *and* the LCDC programming at once.
+`tools/sl6806-ramcalls` regenerates that list from a dump.
 
-**Two routes tried and eliminated:**
+**Where they come from: the mask ROM.** The application's own vector table
+(file `0x10030`) routes SVCall to `0x0000B9D5`, SysTick to `0x0000BA89` and
+IRQ 25 to `0x0000873D` — all inside the 500 KB mask ROM at `0x00000000`. The
+HLKJ bootloader independently makes **393 calls to 100 distinct ROM entry
+points** (`0x00000640` alone 153 times, evidently the log function). So the
+ROM is not just a USB downloader: it is the SDK's shared driver library, and
+the SRAM band above the app's own 0x5862-byte load is its resident data and
+code. That is why no flash→RAM copy exists to find.
+
+**Consequence: dump the ROM, not more flash.** `0x00000000`–`0x0007D000` is
+readable with the same vendor read command that loads payloads, in bootloader
+mode, where it is the ROM itself answering. See docs/DUMPING.md.
+
+**Three routes tried and eliminated:**
 
 1. *Dump SRAM off a running device* — **does not work.** In card-reader mode
    the stock app services SCSI and does not implement the vendor read command:
@@ -237,11 +279,57 @@ copy unlocks GPIO *and* the LCDC programming at once.
    gives one candidate, verified as a false positive (the bytes are XIP code
    at `0x00CE25DE`: 100% of BL targets valid there vs 28% under the
    candidate). No aligned linker-style copy table exists either.
+3. *The same search with all 251 entry points* — same answer, and worth
+   recording because the false positive is seductive. The best delta maps RAM
+   `0x00800000` to file `0x035830` and matches 91/251 entry points against a
+   noise floor of 25. It is still wrong: file `0x013F62`–`0x03B4B0` is a
+   157 KB run of zeros, so the "matched" region begins exactly where real XIP
+   code resumes at `0x00C3B4B0`, and self-relative `BL`s inside any code
+   region stay self-consistent under an arbitrary base shift. **A
+   BL-target-validity test cannot distinguish a real relocation from a
+   shifted base** — only an absolute reference can.
 
-So the RAM image is **not stored verbatim in flash** — likely compressed,
-assembled at runtime, or loaded from the card. Next: disassemble the
-0x5862-byte blob the FIRM header does copy to `0x00804C00` and follow its
-early init; a decompressor there would name its source.
+## 7e. The vendor GPIO pin-id encoding
+
+The 54 call sites of the three GPIO entry points pass these ids as
+immediates:
+
+```
+0x13800 0x18000 0x1B000 0x1B800 0x1C000 0x1C800 0x1D000 0x1D800
+0x1F000 0x1F800   0x41F80 0x47080 0x47780 0x47880 0x47F80
+```
+
+(`tools/sl6806-ramcalls dump.bin --sites 811c7c` prints them, with the
+constant in each register at each call site.)
+
+Every one is a multiple of `0x80`, and dividing by `0x800` gives small
+integers. Best reading:
+
+| Bits | Meaning |
+|---|---|
+| `[10:7]` | configuration nibble; only `0x0` and `0xF` observed |
+| `[16:11]` | pin selector: 3, 14, 15, 39, 48, 54–59, 62, 63 |
+| `[18:17]` | second selector; 0 for the display pins, 2 for one other group |
+
+Whether `[18:17]` is a bank number or simply more pin bits cannot be told
+apart from call sites alone — both readings fit. Recorded rather than
+guessed at.
+
+Roles established from the calling code:
+
+| Id | Pin | Role |
+|---|---|---|
+| `0x13800` | 39 | **panel reset** — driven high/10ms/low/20ms/high by `0x00D3E1A4` |
+| `0x18000` | 48 | reset of an I2C device: low/10ms/high/50ms at `0x00D401E6`, immediately before register reads to address 0x15 (touch or camera) |
+| `0x1B000`…`0x1F800` | 54–59, 62, 63 | configured with value `0x780` from `0x00D93E00`–`0x00D94800` |
+| `0x41F80`…`0x47F80` | 3, 14, 15 | driven with 0 and `0x40` in a power sequence at `0x00D44AB8` |
+
+Note the value argument is `0`/`1` in the reset paths but `0`/`0x40`
+elsewhere, so it is more likely a pad-register value than a logic level.
+
+The framework exposes this as an optional back end — see
+`cores/sl6806/hal_gpio.h` — so a build that can reach `0x00811C7C` gets
+working `digitalWrite()` with no register map at all.
 
 ## 8. LVGL — confirmed **v8.x**
 
@@ -289,13 +377,70 @@ early init; a decompressor there would name its source.
 - **QEMU** — Cortex-M4 works but no SL6806 machine (write device models yourself).
 - Workflow: unit-test in Unicorn → integration test on real HW with mask-ROM recovery.
 
+## 12b. The LCD controller at `0x400D9000` — the way past the RAM wall
+
+The application drives the LCD from SRAM-resident code, which is where the
+previous analysis stopped. **The HLKJ bootloader initialises the same
+peripheral, and it *is* stored verbatim in flash**, so it disassembles.
+
+The identification is not circumstantial: the bootloader prints the function's
+own name. `HAL_lcdc_module_init` (string at `0x0082E171`) is logged by the
+routine at `0x00829A28`, whose first act is to cache `0x400D9000` in a driver
+struct at SRAM `0x0082EE80`. Every other function reaches the controller
+through that cached pointer, which is why the base appears as a literal only
+twice in the whole image — and why a literal scan never found it.
+
+Corroboration that this bootloader path is the LCD path: it clock-gates
+through exactly the CRU registers the application's LCD code uses, it enables
+the same interrupt (74), and it builds its command list with the same magic
+words as the application's `lcdc_set_descriptor`.
+
+Register map (offsets from `0x400D9000`), read out of the bootloader:
+
+| Off | Role |
+|---|---|
+| `+0x00` | four 4-bit fields at [15:12] [11:8] [7:4] [3:0], all 9 for the LCD |
+| `+0x04` | flag bits 1, 2, 3, 5, 6 from the config struct |
+| `+0x08` | control; bit 31 then bit 30 are the two soft resets (`0x008299C4`) |
+| `+0x10` | status/mask; start sets bit 22, clears [16:8], 31, 19 |
+| `+0x14` | interrupt flags, write-1-to-clear; `0x70000000` = transfer busy |
+| `+0x20` | geometry/format: [3:2] [9:8] [11:10] [15:12] [21:20], bit 4 |
+| `+0x24`, `+0x2C` | transfer parameters |
+| `+0x28` | bits [15:0] = length − 1 |
+| `+0x40`, `+0x44` | two words packed from a 16-entry nibble table |
+| `+0x80` | start: bit 0, plus mode bits at 2, 6, 7; [11:8] = 0xF |
+| `+0x84` | bit 0 — the trigger |
+| `+0x88` | **command-list address** |
+
+**That answers the old open thread.** The handoff is: build the descriptor,
+store its address to `+0x88`, set `+0x80` bit 0, set `+0x84` bit 0.
+
+The command list is word pairs built by `0x00827E??` (bootloader) /
+`0x00D3E728` (application): opcode/operand pairs, the column and row windows
+byte-swapped into big-endian as CASET/RASET need, MADCTL, then pixel count − 1
+and `0x32`. Transfers over `0x10000` pixels take a longer variant, so that is
+the per-entry limit.
+
+**Still undecoded:** the opcodes themselves — `0xABAB0005` and `0xCDCDxx03` /
+`0xCDCDxx02` with `xx` ∈ {0A, 12, 8A, 92, 9A, 62, 08, 18} — and most of the
+20-byte config struct. Full map in `cores/sl6806/sl6806_lcdc.h`.
+
 ## 12. Next actions (pick up here)
 
-1. ~~Trace `lv_lcd_init`~~ **DONE** — see §7b. Panel is 240x296 at offset
-   (0,12), MIPI DCS behind an LCDC at `0x40080000`. What remains is the
-   descriptor-to-LCDC handoff, which needs the RAM-resident code (§7d).
-   Quickest route: dump SRAM off a running device.
-2. **Finish the FIRM/SD-update header** (§6): mark magic + body CRC → valid update file.
-3. **Enumerate vtable slots / message-id enum** via the central `__act_on_request`
-   dispatcher (turns `method_20` + siblings into named methods across all scenes).
-4. **Build a Unicorn harness** to execute functions from the image.
+1. ~~Trace `lv_lcd_init`~~ **DONE** — §7b. Panel is 240x296 at offset (0,12),
+   MIPI DCS, and the full init sequence is recovered and in the tree.
+2. ~~Find the LCDC~~ **DONE** — §12b. `0x400D9000`, driver readable in the
+   bootloader, descriptor handoff understood.
+3. ~~Finish the FIRM/SD-update header~~ **DONE** — §6.
+4. **Decode the LCDC command-list opcodes** (§12b). This is now the last thing
+   between the framework and a working display: everything above the bus is
+   written and tested (`tests/host/test_panel.c`).
+5. **Dump the mask ROM** (`0x00000000`–`0x0007D000`) in bootloader mode. It is
+   the SDK's shared driver library (§7d) and would hand over GPIO, the LCD
+   writers and the delay routines in one go.
+6. **Find the PLL** so `F_CPU` stops being a guess. It is not at the CRU base;
+   `0x40080000` has dividers but no multiplier.
+7. **Enumerate vtable slots / message-id enum** via the central
+   `__act_on_request` dispatcher (turns `method_20` + siblings into named
+   methods across all scenes).
+8. **Build a Unicorn harness** to execute functions from the image.

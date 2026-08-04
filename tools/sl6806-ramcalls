@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+sl6806-ramcalls - list the SRAM- and ROM-resident routines the stock firmware
+calls, ranked by call count.
+
+WHY THIS EXISTS. Large parts of the SL6806 driver stack are not in the flash
+image. The application calls them at fixed addresses in SRAM, and the HLKJ
+bootloader calls a second set at fixed addresses in the mask ROM. Neither set
+can be disassembled from a flash dump - but both can be *enumerated*, because
+every call site is a plain BL with the target encoded in it. That gives the
+callable surface, the argument shapes at each call site, and a ranking of
+what is worth recovering first.
+
+    tools/sl6806-ramcalls dump.bin                 # SRAM targets from FIRM
+    tools/sl6806-ramcalls dump.bin --rom           # mask ROM targets
+    tools/sl6806-ramcalls dump.bin --sites 811c7c  # every call site of one
+
+WHAT --sites GIVES YOU. It prints the immediate values loaded into r0-r3
+before each call. That is how the GPIO pin ids in sl6806_re_notes.md 7e were
+recovered, and how the panel command sequence was read: for routines whose
+arguments are constants, the call sites contain the whole data set.
+
+A caveat worth stating: this decodes every 32-bit BL encoding at every 2-byte
+offset, without knowing where instructions actually start, so a small number
+of hits are data that happens to look like a call. Targets with a single call
+site should be treated as unconfirmed; targets with dozens are real.
+"""
+
+import argparse
+import collections
+import struct
+import sys
+
+XIP_BASE = 0x00C00000
+FIRM_OFF = 0x010000
+FIRM_LEN = 0x1B80D0
+
+SRAM_LO, SRAM_HI = 0x00800000, 0x00840000
+ROM_LO, ROM_HI = 0x00000000, 0x0007D000
+
+BL_HDR_OFF = 0x60          # HLKJ payload starts here
+BL_BASE = 0x0081FC00
+
+
+def load(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 0x40000:
+        sys.exit("error: %s is too small to be a flash dump" % path)
+    return data
+
+
+def bl_targets(data, base):
+    """Yield (site, target) for every 32-bit BL/BLX encoding."""
+    for off in range(0, len(data) - 4, 2):
+        w1, w2 = struct.unpack_from("<HH", data, off)
+        if (w1 & 0xF800) != 0xF000:
+            continue
+        if (w2 & 0xD000) == 0xD000:
+            blx = False
+        elif (w2 & 0xD000) == 0xC000:
+            blx = True
+        else:
+            continue
+        s = (w1 >> 10) & 1
+        i1 = (~((w2 >> 13 & 1) ^ s)) & 1
+        i2 = (~((w2 >> 11 & 1) ^ s)) & 1
+        imm = (s << 24) | (i1 << 23) | (i2 << 22) | \
+              ((w1 & 0x3FF) << 12) | ((w2 & 0x7FF) << 1)
+        if s:
+            imm -= 1 << 25
+        pc = base + off + 4
+        if blx:
+            pc &= ~3
+            imm &= ~3
+        yield (base + off, pc + imm)
+
+
+def scan_args(data, base, site, back=0x30):
+    """Immediates left in r0-r3 at a call site, best effort.
+
+    Models movs/mov.w/movw of an immediate and mov between low registers, and
+    forgets a register on anything else it cannot follow. A '?' in the output
+    means the argument came from memory or a computation, not that it is
+    missing.
+    """
+    regs = {}
+    start = site - base - back
+    if start < 0:
+        start = 0
+    off = start
+    end = site - base
+    while off < end:
+        hw = struct.unpack_from("<H", data, off)[0]
+        wide = (hw & 0xF800) in (0xF000, 0xF800, 0xE800)
+        if not wide:
+            if (hw & 0xF800) == 0x2000:                  # MOVS Rd, #imm8
+                regs[(hw >> 8) & 7] = hw & 0xFF
+            elif (hw & 0xF800) == 0x4800:                # LDR Rt, [PC, #imm]
+                rt = (hw >> 8) & 7
+                lit = (((base + off + 4) & ~3) + (hw & 0xFF) * 4) - base
+                if 0 <= lit <= len(data) - 4:
+                    regs[rt] = struct.unpack_from("<I", data, lit)[0]
+                else:
+                    regs.pop(rt, None)
+            elif (hw & 0xFF00) == 0x4600:                # MOV Rd, Rm
+                rd = (hw & 7) | ((hw >> 4) & 8)
+                rm = (hw >> 3) & 0xF
+                if rd < 4:
+                    if rm in regs:
+                        regs[rd] = regs[rm]
+                    else:
+                        regs.pop(rd, None)
+            else:
+                regs.pop(hw & 7, None)
+            off += 2
+            continue
+        w2 = struct.unpack_from("<H", data, off + 2)[0]
+        if (hw & 0xFBEF) == 0xF04F and (w2 & 0x8000) == 0:      # MOV.W
+            rd = (w2 >> 8) & 0xF
+            if rd < 4:
+                regs[rd] = thumb_expand(((hw >> 10 & 1) << 11) |
+                                          (((w2 >> 12) & 7) << 8) | (w2 & 0xFF))
+        elif (hw & 0xFBF0) == 0xF240:                            # MOVW
+            rd = (w2 >> 8) & 0xF
+            if rd < 4:
+                regs[rd] = ((hw & 0xF) << 12) | ((hw >> 10 & 1) << 11) | \
+                           ((w2 >> 12 & 7) << 8) | (w2 & 0xFF)
+        else:
+            regs.clear()
+        off += 4
+    return regs
+
+
+def thumb_expand(imm12):
+    if (imm12 & 0xC00) == 0:
+        kind = (imm12 >> 8) & 3
+        b = imm12 & 0xFF
+        return (b, b << 16 | b, b << 24 | b << 8, b << 24 | b << 16 | b << 8 | b)[kind]
+    unrot = 0x80 | (imm12 & 0x7F)
+    rot = (imm12 >> 7) & 0x1F
+    return ((unrot >> rot) | (unrot << (32 - rot))) & 0xFFFFFFFF
+
+
+# Routines named elsewhere in the analysis. Keeping the table here means the
+# tool's output is readable without cross-referencing the notes.
+KNOWN = {
+    0x00805454: "log/printf",
+    0x0080E842: "lcd_write_cmd(last, devid, cmd)",
+    0x0080E8D8: "lcd_write_data(last, byte)",
+    0x008072E4: "delay_ms",
+    0x00807214: "delay",
+    0x00811C7C: "gpio_write(id, value)",
+    0x00811C90: "gpio_config(id, value)",
+    0x00811CB4: "gpio_3(id, value)",
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    ap.add_argument("dump")
+    ap.add_argument("--rom", action="store_true",
+                    help="mask ROM targets called from the HLKJ bootloader")
+    ap.add_argument("--sites", metavar="ADDR",
+                    help="show every call site of one target, with arguments")
+    ap.add_argument("--top", type=int, default=40,
+                    help="how many targets to list (default 40)")
+    args = ap.parse_args()
+
+    fw = load(args.dump)
+
+    if args.rom:
+        seg_len = struct.unpack_from("<I", fw, 0x10)[0]
+        image = fw[BL_HDR_OFF:BL_HDR_OFF + seg_len]
+        base = BL_BASE
+        lo, hi = ROM_LO, ROM_HI
+        what = "mask ROM entry points called from the HLKJ bootloader"
+    else:
+        image = fw[FIRM_OFF:FIRM_OFF + FIRM_LEN]
+        base = XIP_BASE + FIRM_OFF
+        lo, hi = SRAM_LO, SRAM_HI
+        what = "SRAM entry points called from FIRM"
+
+    sites = collections.defaultdict(list)
+    for site, tgt in bl_targets(image, base):
+        if lo <= tgt < hi:
+            sites[tgt].append(site)
+
+    if args.sites:
+        target = int(args.sites, 16)
+        if target not in sites:
+            sys.exit("error: no calls to %08X found" % target)
+        print("%d call sites of %08X%s" %
+              (len(sites[target]), target,
+               "  (%s)" % KNOWN[target] if target in KNOWN else ""))
+        for s in sites[target]:
+            r = scan_args(image, base, s)
+            print("  %08X  %s" % (s, "  ".join(
+                "r%d=%s" % (i, hex(r[i]) if i in r else "?") for i in range(4))))
+        return
+
+    total = sum(len(v) for v in sites.values())
+    print("%d %s, %d calls" % (len(sites), what, total))
+    print()
+    for tgt, ss in sorted(sites.items(), key=lambda kv: -len(kv[1]))[:args.top]:
+        print("  %08X  x%-5d %s" % (tgt, len(ss), KNOWN.get(tgt, "")))
+
+
+if __name__ == "__main__":
+    main()

@@ -38,9 +38,11 @@ so it is worth being precise about which parts are real:
 | Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~38 KB heap in payload mode, ~190 KB in firmware mode. |
 | Flash image format (HLKJ, CRC16, partitions) | **Works.** Both CRCs verify and round-trip. |
 | Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM. |
-| Getting those pixels onto the LCD | **Not yet.** Needs one panel driver — see [docs/LCD.md](docs/LCD.md). |
-| `pinMode` / `digitalWrite` / `digitalRead` | **Not yet.** The GPIO registers are unknown. Calls report instead of silently doing nothing. |
-| `analogRead` / `analogWrite` | **Not yet.** Same reason. |
+| Panel: geometry, vendor init sequence, windowing, sleep/wake | **Works.** Recovered from the firmware, 53 host-side tests. |
+| Getting those pixels onto the glass | **Not yet.** Needs a 3-function bus — see [docs/LCD.md](docs/LCD.md). |
+| `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
+| `pinMode` / `digitalWrite` / `digitalRead` | **Not yet.** The GPIO registers are unknown, but two pins have working vendor ids — see below. |
+| `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
@@ -52,13 +54,26 @@ Nothing in the dump establishes the real frequency, so every `delay()` and
 `make SKETCH=examples/ClockCalibrate run`, time it with a stopwatch, then
 build with `F_CPU=<measured>` and all timing is correct.
 
-**GPIO needs one table filled in.** The driver is complete; only the register
-addresses are missing, and no amount of framework design can invent them. The
-recipe for finding them is in
+**GPIO needs one of two holes filled in.** The driver is complete; what is
+missing is either the register addresses or a way to reach the vendor's own
+GPIO routine.
+
+The stock firmware never writes a GPIO register — it calls
+`gpio_write(id, value)` at `0x00811C7C` with a packed pin id, from code that
+lives in the mask ROM's driver set. Those ids *are* recovered, including the
+panel reset pin, so a build that can reach that routine gets working
+`digitalWrite()` with no register map at all:
+
+```cpp
+sl6806_gpio_vendor_register(&my_backend);   // one function: write(id, value)
+digitalWrite(PIN_LCD_RESET, HIGH);          // works
+```
+
+The other route is the register table. The recipe is in
 [`cores/sl6806/hal_gpio.h`](cores/sl6806/hal_gpio.h), the helper is
 `tools/sl6806-find-mmio`, and the one place to write the answer is
-[`variants/p20_player/variant.c`](variants/p20_player/variant.c). Until then a
-digital call prints:
+[`variants/p20_player/variant.c`](variants/p20_player/variant.c). Until one of
+the two exists, a digital call prints:
 
 ```
 *** SL6806: GPIO is not configured ***
@@ -85,12 +100,26 @@ rather than a silently mangled stream. Typing in the monitor feeds
 `Print` interface so `Screen.print(x)` works like `Serial.print(x)`. It is
 verified natively (`make -C tests/host`), including clipping and the font.
 
-What is missing is the panel driver: one `sl6806_panel_t` struct giving the
-controller, resolution, bus and init sequence. Those facts live in the stock
-firmware's `lv_lcd_init` at `0x00D3E34C`, so they need a real dump.
-[docs/LCD.md](docs/LCD.md) walks through extracting them. Until then drawing
-works and lands in RAM — you can build and test a UI now, and it will appear
-the moment the driver exists.
+The panel is no longer a mystery either. It is **240x296 RGB565, drawn at
+controller offset (0, 12)**, behind a standard MIPI DCS command set, and its
+**33-command vendor init sequence** was recovered from the firmware and lives
+in [`variants/p20_player/panel.c`](variants/p20_player/panel.c). Regenerate
+any of it from a dump with `tools/sl6806-panelseq`.
+
+What is missing is one layer below all that: the byte-level bus. The stock
+firmware puts bytes on the wire with two routines in the mask ROM's driver
+set, so they are not in the flash image. Supply three functions —
+
+```c
+sl6806_lcd_bus_register(&my_bus);   // command(), pixels(), reset()
+Screen.begin();
+```
+
+— and the init sequence, windowing, framebuffer and text all start working
+unchanged. [docs/LCD.md](docs/LCD.md) describes the three ways to write that
+bus. The LCD controller itself has since been located at `0x400D9000`, with
+its driver readable in the bootloader; see
+[`cores/sl6806/sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
 
 ## Testing
 
@@ -169,6 +198,9 @@ declarations are not synthesised — define helpers before you call them.
 | `sl6806-monitor` | Serial monitor; finds the ring buffer by symbol, not by hardcoded address. |
 | `sl6806-find-mmio` | Ranks candidate peripheral base addresses in a dump. |
 | `sl6806-pack` | Builds a flashable image by patching a known-good dump. |
+| `sl6806-panelseq` | Recovers the panel descriptor and its DCS command sequences from a dump; `--c` emits the variant tables. |
+| `sl6806-ramcalls` | Lists the SRAM and mask-ROM routines the stock firmware calls, ranked, with the constants passed at each call site. |
+| `sl6806-dumpram` | Reads device memory over USB — the mask ROM is the one worth reading. |
 
 ## Hardware notes
 
@@ -177,11 +209,22 @@ SoC codename "spark2".
 
 | Region | Address | Size |
 |---|---|---|
-| Mask ROM (boot ROM, USB download) | `0x00000000` | `0x7D000` |
+| Mask ROM (boot ROM, USB download, **shared driver library**) | `0x00000000` | `0x7D000` |
 | SRAM | `0x00800000` | 256 KiB |
 | SPI flash, XIP | `0x00C00000` | 4 MiB |
 | Core peripherals (SysTick/NVIC/SCB/DWT) | `0xE000E000` | architectural |
-| Everything else (GPIO, clocks, ADC…) | unknown | — |
+| Peripherals | `0x40000000` | — |
+
+Peripheral blocks identified so far:
+
+| Base | Block |
+|---|---|
+| `0x40000000` | pad / pin function mux |
+| `0x40009000` | timers |
+| `0x40070000` | DMA |
+| `0x40080000` | clock & reset ([`sl6806_cru.h`](cores/sl6806/sl6806_cru.h)) |
+| `0x400D9000` | LCD controller ([`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h)) |
+| `0x400F7000` | SD/MMC + SPI flash host |
 
 Flash layout: HLKJ bootloader at `0x0`, partition table at `0xF000`, then
 `FIRM` (application, XIP at `0x00C10000`), `PICS` and `FONT`.
@@ -198,27 +241,33 @@ depends on are annotated with their provenance in
 
 In rough order of how much they unlock:
 
-1. **GPIO registers** — turns `digitalWrite` real, and with it most of what
-   "Arduino" implies. Start with `tools/sl6806-find-mmio`.
-2. **The real CPU clock** — makes all timing absolute. A stopwatch does it;
-   finding the PLL registers does it exactly.
-3. **The FIRM header's mark field and body CRC** — makes standalone firmware
-   possible, and yields the SD-update format as a safer install channel.
-4. **The panel driver** — everything above it is written and tested, so
-   `lv_lcd_init` at `0x00D3E34C` is the highest-value single function left in
-   the dump. See [docs/LCD.md](docs/LCD.md).
+1. **A mask ROM dump.** `0x00000000`–`0x0007D000`, readable in bootloader
+   mode. It is the vendor SDK's shared driver library — the LCD writers, the
+   GPIO writer and the delay routines all live there — so one dump unblocks
+   GPIO *and* the display at once. See
+   [docs/DUMPING.md](docs/DUMPING.md#dumping-ram-and-the-mask-rom).
+2. **The LCDC command-list opcodes.** The controller is at `0x400D9000`, the
+   register map is written down, and the descriptor handoff is understood.
+   What is left is the meaning of `0xABAB0005` and `0xCDCDxx03`. Everything
+   above that layer is already written and tested.
+3. **GPIO registers** — the other route to `digitalWrite`. Start with
+   `tools/sl6806-find-mmio`.
+4. **The real CPU clock** — makes all timing absolute. A stopwatch does it;
+   finding the PLL registers does it exactly. It is *not* at the clock unit's
+   base: `0x40080000` has dividers but no multiplier.
 
 ## Layout
 
 ```
 cores/sl6806/     the core: Arduino.h, Print/Stream/String, timing, GPIO HAL,
-                  USB serial, startup for both modes, boot ROM ABI
-cores/sl6806/gfx/ framebuffer, font, panel interface, Display
+                  USB serial, startup for both modes, boot ROM ABI,
+                  peripheral maps (sl6806_cru.h, sl6806_lcdc.h)
+cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
 examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe
-tests/host/       native tests for console + graphics
+tests/host/       native tests for console, graphics and the panel
 docs/             DUMPING.md, FLASHING.md, LCD.md
 3rd/              smartlink_flash submodule
 ```

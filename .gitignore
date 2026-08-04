@@ -4,4 +4,5 @@ build/
 *.map
 tests/host/test_console
 tests/host/test_gfx
+tests/host/test_panel
 tests/host/*.ppm

@@ -1,32 +1,45 @@
 #!/usr/bin/env python3
 """
-sl6806-dumpram - dump device SRAM while the stock firmware is running.
+sl6806-dumpram - dump device memory over USB.
 
-WHY: several drivers live in SRAM and are not present in the flash image at
-any linear offset - the LCDC descriptor handoff near 0x0080E842 and the GPIO
-writer at 0x00811C7C among them. Reading them off a running device is far
-quicker than finding the flash->RAM copy statically. That means NORMAL boot
-(card-reader mode), not bootloader mode: in bootloader mode the stock app has
-never run, so its RAM image is not there.
+WHY: large parts of the SL6806 driver stack are not in the flash image at any
+linear offset - the LCD command writers at 0x0080E842/0x0080E8D8 and the GPIO
+writer at 0x00811C7C among them. They belong to the mask ROM's driver set
+(sl6806_re_notes.md 7d), so the way to read them is to read memory, not more
+flash.
 
+    # the mask ROM - the SDK's shared driver library, 500 KB at 0
+    tools/sl6806-dumpram --start 0 --size 0x7D000 --out maskrom.bin
+
+    # SRAM, to see which of those drivers are resident right now
     tools/sl6806-dumpram --out sram.bin              # 0x00800000..0x00840000
     tools/sl6806-dumpram --start 0x80E000 --size 0x2000 --out lcd.bin
+
+WHICH MODE. Use BOOTLOADER mode. There the boot ROM itself answers, over the
+same channel that already works for uploading payloads - so read_mem is
+expected to work, though it has not yet been run against an SL6806 in that
+mode. Use --probe first.
+
+Reading SRAM under the stock application (card-reader mode) does NOT work and
+is not worth retrying: the application services SCSI and stalls the vendor
+command, so read_mem returns LIBUSB_ERROR_PIPE and the attempt resets the
+device. Plain `inquiry` still answers, so the device is healthy - the
+application simply does not implement the command. (The smartlink_flash README
+reports it working in card-reader mode on SL6801; SL6806 differs.)
+
+The consequence is that you cannot see the stock application's own RAM image.
+What you CAN see is what the ROM has set up in bootloader mode, and the ROM
+itself - which is where those drivers come from anyway.
 
 BUILT FOR AN UNRELIABLE DEVICE. This board has been observed enumerating and
 then dropping off USB about a second later. So the dump is chunked and
 resumable: each chunk is written as it arrives, and re-running picks up where
-it stopped. Interrupt it, replug, run it again.
+it stopped. Interrupt it, replug, run it again. Stop fwupd first.
 
-TWO THINGS THAT MAY NOT WORK, both unproven on SL6806:
-
-  1. In card-reader mode the stock application services SCSI, not the boot
-     ROM. read_mem works by writing a small trampoline to 0x003FB000 and
-     executing it, and whether the application honours that vendor command is
-     untested here. The smartlink_flash README reports it working in
-     card-reader mode on SL6801.
-  2. Executing that trampoline while the application is running could hang
-     it. Nothing writes to flash, so a replug recovers. --probe checks with a
-     single small read before committing to a long dump.
+ONE THING TO KNOW: read_mem works by writing a small trampoline to 0x003FB000
+and executing it, so it perturbs the machine it is reading. Nothing writes to
+flash, so a replug always recovers. --probe checks with a single small read
+before committing to a long dump.
 """
 
 import argparse
@@ -72,7 +85,7 @@ def wait_for_device(timeout):
     """Block until the device shows up. Returns False on timeout."""
     if device_present():
         return True
-    print("waiting for the device (plug it in, stock firmware running)...",
+    print("waiting for the device (hold the boot key, plug in USB)...",
           file=sys.stderr)
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -90,17 +103,20 @@ class Reader:
         self.sudo = sudo
         self.tmp = tempfile.mkdtemp(prefix="sl6806ram.")
 
-    def read(self, addr, size):
+    def read(self, addr, size, init=False):
         """Read a block via the tiny-trampoline path. None on failure."""
         out = os.path.join(self.tmp, "chunk.bin")
         try:
             os.unlink(out)
         except OSError:
             pass
-        cmd = (["sudo"] if self.sudo else []) + [
-            self.tool, "chip", "6806",
-            "read_mem", hex(addr), hex(size), out]
-        # No `init` here: it is bootloader-only and hangs in card-reader mode.
+        # `init` is bootloader-only - it hangs in card-reader mode - and is
+        # needed once per session there. It is not repeated per chunk: that
+        # would re-initialise the device between every 4 KB.
+        cmd = (["sudo"] if self.sudo else []) + [self.tool, "chip", "6806"]
+        if init:
+            cmd.append("init")
+        cmd += ["read_mem", hex(addr), hex(size), out]
         r = subprocess.run(cmd, capture_output=True, text=True)
         if not os.path.isfile(out):
             return None
@@ -140,6 +156,10 @@ def main():
                    help="seconds to wait for the device (0 = do not wait)")
     p.add_argument("--retries", type=int, default=5,
                    help="attempts per chunk before giving up")
+    p.add_argument("--no-init", action="store_true",
+                   help="skip the one-time `init`. Needed only if the device "
+                        "is somehow not in bootloader mode, where `init` "
+                        "hangs")
     args = p.parse_args()
 
     tool = find_tool(args.tool)
@@ -151,12 +171,16 @@ def main():
                  "       has been seen dropping off USB ~1s after enumerating."
                  % args.wait)
 
+    first_init = not args.no_init
+
     if args.probe:
-        data = rd.read(args.start, 64)
+        data = rd.read(args.start, 64, init=first_init)
         if data is None:
             sys.exit("probe failed: no data returned.\n"
-                     "  Either the device vanished again, or the running\n"
-                     "  application does not service the vendor read command.")
+                     "  Either the device vanished again, or it is not in\n"
+                     "  bootloader mode. The stock application does not\n"
+                     "  service the vendor read command - see the notes at\n"
+                     "  the top of this file.")
         ok, why = looks_like_code(data)
         print("probe at 0x%08X: %s (%s)" % (args.start,
                                             "looks real" if ok else "SUSPECT", why))
@@ -195,7 +219,8 @@ def main():
                         print("\nstopped at 0x%08X. Re-run to resume." % addr,
                               file=sys.stderr)
                         return 1
-                data = rd.read(addr, n)
+                data = rd.read(addr, n, init=first_init)
+                first_init = False
                 if data and len(data) == n:
                     break
                 time.sleep(0.3)

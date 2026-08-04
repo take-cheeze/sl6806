@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""
+sl6806-panelseq - recover the LCD panel descriptor and its command sequences
+from an SL6806 flash dump.
+
+The stock firmware does not store the panel init sequence as a table. It is
+open-coded: a long straight line of calls to two RAM-resident helpers, one
+that writes a DCS command and one that writes a parameter byte, with the
+immediate in each call being the byte to send. This tool disassembles those
+routines and turns them back into a table.
+
+    tools/sl6806-panelseq dump.bin              # human-readable listing
+    tools/sl6806-panelseq dump.bin --c          # C table for a variant
+
+HOW THE PANEL IS FOUND
+The descriptor is located by signature rather than by a hardcoded address:
+bytes +0x11/+0x12 of it are 0x2A/0x2B (CASET/RASET), +0x0F/+0x10 are
+0x2C/0x2E (RAMWR/RAMRD), and the five words at +0x14..+0x24 are pointers into
+the XIP flash window. On the reference dump exactly one 32-byte-aligned
+candidate matches, at 0x00C519FC.
+
+WHAT THE TWO HELPERS ARE
+
+    0x0080E842  lcd_write_cmd(last, devid, cmd)
+    0x0080E8D8  lcd_write_data(last, byte)
+
+Both live in SRAM and are not in the flash image (see sl6806_re_notes.md
+7d/13), so this tool identifies them by call frequency from inside the panel
+routines rather than by disassembling them: within the panel functions only
+two SRAM addresses are ever called with this shape, the one that always takes
+three arguments is the command writer, and the one that takes two is the data
+writer. Their addresses are printed so you can check them against the notes.
+
+`last` is 1 while more bytes of the same command follow and 0 on the final
+byte, which is how the sequence splits into commands without any length
+field.
+"""
+
+import argparse
+import struct
+import sys
+
+XIP_BASE = 0x00C00000
+
+# Delay helpers, identified in sl6806_re_notes.md 7d. Both take milliseconds
+# in r0 in every call site seen inside the panel routines.
+DELAY_MS = (0x008072E4, 0x00807214)
+
+# Record opcodes for the emitted byte stream. Kept in sync with
+# cores/sl6806/gfx/Panel.h.
+OP_END = 0x00
+OP_CMD = 0x01
+OP_DELAY = 0x02
+
+
+def load(path):
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) < 0x40000:
+        sys.exit("error: %s is too small to be a flash dump" % path)
+    return data
+
+
+# --------------------------------------------------------------- descriptor
+
+DESC_FIELDS = ("width", "height", "xoff", "yoff")
+
+
+def find_descriptor(fw, explicit=None):
+    """Return (addr, dict) for the panel descriptor."""
+    cands = []
+    scan = [explicit - XIP_BASE] if explicit else range(0, len(fw) - 0x28, 4)
+    for off in scan:
+        if fw[off + 0x0F] != 0x2C or fw[off + 0x10] != 0x2E:
+            continue
+        if fw[off + 0x11] != 0x2A or fw[off + 0x12] != 0x2B:
+            continue
+        if fw[off + 0x13] != 0x36:
+            continue
+        ptrs = struct.unpack_from("<5I", fw, off + 0x14)
+        if not all(XIP_BASE <= p < XIP_BASE + len(fw) and p & 1 for p in ptrs):
+            continue
+        w, h, xo, yo = struct.unpack_from("<4H", fw, off)
+        if not (0 < w <= 4096 and 0 < h <= 4096):
+            continue
+        cands.append((XIP_BASE + off, {
+            "width": w, "height": h, "xoff": xo, "yoff": yo,
+            "mode": fw[off + 0x08], "devid": fw[off + 0x0D],
+            "ramwr": fw[off + 0x0F], "ramrd": fw[off + 0x10],
+            "caset": fw[off + 0x11], "raset": fw[off + 0x12],
+            "madctl": fw[off + 0x13],
+            "init": ptrs[0], "sleep": ptrs[1], "wake": ptrs[2],
+            "display_on": ptrs[3], "display_off": ptrs[4],
+        }))
+    if not cands:
+        sys.exit("error: no panel descriptor found (wrong dump?)")
+    if len(cands) > 1:
+        print("warning: %d descriptor candidates, using the first" % len(cands),
+              file=sys.stderr)
+    return cands[0]
+
+
+# ------------------------------------------------------------------- walker
+
+def thumb_bl(fw, off, addr):
+    """Decode a 32-bit BL/BLX at `off`. Returns the target or None."""
+    w1, w2 = struct.unpack_from("<HH", fw, off)
+    if (w1 & 0xF800) != 0xF000:
+        return None
+    if (w2 & 0xD000) == 0xD000:
+        blx = False
+    elif (w2 & 0xD000) == 0xC000:
+        blx = True
+    else:
+        return None
+    s = (w1 >> 10) & 1
+    i1 = (~((w2 >> 13 & 1) ^ s)) & 1
+    i2 = (~((w2 >> 11 & 1) ^ s)) & 1
+    imm = (s << 24) | (i1 << 23) | (i2 << 22) | ((w1 & 0x3FF) << 12) | ((w2 & 0x7FF) << 1)
+    if s:
+        imm -= 1 << 25
+    pc = addr + 4
+    if blx:
+        pc &= ~3
+        imm &= ~3
+    return pc + imm
+
+
+def walk(fw, start, limit=0x1000):
+    """Interpret the straight-line body of a panel routine.
+
+    Models only what these routines actually use: `movs`/`mov.w` of an
+    immediate into r0-r3, `mov rd, rs` between them, the `ldrb r1,[r4,#0xd]`
+    that fetches the device id out of the descriptor, and unconditional
+    branches (the compiler jumps over literal pools mid-sequence). Anything
+    else clears the registers it writes, so an unmodelled instruction shows up
+    as a missing argument rather than as a wrong byte.
+
+    Returns a list of (addr, target, {reg: value}).
+    """
+    calls = []
+    regs = {}
+    addr = start
+    end = start + limit
+    seen = set()
+    tail = False        # lr has been popped: the next branch leaves the routine
+    while addr < end:
+        if addr in seen:
+            break
+        seen.add(addr)
+        off = addr - XIP_BASE
+        hw = struct.unpack_from("<H", fw, off)[0]
+        wide = (hw & 0xF800) in (0xF000, 0xF800, 0xE800)
+
+        if wide:
+            # POP.W / LDMIA.W sp!, {...}
+            if hw == 0xE8BD:
+                regl = struct.unpack_from("<H", fw, off + 2)[0]
+                if regl & 0x8000:           # pops pc: the routine returns
+                    break
+                if regl & 0x4000:           # pops lr: a tail call follows
+                    tail = True
+                addr += 4
+                continue
+            tgt = thumb_bl(fw, off, addr)
+            if tgt is not None:
+                calls.append((addr, tgt, dict(regs)))
+                for r in ("r0", "r1", "r2", "r3"):
+                    regs.pop(r, None)
+                addr += 4
+                continue
+            w2 = struct.unpack_from("<H", fw, off + 2)[0]
+            # B.W <label>
+            if (hw & 0xF800) == 0xF000 and (w2 & 0xD000) == 0x9000:
+                s = (hw >> 10) & 1
+                i1 = (~((w2 >> 13 & 1) ^ s)) & 1
+                i2 = (~((w2 >> 11 & 1) ^ s)) & 1
+                imm = (s << 24) | (i1 << 23) | (i2 << 22) | \
+                      ((hw & 0x3FF) << 12) | ((w2 & 0x7FF) << 1)
+                if s:
+                    imm -= 1 << 25
+                if tail:
+                    # `pop {..., lr}` then `b.w f` is a tail call: record it
+                    # so a trailing delay is not lost, then stop.
+                    calls.append((addr, addr + 4 + imm, dict(regs)))
+                    break
+                addr = addr + 4 + imm
+                continue
+            # MOV.W Rd, #imm12 (modified immediate)
+            if (hw & 0xFBEF) == 0xF04F and (w2 & 0x8000) == 0:
+                rd = (w2 >> 8) & 0xF
+                val = thumb_expand(((hw >> 10 & 1) << 11) |
+                                   (((w2 >> 12) & 7) << 8) | (w2 & 0xFF))
+                if rd < 4 and val is not None:
+                    regs["r%d" % rd] = val
+                addr += 4
+                continue
+            # MOVW Rd, #imm16
+            if (hw & 0xFBF0) == 0xF240:
+                rd = (w2 >> 8) & 0xF
+                val = ((hw & 0xF) << 12) | ((hw >> 10 & 1) << 11) | \
+                      ((w2 >> 12 & 7) << 8) | (w2 & 0xFF)
+                if rd < 4:
+                    regs["r%d" % rd] = val
+                addr += 4
+                continue
+            for r in ("r0", "r1", "r2", "r3"):
+                regs.pop(r, None)
+            addr += 4
+            continue
+
+        # 16-bit encodings
+        if (hw & 0xF800) == 0x2000:               # MOVS Rd, #imm8
+            rd = (hw >> 8) & 7
+            regs["r%d" % rd] = hw & 0xFF
+            addr += 2
+            continue
+        if (hw & 0xFF00) == 0x4600:               # MOV Rd, Rm (high registers)
+            rd = (hw & 7) | ((hw >> 4) & 8)
+            rm = (hw >> 3) & 0xF
+            if rd < 4:
+                src = regs.get("r%d" % rm)
+                if src is None:
+                    regs.pop("r%d" % rd, None)
+                else:
+                    regs["r%d" % rd] = src
+            addr += 2
+            continue
+        if hw == 0x7B61:                          # LDRB r1, [r4, #0xd]  (devid)
+            regs["r1"] = "devid"
+            addr += 2
+            continue
+        if (hw & 0xF800) == 0xE000:               # B <label> (T2)
+            imm = hw & 0x7FF
+            if imm & 0x400:
+                imm -= 0x800
+            if tail:
+                break
+            addr = addr + 4 + imm * 2
+            continue
+        if (hw & 0xFF00) == 0xBD00:               # POP {..., pc}
+            break
+        if hw == 0x4770:                          # BX LR
+            break
+        rd = hw & 7
+        regs.pop("r%d" % rd, None)
+        addr += 2
+    return calls
+
+
+def thumb_expand(imm12):
+    """ThumbExpandImm for the modified-immediate encodings."""
+    if (imm12 & 0xC00) == 0:
+        kind = (imm12 >> 8) & 3
+        b = imm12 & 0xFF
+        return (b, b << 16 | b, b << 24 | b << 8, b << 24 | b << 16 | b << 8 | b)[kind]
+    unrot = 0x80 | (imm12 & 0x7F)
+    rot = (imm12 >> 7) & 0x1F
+    return ((unrot >> rot) | (unrot << (32 - rot))) & 0xFFFFFFFF
+
+
+# ------------------------------------------------------------------ decoding
+
+def classify(calls):
+    """Work out which SRAM address is the command writer and which the data
+    writer, from how they are called."""
+    three = {}
+    two = {}
+    for _, tgt, regs in calls:
+        if not (0x00800000 <= tgt < 0x00840000):
+            continue
+        if "r2" in regs:
+            three[tgt] = three.get(tgt, 0) + 1
+        elif "r1" in regs and "r0" in regs:
+            two[tgt] = two.get(tgt, 0) + 1
+    cmd = max(three, key=three.get) if three else None
+    data = max((t for t in two if t != cmd), key=two.get, default=None)
+    return cmd, data
+
+
+def sequence(fw, start, cmd_fn, data_fn):
+    """Turn one routine into [(kind, ...)] records."""
+    out = []
+    pending = None       # (cmd, [args])
+    for _, tgt, regs in walk(fw, start):
+        if tgt == cmd_fn:
+            if pending:
+                out.append(("cmd",) + pending)
+            c = regs.get("r2")
+            pending = (c if isinstance(c, int) else None, [])
+        elif tgt == data_fn:
+            v = regs.get("r1")
+            if pending is None:
+                out.append(("orphan-data", v))
+            else:
+                pending[1].append(v)
+        elif tgt in DELAY_MS:
+            if pending:
+                out.append(("cmd",) + pending)
+                pending = None
+            out.append(("delay", regs.get("r0")))
+        else:
+            if pending:
+                out.append(("cmd",) + pending)
+                pending = None
+            out.append(("call", tgt, regs.get("r0"), regs.get("r1")))
+    if pending:
+        out.append(("cmd",) + pending)
+    return out
+
+
+def encode(seq):
+    """Byte stream in the format cores/sl6806/gfx/Panel.h runs."""
+    out = bytearray()
+    for rec in seq:
+        if rec[0] == "cmd":
+            cmd, args = rec[1], rec[2]
+            if cmd is None or any(a is None for a in args):
+                sys.exit("error: undecoded byte in the sequence; "
+                         "run without --c to see where")
+            if len(args) > 255:
+                sys.exit("error: command 0x%02X has too many parameters" % cmd)
+            out += bytes([OP_CMD, cmd, len(args)]) + bytes(args)
+        elif rec[0] == "delay":
+            ms = rec[1] or 0
+            out += bytes([OP_DELAY, ms & 0xFF, (ms >> 8) & 0xFF])
+    out.append(OP_END)
+    return bytes(out)
+
+
+# ------------------------------------------------------------------ printing
+
+def describe(cmd):
+    names = {
+        0x10: "SLPIN", 0x11: "SLPOUT", 0x20: "INVOFF", 0x21: "INVON",
+        0x28: "DISPOFF", 0x29: "DISPON", 0x2A: "CASET", 0x2B: "RASET",
+        0x2C: "RAMWR", 0x2E: "RAMRD", 0x35: "TEON", 0x36: "MADCTL",
+        0x3A: "COLMOD",
+    }
+    return names.get(cmd, "")
+
+
+def emit_c(name, seq, out):
+    print("static const uint8_t %s[] = {" % name, file=out)
+    for rec in seq:
+        if rec[0] == "cmd":
+            cmd, args = rec[1], rec[2]
+            body = "".join(" 0x%02X," % a for a in args)
+            note = describe(cmd)
+            print("    SL6806_LCD_CMD, 0x%02X, %d,%s%s" %
+                  (cmd, len(args), body,
+                   ("   /* %s */" % note) if note else ""), file=out)
+        elif rec[0] == "delay":
+            print("    SL6806_LCD_DELAY, %d, %d,   /* %d ms */" %
+                  (rec[1] & 0xFF, (rec[1] >> 8) & 0xFF, rec[1]), file=out)
+    print("    SL6806_LCD_END,\n};", file=out)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    ap.add_argument("dump")
+    ap.add_argument("--descriptor", type=lambda s: int(s, 0),
+                    help="descriptor address, if the scan picks the wrong one")
+    ap.add_argument("--c", action="store_true", help="emit C tables")
+    args = ap.parse_args()
+
+    fw = load(args.dump)
+    addr, d = find_descriptor(fw, args.descriptor)
+
+    routines = [("init", d["init"]), ("sleep", d["sleep"]), ("wake", d["wake"]),
+                ("display_on", d["display_on"]),
+                ("display_off", d["display_off"])]
+
+    probe = walk(fw, d["init"] & ~1)
+    cmd_fn, data_fn = classify(probe)
+    if cmd_fn is None or data_fn is None:
+        sys.exit("error: could not identify the command/data writers")
+
+    if args.c:
+        out = sys.stdout
+        print("/* Generated by tools/sl6806-panelseq from a %d-byte dump."
+              % len(fw), file=out)
+        print(" * Descriptor at 0x%08X; command writer 0x%08X, data writer "
+              "0x%08X. */" % (addr, cmd_fn, data_fn), file=out)
+        print(file=out)
+        for name, ptr in routines:
+            seq = sequence(fw, ptr & ~1, cmd_fn, data_fn)
+            seq = [r for r in seq if r[0] in ("cmd", "delay")]
+            emit_c("panel_%s" % name, seq, out)
+            print(file=out)
+        return
+
+    print("panel descriptor at 0x%08X" % addr)
+    print("  %d x %d at offset (%d, %d), device id %d, mode %d"
+          % (d["width"], d["height"], d["xoff"], d["yoff"], d["devid"], d["mode"]))
+    print("  RAMWR 0x%02X  RAMRD 0x%02X  CASET 0x%02X  RASET 0x%02X  MADCTL 0x%02X"
+          % (d["ramwr"], d["ramrd"], d["caset"], d["raset"], d["madctl"]))
+    print("  command writer 0x%08X   data writer 0x%08X" % (cmd_fn, data_fn))
+    print()
+    for name, ptr in routines:
+        print("%s @ 0x%08X" % (name, ptr & ~1))
+        for rec in sequence(fw, ptr & ~1, cmd_fn, data_fn):
+            if rec[0] == "cmd":
+                cmd, a = rec[1], rec[2]
+                print("    cmd  %s %-24s %s"
+                      % ("0x%02X" % cmd if cmd is not None else "??",
+                         " ".join("%02X" % x if x is not None else "??" for x in a),
+                         describe(cmd) if cmd is not None else ""))
+            elif rec[0] == "delay":
+                print("    delay %s ms" % rec[1])
+            elif rec[0] == "call":
+                print("    call 0x%08X (r0=%s r1=%s)" % (rec[1], rec[2], rec[3]))
+            else:
+                print("    %s" % (rec,))
+        print()
+
+
+if __name__ == "__main__":
+    main()

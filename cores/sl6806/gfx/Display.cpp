@@ -12,14 +12,15 @@ __attribute__((weak)) void sl6806_panel_unconfigured(void)
 {
     sl6806_debug_print(
         "\r\n"
-        "*** SL6806: no display driver ***\r\n"
+        "*** SL6806: no LCD bus ***\r\n"
         "    Drawing works - the framebuffer and all primitives are\r\n"
-        "    implemented and tested - but there is no panel driver, so\r\n"
-        "    nothing reaches the screen.\r\n"
-        "    The panel controller, resolution and bus are all still unknown;\r\n"
-        "    they live in lv_lcd_init (0x00D3E34C) in the stock firmware.\r\n"
-        "    See docs/LCD.md, then fill in sl6806_panel_get() in your\r\n"
-        "    variant.\r\n\r\n");
+        "    implemented and tested - and so does the panel: geometry,\r\n"
+        "    the vendor init sequence and windowing were all recovered\r\n"
+        "    from the stock firmware.\r\n"
+        "    What is missing is the byte-level transport. Supply an\r\n"
+        "    sl6806_lcd_bus_t - command(), pixels(), reset() - and call\r\n"
+        "    sl6806_lcd_bus_register() before begin(). See docs/LCD.md,\r\n"
+        "    and examples/RomProbe for the shortest route to one.\r\n\r\n");
 }
 
 bool Display::begin()

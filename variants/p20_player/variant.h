@@ -5,17 +5,25 @@
  * string in its firmware is "P20 Player".
  *
  * ===================================================================
- *  PIN NUMBERS ARE NOT KNOWN YET
+ *  MOST PIN NUMBERS ARE STILL UNKNOWN
  * ===================================================================
- * There is no pinout for this board and no GPIO register map for this SoC.
- * The pin table in variant.c is therefore empty, and every digital call
- * reports that GPIO is unconfigured instead of pretending to work.
+ * There is no pinout for this board and no GPIO register map for this SoC,
+ * so most of the names below are placeholders and using them reports that
+ * GPIO is unconfigured instead of pretending to work.
  *
- * To bring GPIO up:
- *   1. Find the GPIO registers - see the recipe in cores/sl6806/hal_gpio.h.
- *   2. Fill in sl6806_gpio_ports[] and sl6806_pin_map[] in variant.c.
- *   3. Define SL6806_GPIO_CONFIGURED (the build then stops warning).
- *   4. Give the pins names below, so sketches read like Arduino sketches.
+ * Two pins are an exception: PIN_LCD_RESET and PIN_EXT_RESET have the vendor
+ * pin ids the stock firmware uses, read off its own call sites. They work as
+ * soon as a vendor back end is installed - see cores/sl6806/hal_gpio.h - and
+ * need no register map.
+ *
+ * To bring the rest up, either:
+ *   1. Find the GPIO registers - see the recipe in cores/sl6806/hal_gpio.h -
+ *      fill in sl6806_gpio_ports[] and sl6806_pin_map[] in variant.c, and
+ *      define SL6806_GPIO_CONFIGURED; or
+ *   2. Work out which vendor pin id each button and LED uses and add it to
+ *      sl6806_vendor_pin_map[] in variant.c.
+ * Either way, give the pins names below so sketches read like Arduino
+ * sketches.
  *
  * If you are bringing up a different SL6806 board, copy this directory
  * rather than editing it, and build with BOARD=<your-board>.
@@ -47,16 +55,18 @@
 #define SL6806_DCS_RAMRD       0x2E
 #define SL6806_DCS_MADCTL      0x36
 
-/* Panel reset line. The vendor code calls its GPIO writer with this pin id
- * and the sequence high / 10ms / low / 20ms / high / 120ms. The encoding of
- * the id is not yet understood, which is why GPIO is still unconfigured. */
-#define SL6806_PANEL_RESET_PIN_ID  0x13800   /* [V] as an opaque vendor id */
+/* Panel reset line, as the vendor's packed pin id. The vendor code drives it
+ * high / 10ms / low / 20ms / high / 120ms. See cores/sl6806/hal_gpio.h for
+ * what is and is not understood about the encoding. */
+#define SL6806_PANEL_RESET_PIN_ID  0x13800   /* [V] */
 
 /*
- * Named pins. These are placeholders: they are indices into an empty pin
- * table, so using them reports "GPIO not configured" rather than driving a
- * pin. They exist so example sketches compile and so the names are in one
- * place when the real mapping is discovered.
+ * Named pins - Arduino pin numbers, indices into the tables in variant.c.
+ *
+ * PIN_LCD_RESET and PIN_EXT_RESET have real vendor pin ids and work through
+ * a vendor back end. The rest are placeholders that report "GPIO not
+ * configured"; they exist so example sketches compile and so the names are
+ * in one place when the real mapping is discovered.
  */
 #define LED_BUILTIN   0   /* [?] which pin, or whether one exists at all */
 
@@ -66,6 +76,9 @@
 #define BTN_MENU      4   /* [?] */
 #define BTN_VOL_UP    5   /* [?] */
 #define BTN_VOL_DOWN  6   /* [?] */
+
+#define PIN_LCD_RESET 7   /* [V] vendor id 0x13800, panel reset */
+#define PIN_EXT_RESET 8   /* [V] vendor id 0x18000, [I] an I2C device's reset */
 
 /* Peripherals known to exist on this board from the firmware analysis, none
  * of which have a driver yet - listed so the hardware inventory lives with
