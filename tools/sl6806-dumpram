@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""
+sl6806-dumpram - dump device SRAM while the stock firmware is running.
+
+WHY: several drivers live in SRAM and are not present in the flash image at
+any linear offset - the LCDC descriptor handoff near 0x0080E842 and the GPIO
+writer at 0x00811C7C among them. Reading them off a running device is far
+quicker than finding the flash->RAM copy statically. That means NORMAL boot
+(card-reader mode), not bootloader mode: in bootloader mode the stock app has
+never run, so its RAM image is not there.
+
+    tools/sl6806-dumpram --out sram.bin              # 0x00800000..0x00840000
+    tools/sl6806-dumpram --start 0x80E000 --size 0x2000 --out lcd.bin
+
+BUILT FOR AN UNRELIABLE DEVICE. This board has been observed enumerating and
+then dropping off USB about a second later. So the dump is chunked and
+resumable: each chunk is written as it arrives, and re-running picks up where
+it stopped. Interrupt it, replug, run it again.
+
+TWO THINGS THAT MAY NOT WORK, both unproven on SL6806:
+
+  1. In card-reader mode the stock application services SCSI, not the boot
+     ROM. read_mem works by writing a small trampoline to 0x003FB000 and
+     executing it, and whether the application honours that vendor command is
+     untested here. The smartlink_flash README reports it working in
+     card-reader mode on SL6801.
+  2. Executing that trampoline while the application is running could hang
+     it. Nothing writes to flash, so a replug recovers. --probe checks with a
+     single small read before committing to a long dump.
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+SRAM_START = 0x00800000
+SRAM_SIZE = 0x00040000
+
+
+def find_tool(explicit):
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.abspath(__file__))
+    for c in [os.path.join(here, "..", "3rd", "smartlink_flash", "smtlink_dump"),
+              shutil.which("smtlink_dump") or ""]:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    sys.exit("error: smtlink_dump not found; pass --tool <path>")
+
+
+def device_present():
+    """True if a 301a:* device is on the bus right now."""
+    base = "/sys/bus/usb/devices"
+    try:
+        for d in os.listdir(base):
+            try:
+                with open(os.path.join(base, d, "idVendor")) as f:
+                    if f.read().strip() == "301a":
+                        return True
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return False
+
+
+def wait_for_device(timeout):
+    """Block until the device shows up. Returns False on timeout."""
+    if device_present():
+        return True
+    print("waiting for the device (plug it in, stock firmware running)...",
+          file=sys.stderr)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if device_present():
+            # Give the kernel a moment to finish enumerating before we claim it.
+            time.sleep(0.2)
+            return True
+        time.sleep(0.1)
+    return False
+
+
+class Reader:
+    def __init__(self, tool, sudo):
+        self.tool = tool
+        self.sudo = sudo
+        self.tmp = tempfile.mkdtemp(prefix="sl6806ram.")
+
+    def read(self, addr, size):
+        """Read a block via the tiny-trampoline path. None on failure."""
+        out = os.path.join(self.tmp, "chunk.bin")
+        try:
+            os.unlink(out)
+        except OSError:
+            pass
+        cmd = (["sudo"] if self.sudo else []) + [
+            self.tool, "chip", "6806",
+            "read_mem", hex(addr), hex(size), out]
+        # No `init` here: it is bootloader-only and hangs in card-reader mode.
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if not os.path.isfile(out):
+            return None
+        with open(out, "rb") as f:
+            data = f.read()
+        if len(data) != size:
+            return data if data else None      # short read - partial chunk
+        return data
+
+
+def looks_like_code(data):
+    """Cheap sanity check: is this plausibly ARM code/data rather than a
+    stuck response or all-zero fill?"""
+    if not data:
+        return False, "empty"
+    if len(set(data)) <= 2:
+        return False, "only %d distinct byte values" % len(set(data))
+    if data == data[:16] * (len(data) // 16) + data[:len(data) % 16]:
+        return False, "a 16-byte block repeated - stuck response"
+    return True, "%d distinct byte values" % len(set(data))
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--out", default="sram.bin")
+    p.add_argument("--start", type=lambda s: int(s, 0), default=SRAM_START)
+    p.add_argument("--size", type=lambda s: int(s, 0), default=SRAM_SIZE)
+    p.add_argument("--chunk", type=lambda s: int(s, 0), default=0x1000,
+                   help="bytes per smtlink_dump invocation (default 4096); "
+                        "smaller loses less when the device drops")
+    p.add_argument("--tool")
+    p.add_argument("--no-sudo", action="store_true")
+    p.add_argument("--probe", action="store_true",
+                   help="read 64 bytes, report whether it looks real, and stop")
+    p.add_argument("--wait", type=float, default=60.0,
+                   help="seconds to wait for the device (0 = do not wait)")
+    p.add_argument("--retries", type=int, default=5,
+                   help="attempts per chunk before giving up")
+    args = p.parse_args()
+
+    tool = find_tool(args.tool)
+    rd = Reader(tool, not args.no_sudo)
+
+    if args.wait and not wait_for_device(args.wait):
+        sys.exit("error: no 301a device appeared within %gs.\n"
+                 "       It must be plugged in AND stay connected. This board\n"
+                 "       has been seen dropping off USB ~1s after enumerating."
+                 % args.wait)
+
+    if args.probe:
+        data = rd.read(args.start, 64)
+        if data is None:
+            sys.exit("probe failed: no data returned.\n"
+                     "  Either the device vanished again, or the running\n"
+                     "  application does not service the vendor read command.")
+        ok, why = looks_like_code(data)
+        print("probe at 0x%08X: %s (%s)" % (args.start,
+                                            "looks real" if ok else "SUSPECT", why))
+        print(data[:64].hex())
+        return 0 if ok else 1
+
+    # Resume: keep whatever a previous run already captured.
+    done = 0
+    if os.path.isfile(args.out):
+        done = os.path.getsize(args.out)
+        done -= done % args.chunk          # drop a partial trailing chunk
+        if done >= args.size:
+            print("%s already covers the whole range" % args.out)
+            return 0
+        if done:
+            print("resuming: %s already has 0x%X bytes" % (args.out, done))
+            with open(args.out, "rb") as f:
+                keep = f.read(done)
+            with open(args.out, "wb") as f:
+                f.write(keep)
+
+    mode = "ab" if done else "wb"
+    t0 = time.time()
+    with open(args.out, mode) as f:
+        off = done
+        while off < args.size:
+            n = min(args.chunk, args.size - off)
+            addr = args.start + off
+
+            data = None
+            for attempt in range(args.retries):
+                if not device_present():
+                    print("\n  device gone - waiting for it to come back...",
+                          file=sys.stderr)
+                    if not wait_for_device(args.wait or 30):
+                        print("\nstopped at 0x%08X. Re-run to resume." % addr,
+                              file=sys.stderr)
+                        return 1
+                data = rd.read(addr, n)
+                if data and len(data) == n:
+                    break
+                time.sleep(0.3)
+
+            if not data or len(data) != n:
+                print("\nfailed at 0x%08X after %d attempts. Re-run to resume."
+                      % (addr, args.retries), file=sys.stderr)
+                return 1
+
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())          # survive a crash mid-dump
+            off += n
+
+            pct = 100.0 * off / args.size
+            rate = off - done
+            el = time.time() - t0
+            sys.stderr.write("\r  0x%08X  %5.1f%%  (%.1f KB/s)"
+                             % (args.start + off, pct,
+                                (rate / 1024.0) / el if el > 0 else 0))
+            sys.stderr.flush()
+
+    print("\nwrote %s (0x%X bytes from 0x%08X)" % (args.out, args.size, args.start))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
