@@ -57,8 +57,15 @@ only partly understood:
 | +0x10 | loadToRam (0x00804C00) | known |
 | +0x14 | runFrom (entry \| 1, Thumb) | known |
 | +0x1C | length copied to RAM (~0x5862 stock) | known |
-| ? | the "mark" the bootloader validates | **not decoded** |
-| ? | which CRC covers the application body | **not decoded** |
+| +0x18 | `0x1000` on the stock image | purpose unclear |
+| ? | `loadCrc` | named by a boot-time log string; the field's offset and whether it is checked are unresolved |
+
+The two questions that used to sit here — the "mark" and the body CRC — turned
+out to belong to the SD-update path, not to this header. The mark is
+`"SL6806"` at +22 **of an `update.up` file**, and the body CRC is a
+write-verify the bootloader computes at flash time. Neither appears in the
+FIRM partition header, so neither blocks this route; `loadCrc` is now the only
+named field here that is not understood.
 
 The bootloader's own debug strings (`header pass`, `mark pass`,
 `time is not same`) show there are checks beyond the fields we understand. An
