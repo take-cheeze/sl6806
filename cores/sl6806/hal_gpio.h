@@ -9,12 +9,19 @@
  * engineering of the pad controller. Nothing in this framework can invent
  * them.
  *
- * So GPIO here is a complete, working driver with exactly one hole in it:
- * the register addresses. Fill in the table below - once - and every
- * Arduino digital call starts working. Until then, calls into it report an
- * error over Serial instead of silently doing nothing, because a silent
- * no-op on a GPIO API is how you spend an afternoon debugging your wiring
- * for no reason.
+ * So GPIO here is a complete, working driver with exactly one hole in it,
+ * and there are two ways to fill it:
+ *
+ *   - the register table below: fill it in once, in your variant, and every
+ *     Arduino digital call starts working; or
+ *   - the vendor back end further down. The stock firmware does not touch
+ *     GPIO registers either - it calls a routine in the mask ROM's driver
+ *     set with a packed pin id - so if you can reach that routine you get
+ *     working pins without knowing a single register address.
+ *
+ * Until one of the two exists, calls report an error over Serial instead of
+ * silently doing nothing, because a silent no-op on a GPIO API is how you
+ * spend an afternoon debugging your wiring for no reason.
  *
  * HOW TO FIND THE REGISTERS
  * -------------------------
@@ -76,6 +83,74 @@ extern const uint8_t            sl6806_gpio_nports;
 extern const sl6806_pin_t       sl6806_pin_map[];
 extern const uint8_t            sl6806_npins;
 
+/* =====================================================================
+ *  THE VENDOR BACK END
+ * =====================================================================
+ * The stock firmware never writes a GPIO register. It calls
+ *
+ *     0x00811C7C  gpio_write(id, value)      13 call sites
+ *     0x00811C90  gpio_config(id, value)     23 call sites
+ *     0x00811CB4  gpio_?(id, value)          18 call sites
+ *
+ * with a packed pin id, from code that lives in SRAM and is not present in
+ * the flash image (sl6806_re_notes.md 7d). Those addresses are stable across
+ * the whole application image, so if a memory dump shows real code there when
+ * your sketch runs, you can call them and get working GPIO without a single
+ * register address.
+ *
+ * The id encoding, read off the 54 call sites:
+ *
+ *     bits [10:7]   configuration nibble; 0x0 or 0xF in everything observed
+ *     bits [16:11]  pin selector, values 3, 14, 15, 39, 48, 54..59, 62, 63
+ *     bits [18:17]  a second selector; 0 for the display pins, 2 for one
+ *                   other group. Whether this is a bank number or more pin
+ *                   bits cannot be told apart from call sites alone.
+ *
+ * SL6806_GPIO_ID() builds the common case. Known ids are named in the
+ * variant.
+ *
+ * The value argument is 0/1 in the reset paths but 0/0x40 in one other, so
+ * it is more likely a pad-register value than a plain logic level. Check
+ * against hardware before trusting a level other than 0 or 1.
+ */
+#define SL6806_GPIO_ID(pin)          (((uint32_t)(pin) & 0x3Fu) << 11)
+#define SL6806_GPIO_ID_CFG(pin, cfg) (SL6806_GPIO_ID(pin) | \
+                                      (((uint32_t)(cfg) & 0xFu) << 7))
+#define SL6806_GPIO_ID_PIN(id)       (((uint32_t)(id) >> 11) & 0x3Fu)
+
+/* Not a real pin id: marks an entry in the variant's vendor map as unknown,
+ * so that pin reports instead of driving whatever id 0 turns out to be. */
+#define SL6806_GPIO_ID_NONE          0xFFFFFFFFu
+
+typedef struct {
+    /* Required. Mirrors the vendor gpio_write(id, value). */
+    void     (*write)(uint32_t id, uint32_t value);
+    /* Optional; without it digitalRead() reports instead of guessing. */
+    uint32_t (*read)(uint32_t id);
+    /* Optional; mirrors the vendor gpio_config(id, value). Not called by
+     * pinMode(): which field of the vendor configuration word selects the
+     * direction, and which the pull, is not known, so pinMode() leaves a
+     * vendor-mapped pad exactly as whatever ran before us configured it.
+     * Guessing a field would silently reconfigure the pad into something
+     * arbitrary. Call this yourself if you know the value you want. */
+    void     (*config)(uint32_t id, uint32_t value);
+} sl6806_gpio_vendor_t;
+
+/*
+ * Install a vendor back end. Pass NULL to remove it. The pointer is kept,
+ * not copied. Returns 0, or -1 if `v` has no write().
+ *
+ * Once installed it takes priority over the register table for any pin that
+ * has an id in sl6806_vendor_pin_map[], so a board can use both: the ROM
+ * routine for pads whose id is known, registers for the rest.
+ */
+int sl6806_gpio_vendor_register(const sl6806_gpio_vendor_t *v);
+
+/* Supplied by the variant: Arduino pin number -> vendor pin id, with
+ * SL6806_GPIO_ID_NONE for pins whose id is unknown. May be empty. */
+extern const uint32_t sl6806_vendor_pin_map[];
+extern const uint8_t  sl6806_nvendor_pins;
+
 /* Low-level accessors - these are what the wiring layer calls. */
 void     sl6806_gpio_set_dir(uint8_t pin, int output);
 void     sl6806_gpio_write(uint8_t pin, int value);
@@ -83,8 +158,9 @@ int      sl6806_gpio_read(uint8_t pin);
 void     sl6806_gpio_set_pull(uint8_t pin, int enable, int up);
 
 /*
- * Returns 1 if the variant has a real register table, 0 if GPIO is still
- * unconfigured. Sketches can check this to degrade gracefully.
+ * Returns 1 if this build can actually drive a pin - either the variant has
+ * a real register table, or a vendor back end is installed and the variant
+ * knows at least one pin id. Sketches can check this to degrade gracefully.
  */
 int      sl6806_gpio_available(void);
 

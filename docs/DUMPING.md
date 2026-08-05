@@ -62,6 +62,52 @@ Then pass `--no-sudo` to the framework's tools.
   ok    partition table at 0x0F000 names FIRM, PICS and FONT
 ```
 
+## Dumping RAM and the mask ROM
+
+A flash dump is not the whole device. Large parts of the SL6806 driver stack
+— the LCD command writers, the GPIO writer, the delay routines — are never in
+flash at all. Enumerating the application's calls shows 251 distinct entry
+points in SRAM, and the HLKJ bootloader independently makes 393 calls to 100
+entry points inside the **mask ROM** at `0x00000000`. The ROM is not just a
+USB downloader; it is the vendor SDK's shared driver library.
+
+```sh
+tools/sl6806-ramcalls dump.bin           # the SRAM surface, ranked
+tools/sl6806-ramcalls dump.bin --rom     # the mask ROM surface
+```
+
+So the ROM is what is worth reading next, and **bootloader mode** is where to
+read it: the boot ROM answers there, over the same channel that already works
+for uploading payloads. That has not been run against an SL6806 yet - use
+`--probe` before committing to a long dump.
+
+```sh
+tools/sl6806-dumpram --start 0 --size 0x7D000 --out maskrom.bin
+tools/sl6806-dumpram --start 0x800000 --size 0x40000 --out sram.bin
+```
+
+Two things this answers immediately, both cheap:
+
+- **Is there code at `0x0080E842` and `0x00811C7C` right now?** If a
+  bootloader-mode SRAM read shows real Thumb code at the addresses the
+  application calls, then a payload can call them too — which is a working
+  LCD bus and working `digitalWrite()` with no register map. If it shows
+  zeros, the ROM only installs those drivers on the normal boot path, and
+  they have to come from the ROM image instead.
+- **What the ROM's driver code actually does**, which is the only complete
+  answer to the GPIO register question.
+
+Caveats worth knowing before you spend time on it:
+
+- The read command works by writing a small trampoline to RAM and executing
+  it, so it perturbs the very thing you are reading. Keep the dump target
+  away from `0x003FB000`, and treat a single anomalous region with suspicion.
+- Reading SRAM under the *stock application* (card-reader mode) does not
+  work: the application services SCSI and stalls the vendor command
+  (`LIBUSB_ERROR_PIPE`), and the attempt resets the device.
+- Stop `fwupd` first. Its probing has been observed knocking this board off
+  the bus about 1.3 s after it enumerates.
+
 ## Keep it
 
 That dump is your recovery image. USB download mode lives in mask ROM rather

@@ -70,6 +70,22 @@ void analogWriteResolution(uint8_t bits);
 
 #define lowByte(w)                  ((uint8_t)((w) & 0xff))
 #define highByte(w)                 ((uint8_t)((w) >> 8))
+#define makeWord(h, l)              ((uint16_t)(((h) << 8) | ((l) & 0xff)))
+
+/* ---- bit-banged I/O and pulse timing ----
+ * These are built out of digitalWrite/digitalRead/micros, so they work
+ * wherever those do. */
+void     shiftOut(uint8_t dataPin, uint8_t clockPin, uint8_t bitOrder,
+                  uint8_t val);
+uint8_t  shiftIn(uint8_t dataPin, uint8_t clockPin, uint8_t bitOrder);
+uint32_t pulseIn(uint8_t pin, uint8_t state, uint32_t timeout);
+uint32_t pulseInLong(uint8_t pin, uint8_t state, uint32_t timeout);
+
+/* ---- not available on this chip yet; these report instead of no-op ---- */
+void tone(uint8_t pin, unsigned int frequency, unsigned long duration);
+void noTone(uint8_t pin);
+void attachInterrupt(uint8_t pin, void (*handler)(void), int mode);
+void detachInterrupt(uint8_t pin);
 
 /* ---- misc ---- */
 long map(long x, long in_min, long in_max, long out_min, long out_max);
@@ -100,6 +116,15 @@ inline long random(long max)           { return sl6806_random(max); }
 inline long random(long min, long max) { return sl6806_random_range(min, max); }
 inline long random(int max)            { return sl6806_random(max); }
 inline long random(int min, int max)   { return sl6806_random_range(min, max); }
+
+/* Arduino's default arguments. Only one of each pair may have C linkage, so
+ * the defaulted forms are C++ overloads. */
+inline uint32_t pulseIn(uint8_t pin, uint8_t state)
+    { return pulseIn(pin, state, 1000000UL); }
+inline void tone(uint8_t pin, unsigned int frequency)
+    { tone(pin, frequency, 0UL); }
+inline uint16_t word(uint8_t h, uint8_t l) { return makeWord(h, l); }
+inline uint16_t word(uint16_t w)           { return w; }
 
 template <typename T> inline const T &sl_min(const T &a, const T &b) { return a < b ? a : b; }
 template <typename T> inline const T &sl_max(const T &a, const T &b) { return a > b ? a : b; }
