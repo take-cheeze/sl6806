@@ -24,7 +24,7 @@ WHAT THE TWO HELPERS ARE
     0x0080E842  lcd_write_cmd(last, devid, cmd)
     0x0080E8D8  lcd_write_data(last, byte)
 
-Both live in SRAM and are not in the flash image (see sl6806_re_notes.md
+Both live in SRAM and are not in the flash image (see docs/sl6806_re_notes.md
 7d/13), so this tool identifies them by call frequency from inside the panel
 routines rather than by disassembling them: within the panel functions only
 two SRAM addresses are ever called with this shape, the one that always takes
@@ -42,8 +42,8 @@ import sys
 
 XIP_BASE = 0x00C00000
 
-# Delay helpers, identified in sl6806_re_notes.md 7d. Both take milliseconds
-# in r0 in every call site seen inside the panel routines.
+# Delay helpers, identified in docs/sl6806_re_notes.md 7d. Both take
+# milliseconds in r0 in every call site seen inside the panel routines.
 DELAY_MS = (0x008072E4, 0x00807214)
 
 # Record opcodes for the emitted byte stream. Kept in sync with

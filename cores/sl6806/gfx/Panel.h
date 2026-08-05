@@ -22,8 +22,8 @@
  *
  * - live in SRAM and are not present anywhere in the flash image, so they
  * cannot be disassembled from a dump. They belong to the mask ROM's driver
- * set (see sl6806_re_notes.md 7d), which means a ROM dump, not a flash dump,
- * is what unlocks them.
+ * set (see docs/sl6806_re_notes.md 7d), which means a ROM dump, not a flash
+ * dump, is what unlocks them.
  *
  * So this header defines the seam at exactly that line. Supply an
  * sl6806_lcd_bus_t - three short functions - and the whole stack above it

@@ -16,8 +16,8 @@ what is worth recovering first.
     tools/sl6806-ramcalls dump.bin --sites 811c7c  # every call site of one
 
 WHAT --sites GIVES YOU. It prints the immediate values loaded into r0-r3
-before each call. That is how the GPIO pin ids in sl6806_re_notes.md 7e were
-recovered, and how the panel command sequence was read: for routines whose
+before each call. That is how the GPIO pin ids in docs/sl6806_re_notes.md 7e
+were recovered, and how the panel command sequence was read: for routines whose
 arguments are constants, the call sites contain the whole data set.
 
 A caveat worth stating: this decodes every 32-bit BL encoding at every 2-byte
