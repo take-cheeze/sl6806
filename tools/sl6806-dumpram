@@ -5,8 +5,8 @@ sl6806-dumpram - dump device memory over USB.
 WHY: large parts of the SL6806 driver stack are not in the flash image at any
 linear offset - the LCD command writers at 0x0080E842/0x0080E8D8 and the GPIO
 writer at 0x00811C7C among them. They belong to the mask ROM's driver set
-(sl6806_re_notes.md 7d), so the way to read them is to read memory, not more
-flash.
+(docs/sl6806_re_notes.md 7d), so the way to read them is to read memory, not
+more flash.
 
     # the mask ROM - the SDK's shared driver library, 500 KB at 0
     tools/sl6806-dumpram --start 0 --size 0x7D000 --out maskrom.bin

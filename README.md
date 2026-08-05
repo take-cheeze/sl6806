@@ -233,8 +233,8 @@ Flash layout: HLKJ bootloader at `0x0`, partition table at `0xF000`, then
 
 The stock application is an LVGL 8.x UI over a scene framework, plus FFmpeg
 and a Bluetooth stack. Full analysis is in
-[`sl6806_re_notes.md`](sl6806_re_notes.md); the addresses this framework
-depends on are annotated with their provenance in
+[`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md); the addresses this
+framework depends on are annotated with their provenance in
 [`cores/sl6806/sl6806.h`](cores/sl6806/sl6806.h) and
 [`cores/sl6806/sl6806_rom.h`](cores/sl6806/sl6806_rom.h) — `[V]` verified,
 `[A]` architectural, `[I]` inferred, `[?]` unknown.
@@ -270,7 +270,7 @@ ld/               linker scripts, one per build mode
 tools/            host-side Python tools
 examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe
 tests/host/       native tests for console, graphics and the panel
-docs/             DUMPING.md, FLASHING.md, LCD.md
+docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
 3rd/              smartlink_flash submodule
 ```
 

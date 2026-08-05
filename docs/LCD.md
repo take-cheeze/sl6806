@@ -73,9 +73,10 @@ routines in SRAM:
 
 `last` is 0 on the final byte of a command and 1 while more follow.
 
-These belong to the mask ROM's driver set (`sl6806_re_notes.md` §7d), not to
-the application, so they may well be resident when your payload runs. That is
-a question a memory read answers in one command — see
+These belong to the mask ROM's driver set
+([`sl6806_re_notes.md`](sl6806_re_notes.md) §7d), not to the application, so
+they may well be resident when your payload runs. That is a question a memory
+read answers in one command — see
 [DUMPING.md](DUMPING.md#dumping-ram-and-the-mask-rom). If there is real Thumb
 code at `0x0080E842`, a bus is two `((void(*)(int,int,int))0x0080E843)(…)`
 calls.

@@ -93,8 +93,8 @@ extern const uint8_t            sl6806_npins;
  *     0x00811CB4  gpio_?(id, value)          18 call sites
  *
  * with a packed pin id, from code that lives in SRAM and is not present in
- * the flash image (sl6806_re_notes.md 7d). Those addresses are stable across
- * the whole application image, so if a memory dump shows real code there when
+ * the flash image (docs/sl6806_re_notes.md 7d). Those addresses are stable
+ * across the whole application image, so if a memory dump shows real code when
  * your sketch runs, you can call them and get working GPIO without a single
  * register address.
  *

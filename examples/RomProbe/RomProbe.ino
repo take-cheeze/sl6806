@@ -5,7 +5,7 @@
  * WHAT THIS IS FOR
  * The SL6806's LCD writers, GPIO writer and delay routines are not in the
  * flash image. They belong to the mask ROM's driver set and are called by the
- * stock firmware at fixed SRAM addresses (sl6806_re_notes.md 7d). Whether
+ * stock firmware at fixed SRAM addresses (docs/sl6806_re_notes.md 7d). Whether
  * they are also resident when *your* payload runs is a question nobody has
  * answered, and it is the difference between "the display needs a driver
  * written" and "the display needs six lines of glue".

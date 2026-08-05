@@ -18,8 +18,8 @@
  * two routines that live in SRAM and are not in the flash image at any
  * offset (0x0080E842 lcd_write_cmd, 0x0080E8D8 lcd_write_data), so they
  * cannot be read out of a dump. They belong to the mask ROM's driver set -
- * see sl6806_re_notes.md 7d - which is why docs/DUMPING.md now describes how
- * to dump the ROM.
+ * see docs/sl6806_re_notes.md 7d - which is why docs/DUMPING.md now
+ * describes how to dump the ROM.
  *
  * Register an sl6806_lcd_bus_t and everything below starts working:
  *
