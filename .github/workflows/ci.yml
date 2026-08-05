@@ -1,0 +1,106 @@
+# CI for the SL6806 Arduino framework.
+#
+# Three jobs, in increasing order of what they need installed, so a failure
+# tells you roughly where the problem is without reading the log:
+#
+#   host-tests  gcc only. The pure-logic parts: console ring, framebuffer,
+#               panel command stream. Runs under ASan/UBSan.
+#   build       the ARM toolchain. Every sketch, both build modes. This is
+#               the "minimum build" gate: if it fails, nothing else matters.
+#   smoke       toolchain + Unicorn. Runs the built images and checks what
+#               they actually print.
+#
+# The tools job is deliberately cheap and separate: the Python tools are the
+# reverse-engineering half of the project and are easy to break with a typo
+# that no C build would catch.
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-tests:
+    name: host tests (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run
+        run: make -C tests/host
+
+  build:
+    name: build ${{ matrix.sketch }} (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sketch: [Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe]
+        mode: [payload, firmware]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the ARM toolchain
+        # The newlib packages are *recommends* of gcc-arm-none-eabi, not
+        # depends, so --no-install-recommends alone leaves a compiler with no
+        # C library headers and every build dies on <string.h>. Name them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libstdc++-arm-none-eabi-newlib
+      - name: Build
+        # -Werror here rather than in the Makefile: a warning should stop CI
+        # without making a local experiment painful.
+        run: |
+          make SKETCH=examples/${{ matrix.sketch }} MODE=${{ matrix.mode }} \
+               BUILD_DIR=build/${{ matrix.sketch }}-${{ matrix.mode }} \
+               EXTRA_FLAGS=-Werror
+      - name: Report size
+        run: |
+          arm-none-eabi-size \
+            build/${{ matrix.sketch }}-${{ matrix.mode }}/${{ matrix.sketch }}.elf
+
+  smoke:
+    name: emulator smoke tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the ARM toolchain
+        # The newlib packages are *recommends* of gcc-arm-none-eabi, not
+        # depends, so --no-install-recommends alone leaves a compiler with no
+        # C library headers and every build dies on <string.h>. Name them.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libstdc++-arm-none-eabi-newlib
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install Unicorn
+        run: pip install unicorn
+      - name: Run
+        run: make -C tests/emu
+
+  tools:
+    name: python tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Compile and start every tool
+        # --help exercises argparse and the module-level code, which is where
+        # a syntax error or a bad default actually lives.
+        run: |
+          for t in tools/sl6806-*; do
+            echo "== $t"
+            python3 -m py_compile "$t"
+            python3 "$t" --help > /dev/null
+          done

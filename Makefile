@@ -73,8 +73,12 @@ OPT    := -Os -ffunction-sections -fdata-sections -fno-common
 INCS   := -I$(CORE_DIR) -I$(VARIANT_DIR)
 DEFS   := -DF_CPU=$(F_CPU)UL -DSL6806=1 $(MODE_DEF)
 
-CFLAGS   := $(ARCH) $(WARN) $(OPT) $(INCS) $(DEFS) -std=gnu11
-CXXFLAGS := $(ARCH) $(WARN) $(OPT) $(INCS) $(DEFS) -std=gnu++17 \
+# Appended to every compile. CI passes -Werror here rather than baking it in,
+# so a warning stops the build there without making local experiments painful.
+EXTRA_FLAGS ?=
+
+CFLAGS   := $(ARCH) $(WARN) $(OPT) $(INCS) $(DEFS) $(EXTRA_FLAGS) -std=gnu11
+CXXFLAGS := $(ARCH) $(WARN) $(OPT) $(INCS) $(DEFS) $(EXTRA_FLAGS) -std=gnu++17 \
             -fno-exceptions -fno-rtti -fno-threadsafe-statics -fno-use-cxa-atexit
 LDFLAGS  := $(ARCH) -T$(LDSCRIPT) -nostartfiles -Wl,--gc-sections \
             -Wl,-Map=$(OUT).map -specs=nano.specs -u _printf_float
@@ -84,8 +88,14 @@ OBJS := $(addprefix $(BUILD_DIR)/obj/,$(CORE_C:.c=.c.o) $(CORE_CXX:.cpp=.cpp.o) 
 OBJS += $(addprefix $(BUILD_DIR)/obj/,$(addsuffix .o,$(SKETCH_SRC)))
 
 # ----------------------------------------------------------------- rules
-.PHONY: all clean upload monitor run size
+.PHONY: all clean upload monitor run size test
 all: $(OUT).bin size
+
+# Both suites. tests/emu needs the toolchain and Unicorn and says so if they
+# are missing, so this stays useful with only gcc installed.
+test:
+	$(MAKE) -C tests/host
+	$(MAKE) -C tests/emu
 
 $(BUILD_DIR)/obj/%.c.o: %.c
 	@mkdir -p $(dir $@)

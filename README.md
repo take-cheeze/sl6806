@@ -125,17 +125,36 @@ its driver readable in the bootloader; see
 
 ## Testing
 
-The hardware-independent parts of the core are tested natively, under
-AddressSanitizer and UBSan:
+Two suites, neither of which needs a device:
 
 ```sh
-make -C tests/host
+make test              # both
+make -C tests/host     # pure logic, under ASan/UBSan
+make -C tests/emu      # real ARM images, under an emulator
 ```
 
-This covers the console ring (wrapping, overflow accounting, framing) and all
-drawing primitives (clipping, shapes, text). `tests/host/host_stub.h` is
-force-included so core sources compile for the host without a single `#ifdef`
-for testing. The graphics test also writes `gfx_demo.ppm` for visual checks.
+**Host tests** cover the parts that are algorithms: the console ring
+(wrapping, overflow accounting, framing), every drawing primitive (clipping,
+shapes, text), and the panel command stream and window arithmetic.
+`tests/host/host_stub.h` is force-included so core sources compile for the
+host without a single `#ifdef` for testing. The graphics test writes
+`gfx_demo.ppm` for visual checks.
+
+**Emulator smoke tests** build real payload images with this Makefile and run
+them under [Unicorn](https://www.unicorn-engine.org/), then check what they
+printed. That covers the seam the host tests cannot reach — `.bss` cleared,
+C++ constructors run, the heap up, timekeeping finding a counter, `setup()`
+and `loop()` executing, bytes reaching the console ring in the right order.
+Every failure they catch shows up on hardware as "the device printed
+nothing", which is the symptom that tells you least.
+
+They need `pip install unicorn` and the ARM toolchain. What they emulate is
+memory, not peripherals: passing says the software starts, and says nothing
+about whether any peripheral register in the framework is right — there is no
+peripheral behind them. See `tests/emu/sl6806_emu.py`.
+
+CI runs both on every push and pull request, plus a build of all six sketches
+in both modes with `-Werror`, and a start-up check of every Python tool.
 
 ## Getting started
 
