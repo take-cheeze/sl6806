@@ -45,9 +45,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install the ARM toolchain
+        # The newlib packages are *recommends* of gcc-arm-none-eabi, not
+        # depends, so --no-install-recommends alone leaves a compiler with no
+        # C library headers and every build dies on <string.h>. Name them.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libstdc++-arm-none-eabi-newlib
       - name: Build
         # -Werror here rather than in the Makefile: a warning should stop CI
         # without making a local experiment painful.
@@ -66,9 +71,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install the ARM toolchain
+        # The newlib packages are *recommends* of gcc-arm-none-eabi, not
+        # depends, so --no-install-recommends alone leaves a compiler with no
+        # C library headers and every build dies on <string.h>. Name them.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libstdc++-arm-none-eabi-newlib
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
