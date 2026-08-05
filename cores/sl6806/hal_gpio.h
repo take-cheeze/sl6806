@@ -93,10 +93,15 @@ extern const uint8_t            sl6806_npins;
  *     0x00811CB4  gpio_?(id, value)          18 call sites
  *
  * with a packed pin id, from code that lives in SRAM and is not present in
- * the flash image (docs/sl6806_re_notes.md 7d). Those addresses are stable
- * across the whole application image, so if a memory dump shows real code when
- * your sketch runs, you can call them and get working GPIO without a single
- * register address.
+ * the flash image (docs/sl6806_re_notes.md 7d).
+ *
+ * BE WARNED: those routines are NOT resident in bootloader mode. A dump of
+ * SRAM taken there shows uninitialised noise at 0x00811C7C, because the
+ * application that installs them has never run (7f). So a payload cannot
+ * simply call them, and this back end has no working implementation yet. It
+ * is still the right shape for one - a variant that finds another way to
+ * reach the vendor driver, or reimplements it once the registers are known,
+ * plugs in here and every named pin below starts working.
  *
  * The id encoding, read off the 54 call sites:
  *

@@ -195,7 +195,7 @@ declarations are not synthesised — define helpers before you call them.
 
 | Tool | Purpose |
 |---|---|
-| `sl6806-checkdump` | **Run this on every dump.** Detects the silent-failure dump, verifies both HLKJ CRCs and the partition table. |
+| `sl6806-checkdump` | **Run this on every dump.** Detects the silent-failure dump, verifies both HLKJ CRCs and the partition table. `--rom` / `--sram` validate memory dumps, which fail as plausible noise rather than as a repeated block. |
 | `sl6806-upload` | Loads a payload; refuses to proceed if the device is in card-reader mode. |
 | `sl6806-monitor` | Serial monitor; finds the ring buffer by symbol, not by hardcoded address. |
 | `sl6806-find-mmio` | Ranks candidate peripheral base addresses in a dump. |
@@ -243,20 +243,22 @@ framework depends on are annotated with their provenance in
 
 In rough order of how much they unlock:
 
-1. **A mask ROM dump.** `0x00000000`–`0x0007D000`, readable in bootloader
-   mode. It is the vendor SDK's shared driver library — the LCD writers, the
-   GPIO writer and the delay routines all live there — so one dump unblocks
-   GPIO *and* the display at once. See
-   [docs/DUMPING.md](docs/DUMPING.md#dumping-ram-and-the-mask-rom).
-2. **The LCDC command-list opcodes.** The controller is at `0x400D9000`, the
+1. **The LCDC command-list opcodes.** The controller is at `0x400D9000`, the
    register map is written down, and the descriptor handoff is understood.
    What is left is the meaning of `0xABAB0005` and `0xCDCDxx03`. Everything
-   above that layer is already written and tested.
-3. **GPIO registers** — the other route to `digitalWrite`. Start with
-   `tools/sl6806-find-mmio`.
-4. **The real CPU clock** — makes all timing absolute. A stopwatch does it;
+   above that layer is already written and tested, so this is now the single
+   thing between the framework and a picture.
+2. **GPIO registers** — the only route to `digitalWrite`. Start with
+   `tools/sl6806-find-mmio`. Note the mask ROM has been dumped and does *not*
+   contain them.
+3. **The real CPU clock** — makes all timing absolute. A stopwatch does it;
    finding the PLL registers does it exactly. It is *not* at the clock unit's
    base: `0x40080000` has dividers but no multiplier.
+
+The mask ROM has since been dumped, which settled two questions in the
+negative: it holds no LCD driver, and the vendor SRAM routines are not
+resident in bootloader mode, so a payload cannot call them. See
+[docs/sl6806_re_notes.md](docs/sl6806_re_notes.md) §7f.
 
 ## Layout
 

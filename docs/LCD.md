@@ -59,9 +59,9 @@ Register one and the init sequence, window addressing, framebuffer, text and
 `sl6806_panel_get()` returns `NULL` and `Display::begin()` says why, because a
 panel that silently drops frames is worse than an absent one.
 
-## Three ways to write that bus
+## Two ways to write that bus
 
-### 1. Call the ROM routines (easiest, if they are resident)
+### Not a route: calling the vendor routines
 
 The stock firmware does not touch LCD registers directly. It calls two
 routines in SRAM:
@@ -73,19 +73,18 @@ routines in SRAM:
 
 `last` is 0 on the final byte of a command and 1 while more follow.
 
-These belong to the mask ROM's driver set
-([`sl6806_re_notes.md`](sl6806_re_notes.md) §7d), not to the application, so
-they may well be resident when your payload runs. That is a question a memory
-read answers in one command — see
-[DUMPING.md](DUMPING.md#dumping-ram-and-the-mask-rom). If there is real Thumb
-code at `0x0080E842`, a bus is two `((void(*)(int,int,int))0x0080E843)(…)`
-calls.
+It was worth hoping these were resident when a payload runs — that would have
+made a bus two calls. **They are not.** A bootloader-mode dump of
+`0x00800000`–`0x00840000` shows uniformly random bytes at both addresses, and
+the dump is demonstrably faithful: the relocated vector table and the ROM's
+own stack read back correctly in the same file. In bootloader mode the
+application has never run, so nothing has installed its drivers.
+[`sl6806_re_notes.md`](sl6806_re_notes.md) §7f has the evidence.
 
-Do check first. Calling into whatever happens to be at a fixed SRAM address
-is exactly the kind of thing that appears to work and then corrupts something
-three seconds later.
+`examples/RomProbe` re-runs this check on your own unit in one build, which
+is worth doing before you trust the result on hardware nobody has tested.
 
-### 2. Program the LCD controller
+### 1. Program the LCD controller
 
 The controller is at **`0x400D9000`**, and unlike the application's copy, a
 driver for it *is* in the flash image: the HLKJ bootloader initialises the
@@ -110,10 +109,10 @@ Note that the clock gating is understood: `cores/sl6806/sl6806_cru.h`. (The
 clock unit is at `0x40080000`; earlier notes called that the LCD controller,
 which was wrong and sent the analysis in a circle.)
 
-### 3. Bit-bang it
+### 2. Bit-bang it
 
-Needs the GPIO registers, which are not known. Listed for completeness; the
-first two routes are both shorter.
+Needs the GPIO registers, which are not known — and the mask ROM dump did
+not reveal them either. Listed for completeness; the LCDC route is shorter.
 
 ## Memory, before you pick a resolution
 
