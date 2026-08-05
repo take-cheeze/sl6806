@@ -47,14 +47,17 @@ extern "C" {
  * The byte-level transport to the panel controller. This is the one thing
  * the framework cannot supply for you.
  *
- * A bus can be implemented three ways, in increasing order of difficulty:
+ * A bus can be implemented two ways:
  *
- *   1. Call the ROM routines above, if a memory dump confirms they are
- *      resident when your sketch runs. See docs/LCD.md.
- *   2. Program the LCD controller directly, once its registers are known.
- *   3. Bit-bang the panel on GPIO, once the GPIO registers are known.
+ *   1. Program the LCD controller at 0x400D9000 - see sl6806_lcdc.h. This is
+ *      the realistic route.
+ *   2. Bit-bang the panel on GPIO, once the GPIO registers are known.
  *
- * All three produce the same three functions.
+ * A third route - calling the vendor routines above - has been tried and
+ * does NOT work: a bootloader-mode memory dump shows uninitialised noise at
+ * both addresses, because the application that installs them has never run.
+ * See docs/sl6806_re_notes.md 7f. Both routes produce the same three
+ * functions.
  */
 typedef struct {
     const char *name;      /* shown at startup, e.g. "ROM lcd_write" */

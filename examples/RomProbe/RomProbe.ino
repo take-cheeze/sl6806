@@ -5,13 +5,18 @@
  * WHAT THIS IS FOR
  * The SL6806's LCD writers, GPIO writer and delay routines are not in the
  * flash image. They belong to the mask ROM's driver set and are called by the
- * stock firmware at fixed SRAM addresses (docs/sl6806_re_notes.md 7d). Whether
- * they are also resident when *your* payload runs is a question nobody has
- * answered, and it is the difference between "the display needs a driver
- * written" and "the display needs six lines of glue".
+ * stock firmware at fixed SRAM addresses (docs/sl6806_re_notes.md 7d).
  *
- * This sketch answers it. It reads the memory at each known entry point and
- * prints it, so you can see whether there is real Thumb code there.
+ * THE ANSWER, ON THE ONE UNIT MEASURED SO FAR, IS NO. A bootloader-mode dump
+ * of SRAM shows uniformly random bytes at every one of those addresses - the
+ * application that installs them has never run at that point, so nothing is
+ * there. See docs/sl6806_re_notes.md 7f for why that dump is trustworthy.
+ *
+ * This sketch is what measured it, and it is still worth running: it checks
+ * *your* unit, in the mode your sketch actually runs in, in one build. If it
+ * disagrees with the result above, that is a genuinely interesting finding
+ * and the display gets much easier. It reads the memory at each known entry
+ * point and prints it, so you can see whether there is real Thumb code.
  *
  *     make SKETCH=examples/RomProbe run
  *
@@ -27,10 +32,10 @@
  * sl6806_lcd_bus_t out of the two LCD writers and asks the display stack to
  * run the real panel init sequence.
  *
- * That is deliberately not the default. Calling whatever happens to sit at a
- * fixed address is how you get a fault several seconds later in unrelated
- * code, and the probe above costs nothing while the call might cost you a
- * confusing afternoon. Look first.
+ * Given the measurement above, expect that to fault. It is not the default
+ * for exactly that reason: calling whatever happens to sit at a fixed address
+ * is how you get a crash several seconds later in unrelated code, while the
+ * probe costs nothing. Look at the output first, every time.
  */
 
 #define USE_ROM_ROUTINES 0
@@ -146,10 +151,12 @@ void setup()
     Serial.println(" entry points look like live code.");
 
     if (live == 0) {
-        Serial.println("Nothing is resident in this mode. The routines have to");
-        Serial.println("come from a mask ROM dump - see docs/DUMPING.md.");
+        Serial.println("Nothing is resident - which is the expected result.");
+        Serial.println("The display has to go through the LCD controller at");
+        Serial.println("0x400D9000 instead; see docs/LCD.md.");
     } else {
-        Serial.println("Worth trying: set USE_ROM_ROUTINES to 1 and rebuild.");
+        Serial.println("Unexpected - the reference unit had nothing here.");
+        Serial.println("Worth reporting. Set USE_ROM_ROUTINES to 1 to try it.");
     }
 
 #if USE_ROM_ROUTINES

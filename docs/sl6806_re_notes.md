@@ -263,7 +263,8 @@ code. That is why no flash→RAM copy exists to find.
 
 **Consequence: dump the ROM, not more flash.** `0x00000000`–`0x0007D000` is
 readable with the same vendor read command that loads payloads, in bootloader
-mode, where it is the ROM itself answering. See docs/DUMPING.md.
+mode, where it is the ROM itself answering. See docs/DUMPING.md. **This has
+now been done — see §7f for what the dumps say.**
 
 **Three routes tried and eliminated:**
 
@@ -330,6 +331,87 @@ elsewhere, so it is more likely a pad-register value than a logic level.
 The framework exposes this as an optional back end — see
 `cores/sl6806/hal_gpio.h` — so a build that can reach `0x00811C7C` gets
 working `digitalWrite()` with no register map at all.
+
+## 7f. The mask ROM and SRAM dumps — what they settle
+
+`tools/sl6806-dumpram` was run in bootloader mode and produced a 512000-byte
+`maskrom.bin` (`0x00000000`–`0x0007D000`) and a 262144-byte `sram.bin`
+(`0x00800000`–`0x00840000`). Neither is committed here; both are reproducible
+with the commands in docs/DUMPING.md.
+
+**Both dumps are genuine.** Three independent checks:
+
+- 93.1% of the 7480 `BL`/`BLX` encodings in the ROM resolve to targets inside
+  the ROM. A shifted or corrupt image does not do that.
+- Every entry point the HLKJ bootloader calls into ROM lands on a real
+  instruction. `0x000640` — the one the bootloader calls 153 times — begins
+  `push {r0,r1,r2,r3}` / `push {r4,r5,lr}`, the classic varargs prologue,
+  confirming it is the log/printf the call pattern implied.
+- In the SRAM dump, 83.4% of the words in `0x00800000`–`0x00801000` are
+  ROM-range pointers (chance level 0.01%), i.e. a relocated 256-entry vector
+  table, and 6.6% of the words just below the ROM's initial SP `0x00806000`
+  are ROM-range return addresses. So `read_mem` addresses SRAM correctly and
+  the ROM really is running.
+
+### SETTLED, NEGATIVE: the vendor routines are not resident in bootloader mode
+
+This was the cheap hypothesis worth testing — if `0x0080E842` and
+`0x00811C7C` held real code when a payload runs, a working LCD bus and
+`digitalWrite()` were a few lines of glue away. **They do not.**
+
+| Address | Expected | Found in SRAM |
+|---|---|---|
+| `0x0080E842` | `lcd_write_cmd` | `70 4c bd 7f 7e 3f 9f 63` |
+| `0x0080E8D8` | `lcd_write_data` | `c3 dd 38 ea cc 42 01 dc` |
+| `0x00811C7C` | `gpio_write` | `3d 75 f0 9e a8 1b f9 f5` |
+| `0x008072E4` | `delay_ms` | `1e 65 fc 74 b9 82 60 c7` |
+
+Everything above roughly `0x00806000` is uniformly random: entropy 7.96 bits
+per byte, 50.08% ones, no repeated 16-byte block in 256 KB, and 0.0% of words
+in the driver pages are pointers to anywhere plausible. The dump is faithful
+(see the vector table and stack above); the memory is simply empty. Which is
+what it should be — in bootloader mode the application has never run, so
+nothing has installed its drivers.
+
+**So the "call the ROM routines" route is dead for payloads.** Anything that
+jumps to those SRAM addresses from a payload is jumping into uninitialised
+memory.
+
+### SETTLED, NEGATIVE: the driver blob is not in the ROM either
+
+Same delta search as §7d.2/7d.3, now over the ROM: 251 known entry points
+against 2117 prologue sites. Best delta scores 15/251 against a noise floor of
+13–14. Nothing. The SRAM drivers are not stored verbatim in the mask ROM any
+more than they are in flash, so they are assembled, decompressed or fetched at
+runtime by the application — still unexplained.
+
+### What the ROM does contain
+
+- **No LCD driver.** `0x400D9000` is never referenced. The boot ROM does USB,
+  storage and clocks; the display belongs entirely to the application. So the
+  LCDC route (§12b) has to go through the register map, not through a ROM
+  call.
+- **A 52-register system controller at `0x40080000`**, used from `+0x00` to
+  `+0x120` on a 4-byte stride, 264 references. This corroborates §7c: it is
+  the clock/reset unit, and the application's LCD path only ever touches four
+  of those registers.
+- **A storage controller at `0x400F1000`**, registers `+0x00`–`+0x5C` — the
+  sibling of the `0x400F7000` block the flash bootloader drives.
+- `0x40030000`, `0x40040000` and `0x40020000` are addressed as absolute
+  16-bit registers rather than base+offset, so they need a different scan.
+
+**Still not found: GPIO.** No block in the ROM has the read-modify-write-on-a-
+bit-index shape, and the `ubfx rX, rX, #11, #6` at `0x0041DC` — which looks
+exactly like the vendor pin-id field — is a false lead: it is inside the
+SD/MMC driver, extracting a response field.
+
+### What this changes
+
+The ROM is resident and callable from a payload by construction — the flash
+bootloader already makes 393 such calls. That is the remaining constructive
+use of this dump: ROM entry points are stable addresses, and their signatures
+can be recovered from the bootloader's call sites. What the ROM cannot give
+is the display, because it has no display driver.
 
 ## 8. LVGL — confirmed **v8.x**
 

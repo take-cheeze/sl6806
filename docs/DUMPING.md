@@ -76,26 +76,29 @@ tools/sl6806-ramcalls dump.bin           # the SRAM surface, ranked
 tools/sl6806-ramcalls dump.bin --rom     # the mask ROM surface
 ```
 
-So the ROM is what is worth reading next, and **bootloader mode** is where to
-read it: the boot ROM answers there, over the same channel that already works
-for uploading payloads. That has not been run against an SL6806 yet - use
-`--probe` before committing to a long dump.
+**Bootloader mode** is where to read them: the boot ROM answers there, over
+the same channel that already works for uploading payloads. Use `--probe`
+before committing to a long dump.
 
 ```sh
 tools/sl6806-dumpram --start 0 --size 0x7D000 --out maskrom.bin
 tools/sl6806-dumpram --start 0x800000 --size 0x40000 --out sram.bin
 ```
 
-Two things this answers immediately, both cheap:
+**This has been done, and the results are in
+[`sl6806_re_notes.md`](sl6806_re_notes.md) §7f.** In short:
 
-- **Is there code at `0x0080E842` and `0x00811C7C` right now?** If a
-  bootloader-mode SRAM read shows real Thumb code at the addresses the
-  application calls, then a payload can call them too — which is a working
-  LCD bus and working `digitalWrite()` with no register map. If it shows
-  zeros, the ROM only installs those drivers on the normal boot path, and
-  they have to come from the ROM image instead.
-- **What the ROM's driver code actually does**, which is the only complete
-  answer to the GPIO register question.
+- The ROM dump is genuine — 93% of its branches resolve internally — but it
+  contains no LCD driver, does not hold the application's SRAM driver blob,
+  and does not reveal the GPIO registers.
+- Nothing is resident at `0x0080E842` or `0x00811C7C` in bootloader mode. The
+  SRAM dump is faithful there (its relocated vector table and the ROM's own
+  stack both read back correctly), so this is a real absence rather than a
+  failed read.
+
+Re-running it on another unit is still worthwhile — the above is one device —
+and `examples/RomProbe` does the SRAM half from a sketch without any of this
+tooling.
 
 Caveats worth knowing before you spend time on it:
 

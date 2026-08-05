@@ -16,9 +16,9 @@ more flash.
     tools/sl6806-dumpram --start 0x80E000 --size 0x2000 --out lcd.bin
 
 WHICH MODE. Use BOOTLOADER mode. There the boot ROM itself answers, over the
-same channel that already works for uploading payloads - so read_mem is
-expected to work, though it has not yet been run against an SL6806 in that
-mode. Use --probe first.
+same channel that already works for uploading payloads. This has been run
+against a real SL6806 in that mode and both dumps verified - see
+docs/sl6806_re_notes.md 7f. Use --probe first anyway.
 
 Reading SRAM under the stock application (card-reader mode) does NOT work and
 is not worth retrying: the application services SCSI and stalls the vendor

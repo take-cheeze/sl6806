@@ -9,6 +9,8 @@ binary full of repeated SCSI replies. Run this before spending any time
 analysing a dump.
 
     tools/sl6806-checkdump dump.bin
+    tools/sl6806-checkdump --rom  maskrom.bin      # from sl6806-dumpram
+    tools/sl6806-checkdump --sram sram.bin
 
 Checks, in order of how much time they save you:
   1. Is the whole file one short block repeated? (the classic failed dump)
@@ -16,6 +18,18 @@ Checks, in order of how much time they save you:
   3. Do the HLKJ header and payload CRC16s verify?
   4. Is the partition table where it should be, naming FIRM/PICS/FONT?
   5. Is the size right for this chip? (SL6806 is 4 MiB)
+
+--rom and --sram check memory dumps instead, which fail differently: they can
+come back as plausible noise rather than as a repeated block. The tests are
+the ones used to establish that the reference dumps were trustworthy
+(docs/sl6806_re_notes.md 7f):
+
+  ROM  - do its own BL/BLX branches resolve inside it? Real code is
+         overwhelmingly self-referential; a shifted or garbage image is not.
+  SRAM - is the relocated vector table at 0x00800000 full of ROM-range
+         pointers, and does the ROM's stack below 0x00806000 hold ROM-range
+         return addresses? Those two regions prove the read addressed SRAM
+         correctly, which is what lets you believe an *absence* elsewhere.
 """
 
 import argparse
@@ -23,6 +37,8 @@ import hashlib
 import sys
 
 FLASH_SIZE = 4 * 1024 * 1024
+ROM_SIZE = 0x7D000
+SRAM_SIZE = 0x40000
 HLKJ_MAGIC = b"HLKJ"
 PART_TABLE_OFF = 0x0F000
 
@@ -49,6 +65,110 @@ class Report:
     def bad(self, msg):
         print("  \033[31mFAIL\033[0m  %s" % msg)
         self.fatal = True
+
+
+def bl_targets(data, base):
+    """Yield every 32-bit BL/BLX target. Shared with tools/sl6806-ramcalls."""
+    import struct
+    for off in range(0, len(data) - 4, 2):
+        w1, w2 = struct.unpack_from("<HH", data, off)
+        if (w1 & 0xF800) != 0xF000:
+            continue
+        if (w2 & 0xD000) == 0xD000:
+            blx = False
+        elif (w2 & 0xD000) == 0xC000:
+            blx = True
+        else:
+            continue
+        sgn = (w1 >> 10) & 1
+        i1 = (~((w2 >> 13 & 1) ^ sgn)) & 1
+        i2 = (~((w2 >> 11 & 1) ^ sgn)) & 1
+        imm = (sgn << 24) | (i1 << 23) | (i2 << 22) | \
+              ((w1 & 0x3FF) << 12) | ((w2 & 0x7FF) << 1)
+        if sgn:
+            imm -= 1 << 25
+        pc = base + off + 4
+        if blx:
+            pc &= ~3
+            imm &= ~3
+        yield pc + imm
+
+
+def check_rom(data, r):
+    """A mask ROM dump is real if its branches point back into itself."""
+    if len(data) != ROM_SIZE:
+        r.warn("size is 0x%X; the SL6806 mask ROM is 0x%X bytes"
+               % (len(data), ROM_SIZE))
+
+    total = inside = 0
+    for t in bl_targets(data, 0):
+        total += 1
+        if 0 <= t < len(data):
+            inside += 1
+    if total < 500:
+        r.bad("only %d branch encodings found - this is not a code image" % total)
+        return
+    frac = 100.0 * inside / total
+    if frac >= 85:
+        r.ok("%.1f%% of %d branches resolve inside the ROM (real code)"
+             % (frac, total))
+    elif frac >= 60:
+        r.warn("%.1f%% of %d branches resolve inside the ROM - low; the image "
+               "may be partial" % (frac, total))
+    else:
+        r.bad("only %.1f%% of %d branches resolve inside the ROM - this is not "
+              "a valid ROM image" % (frac, total))
+
+
+def check_sram(data, r):
+    """An SRAM dump is trustworthy where its known structures read back."""
+    import struct
+
+    if len(data) != SRAM_SIZE:
+        r.warn("size is 0x%X; SL6806 SRAM is 0x%X bytes" % (len(data), SRAM_SIZE))
+
+    def ptr_density(lo, hi):
+        n = hit = 0
+        for a in range(lo, min(hi, len(data)), 4):
+            v = struct.unpack_from("<I", data, a)[0]
+            n += 1
+            if 0 <= v < ROM_SIZE:
+                hit += 1
+        return (100.0 * hit / n) if n else 0.0
+
+    # Chance level for a uniform-random word landing in the ROM range is 0.01%.
+    vec = ptr_density(0x0000, 0x1000)
+    if vec >= 50:
+        r.ok("vector table at 0x00800000 is %.1f%% ROM-range pointers "
+             "(the ROM relocated it here)" % vec)
+    else:
+        r.bad("vector table page is only %.1f%% ROM-range pointers - the read "
+              "did not address SRAM correctly" % vec)
+
+    stk = ptr_density(0x5000, 0x6000)
+    if stk >= 1.0:
+        r.ok("stack below the ROM's initial SP holds %.1f%% ROM-range return "
+             "addresses (the ROM is running)" % stk)
+    else:
+        r.warn("stack below 0x00806000 holds only %.1f%% ROM-range words; the "
+               "ROM may not have been running" % stk)
+
+    # Everything the application installs is absent in bootloader mode. Say so,
+    # so an empty region is not mistaken for a bad dump.
+    live = []
+    for addr, name in ((0x0080E842, "lcd_write_cmd"), (0x0080E8D8, "lcd_write_data"),
+                       (0x00811C7C, "gpio_write")):
+        o = addr - 0x00800000
+        if o + 2 > len(data):
+            continue
+        hw = struct.unpack_from("<H", data, o)[0]
+        if (hw & 0xFF00) == 0xB500 or hw == 0xE92D:
+            live.append(name)
+    if live:
+        r.ok("vendor routines present: %s - unexpected, and worth reporting"
+             % ", ".join(live))
+    else:
+        r.ok("no vendor routines resident (expected in bootloader mode)")
 
 
 def check_repetition(data, r):
@@ -151,6 +271,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("dump")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--rom", action="store_true",
+                   help="check a mask ROM dump (0x00000000-0x0007D000)")
+    g.add_argument("--sram", action="store_true",
+                   help="check an SRAM dump (0x00800000-0x00840000)")
     args = p.parse_args()
 
     with open(args.dump, "rb") as f:
@@ -158,6 +283,20 @@ def main():
 
     print("checking %s (%d bytes)" % (args.dump, len(data)))
     r = Report()
+
+    if args.rom or args.sram:
+        what = "mask ROM" if args.rom else "SRAM"
+        if check_repetition(data, r):
+            print("\nverdict: THIS DUMP IS NOT USABLE.")
+            return 1
+        (check_rom if args.rom else check_sram)(data, r)
+        print()
+        if r.fatal:
+            print("verdict: this %s dump has real problems - do not trust "
+                  "analysis based on it." % what)
+            return 1
+        print("verdict: looks like a valid SL6806 %s dump." % what)
+        return 0
 
     if len(data) == FLASH_SIZE:
         r.ok("size is 4 MiB, the full SL6806 flash")
