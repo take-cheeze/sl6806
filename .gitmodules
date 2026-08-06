@@ -1,3 +1,8 @@
 [submodule "3rd/smartlink_flash"]
 	path = 3rd/smartlink_flash
 	url = https://github.com/ilyakurdyukov/smartlink_flash.git
+	ignore = dirty
+[submodule "3rd/actions_flash"]
+	path = 3rd/actions_flash
+	url = https://github.com/ilyakurdyukov/actions_flash.git
+	ignore = dirty
