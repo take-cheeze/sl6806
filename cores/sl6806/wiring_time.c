@@ -22,6 +22,48 @@
 
 #include "sl6806.h"
 #include "wiring_time.h"
+#include "sl6806_console.h"
+
+/* 0 = no cap. Set by RUN_MODE=poll; see the header. */
+static uint32_t block_limit_ms;
+
+void sl6806_set_block_limit(uint32_t ms) { block_limit_ms = ms; }
+uint32_t sl6806_block_limit(void) { return block_limit_ms; }
+
+__attribute__((weak)) void sl6806_block_clamped(uint32_t asked_ms,
+                                                uint32_t capped_ms)
+{
+    static uint8_t reported;
+    char n[12];
+    int i;
+
+    if (reported)
+        return;
+    reported = 1;
+
+    sl6806_debug_print(
+        "\r\n*** SL6806: delay() clamped ***\r\n"
+        "    A delay of ");
+    /* No printf here: this can run from inside the USB handler, where the
+     * whole point is to be quick. */
+    for (i = 0; i < 11 && asked_ms; i++) {
+        n[i] = (char)('0' + asked_ms % 10);
+        asked_ms /= 10;
+    }
+    n[i] = 0;
+    while (i--) {
+        char c[2] = { n[i], 0 };
+        sl6806_debug_print(c);
+    }
+    (void)capped_ms;
+    sl6806_debug_print(
+        " ms was shortened.\r\n"
+        "    In RUN_MODE=poll, loop() runs inside the boot ROM's USB command\r\n"
+        "    handler. Blocking there past the host's timeout wedges the\r\n"
+        "    device until you unplug it, so long delays are capped.\r\n"
+        "    Pace loop() with millis() instead of delay().\r\n"
+        "    (reported once; further clamping is silent)\r\n\r\n");
+}
 
 /* Which counter we ended up with. */
 static uint32_t tick_mask;      /* counter modulus - 1 */
@@ -105,6 +147,11 @@ void delayMicroseconds(uint32_t us)
     if (!time_ready)
         sl6806_time_init();
 
+    if (block_limit_ms && us / 1000UL > block_limit_ms) {
+        sl6806_block_clamped(us / 1000UL, block_limit_ms);
+        us = block_limit_ms * 1000UL;
+    }
+
     start  = read_raw();
     target = (uint32_t)(us * (F_CPU / 1000000UL));
 
@@ -122,7 +169,14 @@ void delayMicroseconds(uint32_t us)
 
 void delay(uint32_t ms)
 {
-    uint64_t target = sl6806_cycles() + (uint64_t)ms * (F_CPU / 1000UL);
+    uint64_t target;
+
+    if (block_limit_ms && ms > block_limit_ms) {
+        sl6806_block_clamped(ms, block_limit_ms);
+        ms = block_limit_ms;
+    }
+
+    target = sl6806_cycles() + (uint64_t)ms * (F_CPU / 1000UL);
 
     while (sl6806_cycles() < target)
         yield();

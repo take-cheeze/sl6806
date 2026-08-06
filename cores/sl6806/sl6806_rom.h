@@ -57,9 +57,15 @@ SL6806_ROM_FN(0x0DD8, void,   rom_free,    (void *));
  *             verified: the stock payload handles its own command here.
  *   cb2     - the stock payload installs a do-nothing function here and the
  *             ROM remains healthy, so the ROM calls it. [I] We use it as the
- *             periodic hook that drives loop(). If your sketch never advances,
- *             cb2 is not periodic on your ROM revision - build with
- *             -DSL6806_RUN_MODE=SL6806_RUN_TAKEOVER instead.
+ *             periodic hook that drives loop().
+ *
+ *             [V] MEASURED, NEGATIVE, on one unit (SMTLINK DEVICE 2.00):
+ *             cb2 is NOT called periodically. A Hello build printed all of
+ *             setup()'s output - so _start ran and returned, and scsi_cb is
+ *             being serviced - and then never ticked. Build with
+ *             RUN_MODE=poll, which drives loop() from scsi_cb instead.
+ *             examples/CallbackProbe finds out which slots your ROM really
+ *             calls.
  * The remaining slots are unknown; leave them NULL.
  */
 typedef struct {

@@ -160,6 +160,55 @@ def test_takeover_mode_never_returns():
           "takeover mode must not register a ROM callback")
 
 
+def test_poll_mode_cannot_block_the_usb_handler():
+    """The regression that wedged a real device.
+
+    RUN_MODE=poll runs loop() inside the ROM's USB command handler. Hello's
+    loop() ends in delay(1000); left uncapped that blocks past the host's SCSI
+    timeout, the endpoint desynchronises, and the device stops answering
+    anything at all until it is unplugged. It is not slow polling - it is a
+    hung device, and it happened.
+    """
+    import subprocess
+
+    def one_loop(run_mode):
+        path = build("Hello", RUN_MODE=run_mode)
+        elf = path[:-4] + ".elf"
+        out = subprocess.run(["arm-none-eabi-nm", elf],
+                             capture_output=True, text=True).stdout
+        fn = next((int(l.split()[0], 16) for l in out.splitlines()
+                   if len(l.split()) == 3 and l.split()[2] == "sl6806_run_loop"),
+                  None)
+        emu = SL6806(load_image(path))
+        emu.start()
+        before = emu.cycles
+        emu.call(fn)
+        return emu, emu.cycles - before
+
+    _, hook_cycles = one_loop("hook")
+    emu, poll_cycles = one_loop("poll")
+
+    # The point of the cap: an ordinary blocking sketch must not sit in the
+    # handler for a second.
+    ms = poll_cycles / (120000000 / 1000.0)
+    check(ms < 200, "poll mode blocked for %.0f ms in one loop() - the host's "
+                    "SCSI timeout is about a second, so this wedges the "
+                    "device", ms)
+    check(poll_cycles < hook_cycles / 4,
+          "poll mode did not shorten the delay: %d cycles vs %d uncapped",
+          poll_cycles, hook_cycles)
+
+    # And it must say so rather than silently running at the wrong speed.
+    text, _ = emu.console()
+    check("clamped" in text,
+          "the delay was shortened without telling the sketch:\n%s", text)
+
+    # hook mode must be left alone - the cap is poll-mode only.
+    check(hook_cycles > 100000000,
+          "hook mode should still honour delay(1000) in full, got %d cycles",
+          hook_cycles)
+
+
 def test_no_stray_peripheral_writes():
     """A sketch with no drivers must not poke unknown MMIO.
 

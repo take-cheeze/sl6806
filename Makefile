@@ -4,6 +4,7 @@
 #   make SKETCH=examples/Blink upload          load it and run it over USB
 #   make SKETCH=examples/Blink monitor         watch its Serial output
 #   make SKETCH=examples/Blink run             upload, then monitor
+#   make SKETCH=examples/Blink RUN_MODE=poll   drive loop() from USB polls
 #   make SKETCH=examples/Blink MODE=firmware   build a flashable FIRM image
 #   make clean
 #
@@ -52,8 +53,14 @@ LDSCRIPT := ld/sl6806_payload.ld
 MODE_DEF := -DSL6806_BUILD_PAYLOAD=1 -DSL6806_BUILD_FIRMWARE=0
 endif
 
+# hook (default) = ROM idle callback, poll = the SCSI handler, takeover = spin.
+# See the note at the top of cores/sl6806/startup_payload.c: if a sketch prints
+# setup()'s output and then never ticks, the ROM's idle callback is not
+# periodic on that unit and RUN_MODE=poll is the fix.
 ifeq ($(RUN_MODE),takeover)
 MODE_DEF += -DSL6806_RUN_MODE=1
+else ifeq ($(RUN_MODE),poll)
+MODE_DEF += -DSL6806_RUN_MODE=2
 else
 MODE_DEF += -DSL6806_RUN_MODE=0
 endif
@@ -91,10 +98,11 @@ OBJS += $(addprefix $(BUILD_DIR)/obj/,$(addsuffix .o,$(SKETCH_SRC)))
 .PHONY: all clean upload monitor run size test
 all: $(OUT).bin size
 
-# Both suites. tests/emu needs the toolchain and Unicorn and says so if they
-# are missing, so this stays useful with only gcc installed.
+# All three suites. tests/emu needs the toolchain and Unicorn and says so if
+# they are missing, so this stays useful with only gcc installed.
 test:
 	$(MAKE) -C tests/host
+	$(MAKE) -C tests/tools
 	$(MAKE) -C tests/emu
 
 $(BUILD_DIR)/obj/%.c.o: %.c

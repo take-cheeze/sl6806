@@ -18,15 +18,25 @@ instead of letting the load fail in a confusing way.
 import argparse
 import os
 import shutil
+import string
 import subprocess
 import sys
 
 DEFAULT_BASE = 0x820000
 
-# Inquiry strings, from the smartlink_flash README and confirmed against the
-# device. Bootloader mode is the one that accepts payloads.
-BOOTLOADER_INQUIRY = "SMTLINK DEVICE"
-CARDREADER_INQUIRY = "SSTLINK DDVICE"   # sic - the typo is in the firmware
+# SCSI INQUIRY identity, as (vendor, product). Confirmed against the device;
+# the typos are the firmware's, not ours. Bootloader mode is the one that
+# accepts payloads.
+#
+# These are compared against the *decoded* fields, not against the text
+# smtlink_dump prints. Matching its output as a string does not work: it
+# prints a hexdump whose ASCII column renders 0x20 as ".", and the T10 vendor
+# field ends at byte 15 - a line boundary - so "SMTLINK DEVICE" is split
+# across two lines and never appears literally. A substring check therefore
+# fails on a perfectly good device, and, worse, silently never fires for the
+# card-reader case it exists to catch.
+BOOTLOADER_ID = ("SMTLINK", "DEVICE")
+CARDREADER_ID = ("SSTLINK", "DDVICE")
 
 
 def find_tool(explicit):
@@ -51,23 +61,69 @@ def run(tool, args, sudo, capture=False):
     return subprocess.run(cmd)
 
 
+def parse_hexdump(text):
+    """Reassemble the bytes from smtlink_dump's hexdump output.
+
+    Each data line is hex byte columns, optionally followed by "|ascii|".
+    Lines that are not purely hex bytes (headers, warnings) are skipped, so
+    this survives the tool printing anything else alongside.
+    """
+    data = bytearray()
+    for line in text.splitlines():
+        row = line.split("|", 1)[0].strip()
+        if not row:
+            continue
+        toks = row.split()
+        if not all(len(t) == 2 and all(c in string.hexdigits for c in t)
+                   for t in toks):
+            continue
+        data += bytes(int(t, 16) for t in toks)
+    return bytes(data)
+
+
+def parse_inquiry(text):
+    """(vendor, product, revision) from a SCSI INQUIRY response, or None.
+
+    Standard field layout: bytes 8-15 vendor, 16-31 product, 32-35 revision.
+    """
+    data = parse_hexdump(text)
+    if len(data) < 36:
+        return None
+    def field(lo, hi):
+        return data[lo:hi].decode("latin-1").strip()
+    return field(8, 16), field(16, 32), field(32, 36)
+
+
 def check_mode(tool, sudo, chip_args):
-    """Warn clearly if the device is not in bootloader mode."""
+    """Refuse clearly if the device is not in bootloader mode."""
     r = run(tool, chip_args + ["inquiry"], sudo, capture=True)
     text = (r.stdout or "") + (r.stderr or "")
 
-    if CARDREADER_INQUIRY in text:
+    ident = parse_inquiry(text)
+    if ident is None:
+        print("warning: could not read an inquiry response; continuing\n"
+              "         anyway. If this hangs, the device is probably not in\n"
+              "         bootloader mode.", file=sys.stderr)
+        return
+
+    vendor, product, rev = ident
+
+    if (vendor, product) == CARDREADER_ID:
         sys.exit(
             "error: the device is in CARD READER mode, not bootloader mode.\n"
+            "       (inquiry says %s %s %s)\n"
             "       Payloads only run from bootloader mode. Power the device\n"
             "       off, hold a button, and plug the USB cable back in while\n"
-            "       still holding it. The button varies between units.")
+            "       still holding it. The button varies between units."
+            % (vendor, product, rev))
 
-    if BOOTLOADER_INQUIRY not in text:
-        print("warning: could not confirm bootloader mode from the inquiry\n"
-              "         response; continuing anyway. If this hangs, the\n"
-              "         device is probably not in bootloader mode.",
-              file=sys.stderr)
+    if (vendor, product) != BOOTLOADER_ID:
+        print("warning: unrecognised device: inquiry says %s %s %s, expected\n"
+              "         %s %s. Continuing anyway."
+              % (vendor, product, rev, *BOOTLOADER_ID), file=sys.stderr)
+        return
+
+    print("bootloader mode confirmed (%s %s %s)" % (vendor, product, rev))
 
 
 def main():

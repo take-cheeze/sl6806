@@ -8,3 +8,4 @@ tests/host/test_gfx
 tests/host/test_panel
 tests/host/*.ppm
 __pycache__/
+tests/tools/__pycache__/

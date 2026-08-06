@@ -11,11 +11,35 @@
  *   HOOK (default)  - setup() runs, then loop() is driven from the ROM's
  *                     periodic callback and _start returns. USB stays alive,
  *                     so Serial and the monitor keep working.
+ *   POLL            - setup() runs, then loop() is driven from the vendor
+ *                     SCSI handler instead: once per host poll. USB stays
+ *                     alive. Use this when cb2 turns out not to be periodic.
  *   TAKEOVER        - setup() runs, then loop() spins forever and _start
  *                     never returns. USB dies with it: no Serial, no monitor,
  *                     and the only way back is to re-enter bootloader mode.
- *                     Use it when the ROM's callback turns out not to fire,
- *                     or when you need every cycle.
+ *                     Use it when you need every cycle and no output.
+ *
+ * WHICH ONE YOU WANT. cb2 being periodic is an inference, not a measurement,
+ * and on at least one real ROM it is NOT called: the sketch prints setup()'s
+ * output and then never ticks. If that is what you see, build with
+ * RUN_MODE=poll. TAKEOVER is not the answer to that symptom - it gives you a
+ * running loop() you cannot observe.
+ *
+ * WHAT POLL MODE COSTS. loop() only advances while something is polling, so
+ * the sketch effectively runs at the monitor's poll rate and stops when you
+ * disconnect.
+ *
+ * AND IT MUST NOT BLOCK. loop() runs inside the ROM's USB command handler. If
+ * it does not return before the host's SCSI timeout - about a second - the
+ * transaction is abandoned mid-flight, the endpoint desynchronises, and the
+ * device stops answering anything at all, inquiry included, until it is
+ * unplugged. A plain delay(1000) in loop() is enough to do it, which is not
+ * "slow polling" but a hung device.
+ *
+ * So poll mode caps how long delay() may block, at
+ * SL6806_POLL_BLOCK_LIMIT_MS, and reports once when it clamps. That keeps an
+ * ordinary blocking sketch alive and honest rather than wedging the link, but
+ * its timing will be wrong - pace loop() with millis() if the timing matters.
  */
 
 #include "sl6806.h"
@@ -25,6 +49,17 @@
 
 #define SL6806_RUN_HOOK     0
 #define SL6806_RUN_TAKEOVER 1
+#define SL6806_RUN_POLL     2
+
+/*
+ * How long loop() may block in poll mode. Comfortably under the host's ~1 s
+ * SCSI timeout, with room for the USB round trip either side. Override it if
+ * you know your host is more patient; setting it to 0 removes the cap, which
+ * will wedge the device the first time loop() blocks.
+ */
+#ifndef SL6806_POLL_BLOCK_LIMIT_MS
+#define SL6806_POLL_BLOCK_LIMIT_MS 50
+#endif
 
 #ifndef SL6806_RUN_MODE
 #define SL6806_RUN_MODE SL6806_RUN_HOOK
@@ -44,6 +79,7 @@ void sl6806_run_loop(void);
  * This is what tools/sl6806-monitor polls the console ring with. */
 #define CMD_USER_READMEM 64
 
+#if SL6806_RUN_MODE != SL6806_RUN_TAKEOVER
 static int payload_scsi_cb(uint8_t *cdb)
 {
     uint32_t len, addr;
@@ -71,6 +107,12 @@ static int payload_scsi_cb(uint8_t *cdb)
     if (addr == SL6806_CONSOLE_POLL_ADDR) {
         sl6806_console_pkt_t pkt;
 
+#if SL6806_RUN_MODE == SL6806_RUN_POLL
+        /* Drive loop() from the one callback that is known to fire. Run it
+         * before draining the ring so whatever it prints goes out in this
+         * same round trip rather than waiting for the next one. */
+        sl6806_run_loop();
+#endif
         sl6806_console_poll(&pkt);
         rom_memcpy(SL6806_USB_RET_BUF, &pkt, sizeof(pkt));
         SL6806_USB_RET_LEN = sizeof(pkt);
@@ -93,6 +135,20 @@ static int payload_idle_cb(void)
 /* Must live in .bss/.data of the image so it stays valid after _start
  * returns - the ROM keeps the pointer. */
 static sl6806_usb_userfn_t userfn;
+
+/*
+ * Weak: a sketch can override this to install its own callbacks in the table
+ * before it is handed to the ROM. Only scsi_cb and cb2 have established
+ * meaning, and cb2's is doubtful - see the note at the top - so this exists
+ * mainly so examples/CallbackProbe can find out which slots the ROM actually
+ * calls on a given unit. Do not overwrite scsi_cb unless you are replacing
+ * the console.
+ */
+__attribute__((weak)) void sl6806_usb_userfn_init(sl6806_usb_userfn_t *fn)
+{
+    (void)fn;
+}
+#endif /* != SL6806_RUN_TAKEOVER */
 
 static void runtime_init(void)
 {
@@ -117,14 +173,23 @@ __attribute__((section(".text._start"), used))
 void _start(void)
 {
     runtime_init();
+
+#if SL6806_RUN_MODE == SL6806_RUN_POLL
+    /* Before setup(), so a blocking setup() cannot wedge the link either. */
+    sl6806_set_block_limit(SL6806_POLL_BLOCK_LIMIT_MS);
+#endif
+
     sl6806_run_setup();
 
 #if SL6806_RUN_MODE == SL6806_RUN_TAKEOVER
     for (;;)
         sl6806_run_loop();
 #else
+#if SL6806_RUN_MODE == SL6806_RUN_HOOK
     userfn.cb2     = payload_idle_cb;
+#endif
     userfn.scsi_cb = payload_scsi_cb;
+    sl6806_usb_userfn_init(&userfn);
     rom_usb_set_userfn(&userfn);
 
     /* Tell the ROM this command produced no data of its own. */
