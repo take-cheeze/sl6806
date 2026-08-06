@@ -104,3 +104,7 @@ jobs:
             python3 -m py_compile "$t"
             python3 "$t" --help > /dev/null
           done
+      - name: Unit tests
+        # --help cannot catch a parser that misreads a device response. These
+        # can.
+        run: make -C tests/tools

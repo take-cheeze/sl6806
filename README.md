@@ -128,8 +128,9 @@ its driver readable in the bootloader; see
 Two suites, neither of which needs a device:
 
 ```sh
-make test              # both
+make test              # all three
 make -C tests/host     # pure logic, under ASan/UBSan
+make -C tests/tools    # the Python tools' parsers
 make -C tests/emu      # real ARM images, under an emulator
 ```
 
@@ -153,8 +154,12 @@ memory, not peripherals: passing says the software starts, and says nothing
 about whether any peripheral register in the framework is right — there is no
 peripheral behind them. See `tests/emu/sl6806_emu.py`.
 
-CI runs both on every push and pull request, plus a build of all six sketches
-in both modes with `-Werror`, and a start-up check of every Python tool.
+**Tool tests** cover the parts of the host tools that interpret what the
+hardware says back — mode detection from a SCSI inquiry, for instance. Those
+are pure functions, and `--help` in CI cannot check them.
+
+CI runs all three on every push and pull request, plus a build of all six
+sketches in both modes with `-Werror`.
 
 ## Getting started
 

@@ -91,10 +91,11 @@ OBJS += $(addprefix $(BUILD_DIR)/obj/,$(addsuffix .o,$(SKETCH_SRC)))
 .PHONY: all clean upload monitor run size test
 all: $(OUT).bin size
 
-# Both suites. tests/emu needs the toolchain and Unicorn and says so if they
-# are missing, so this stays useful with only gcc installed.
+# All three suites. tests/emu needs the toolchain and Unicorn and says so if
+# they are missing, so this stays useful with only gcc installed.
 test:
 	$(MAKE) -C tests/host
+	$(MAKE) -C tests/tools
 	$(MAKE) -C tests/emu
 
 $(BUILD_DIR)/obj/%.c.o: %.c
