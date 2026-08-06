@@ -192,9 +192,16 @@ which keeps USB — and therefore `Serial` — alive.
 callback is not periodic on your ROM revision — which has now been measured on
 a real unit, so expect it rather than being surprised. Build with
 `RUN_MODE=poll`: `loop()` is driven from the vendor SCSI handler instead, which
-is the one callback known to fire. The cost is that `loop()` only advances
-while something is polling, and a long `delay()` in `loop()` stalls the USB
-transaction it runs inside.
+is the one callback known to fire.
+
+Two costs. `loop()` only advances while something is polling, so the sketch
+stops when you disconnect the monitor. And **`loop()` must not block** — it
+runs inside the ROM's USB command handler, and not returning before the host's
+~1 s SCSI timeout desynchronises the endpoint and wedges the device until you
+unplug it. A plain `delay(1000)` is enough. Poll mode therefore caps how long
+`delay()` may block and reports once when it clamps, so an ordinary blocking
+sketch stays alive and honest instead of hanging the link — but its timing is
+wrong, so pace `loop()` with `millis()` if the timing matters.
 
 `examples/CallbackProbe` reports which of the ROM's callback slots your unit
 actually calls, if you want to know rather than assume.

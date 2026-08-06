@@ -27,9 +27,19 @@
  *
  * WHAT POLL MODE COSTS. loop() only advances while something is polling, so
  * the sketch effectively runs at the monitor's poll rate and stops when you
- * disconnect. And because loop() runs inside the USB command handler, a long
- * delay() in loop() stalls that transaction for its whole duration - a
- * delay(1000) makes every poll take a second. Keep loop() short in this mode.
+ * disconnect.
+ *
+ * AND IT MUST NOT BLOCK. loop() runs inside the ROM's USB command handler. If
+ * it does not return before the host's SCSI timeout - about a second - the
+ * transaction is abandoned mid-flight, the endpoint desynchronises, and the
+ * device stops answering anything at all, inquiry included, until it is
+ * unplugged. A plain delay(1000) in loop() is enough to do it, which is not
+ * "slow polling" but a hung device.
+ *
+ * So poll mode caps how long delay() may block, at
+ * SL6806_POLL_BLOCK_LIMIT_MS, and reports once when it clamps. That keeps an
+ * ordinary blocking sketch alive and honest rather than wedging the link, but
+ * its timing will be wrong - pace loop() with millis() if the timing matters.
  */
 
 #include "sl6806.h"
@@ -40,6 +50,16 @@
 #define SL6806_RUN_HOOK     0
 #define SL6806_RUN_TAKEOVER 1
 #define SL6806_RUN_POLL     2
+
+/*
+ * How long loop() may block in poll mode. Comfortably under the host's ~1 s
+ * SCSI timeout, with room for the USB round trip either side. Override it if
+ * you know your host is more patient; setting it to 0 removes the cap, which
+ * will wedge the device the first time loop() blocks.
+ */
+#ifndef SL6806_POLL_BLOCK_LIMIT_MS
+#define SL6806_POLL_BLOCK_LIMIT_MS 50
+#endif
 
 #ifndef SL6806_RUN_MODE
 #define SL6806_RUN_MODE SL6806_RUN_HOOK
@@ -153,6 +173,12 @@ __attribute__((section(".text._start"), used))
 void _start(void)
 {
     runtime_init();
+
+#if SL6806_RUN_MODE == SL6806_RUN_POLL
+    /* Before setup(), so a blocking setup() cannot wedge the link either. */
+    sl6806_set_block_limit(SL6806_POLL_BLOCK_LIMIT_MS);
+#endif
+
     sl6806_run_setup();
 
 #if SL6806_RUN_MODE == SL6806_RUN_TAKEOVER
