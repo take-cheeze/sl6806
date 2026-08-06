@@ -188,9 +188,20 @@ run by the boot ROM over USB. Flash is never written, so **this mode cannot
 brick the device.** Develop here. `loop()` runs from the ROM's idle callback,
 which keeps USB — and therefore `Serial` — alive.
 
-If your sketch never advances, that callback is not periodic on your ROM
-revision; build with `RUN_MODE=takeover` to spin in `loop()` instead. That
-costs you USB and the monitor.
+**If your sketch prints `setup()`'s output and then never ticks**, that idle
+callback is not periodic on your ROM revision — which has now been measured on
+a real unit, so expect it rather than being surprised. Build with
+`RUN_MODE=poll`: `loop()` is driven from the vendor SCSI handler instead, which
+is the one callback known to fire. The cost is that `loop()` only advances
+while something is polling, and a long `delay()` in `loop()` stalls the USB
+transaction it runs inside.
+
+`examples/CallbackProbe` reports which of the ROM's callback slots your unit
+actually calls, if you want to know rather than assume.
+
+`RUN_MODE=takeover` spins in `loop()` and never returns to the ROM. It is not
+the answer to a sketch that will not tick: it costs you USB and the monitor,
+so you get a running `loop()` you cannot observe.
 
 **`MODE=firmware`** — an image linked to SRAM at `0x00804C00` with its own
 vector table, intended to replace the vendor application. Read

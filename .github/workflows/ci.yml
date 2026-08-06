@@ -40,7 +40,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sketch: [Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe]
+        sketch: [Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe,
+                 CallbackProbe]
         mode: [payload, firmware]
     steps:
       - uses: actions/checkout@v4
@@ -64,6 +65,34 @@ jobs:
         run: |
           arm-none-eabi-size \
             build/${{ matrix.sketch }}-${{ matrix.mode }}/${{ matrix.sketch }}.elf
+
+  run-modes:
+    name: build run mode ${{ matrix.run_mode }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        run_mode: [hook, poll, takeover]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-none-eabi libnewlib-arm-none-eabi \
+            libstdc++-arm-none-eabi-newlib
+      - name: Build
+        # Each run mode compiles out a different part of startup_payload.c, so
+        # a warning can hide in one of them while the matrix above is clean -
+        # which is exactly how takeover picked up two unused-symbol warnings.
+        run: |
+          make SKETCH=examples/Hello RUN_MODE=${{ matrix.run_mode }} \
+               BUILD_DIR=build/rm-${{ matrix.run_mode }} EXTRA_FLAGS=-Werror
+      - name: Build the callback probe
+        if: matrix.run_mode == 'poll'
+        run: |
+          make SKETCH=examples/CallbackProbe RUN_MODE=poll \
+               BUILD_DIR=build/probe EXTRA_FLAGS=-Werror
 
   smoke:
     name: emulator smoke tests
