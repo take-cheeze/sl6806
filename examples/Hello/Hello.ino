@@ -24,7 +24,7 @@ void setup()
     Serial.println(SL6806_VARIANT_NAME);
     Serial.print("F_CPU   : ");
     Serial.print(F_CPU / 1000000UL);
-    Serial.println(" MHz (assumed - run ClockCalibrate to check)");
+    Serial.println(" MHz (assumed - `make calibrate` measures the real one)");
 
     /* Exercises the heap and the C++ runtime, not just printing. */
     String s = "heap+String ok, ";

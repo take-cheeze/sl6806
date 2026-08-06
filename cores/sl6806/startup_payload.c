@@ -40,16 +40,19 @@
  * SL6806_POLL_BLOCK_LIMIT_MS, and reports once when it clamps. That keeps an
  * ordinary blocking sketch alive and honest rather than wedging the link, but
  * its timing will be wrong - pace loop() with millis() if the timing matters.
+ *
+ * THE VENDOR HANDLER ANSWERS TWO QUERIES OF ITS OWN, at sentinel addresses no
+ * real read can land on: the console poll (sl6806_console.h) and a status
+ * report (sl6806_stat.h) that exists so the host can measure the real CPU
+ * clock. Both are answered here rather than by a sketch, so they work
+ * whatever the sketch is doing - including not ticking at all.
  */
 
 #include "sl6806.h"
 #include "sl6806_rom.h"
 #include "sl6806_console.h"
+#include "sl6806_stat.h"
 #include "wiring_time.h"
-
-#define SL6806_RUN_HOOK     0
-#define SL6806_RUN_TAKEOVER 1
-#define SL6806_RUN_POLL     2
 
 /*
  * How long loop() may block in poll mode. Comfortably under the host's ~1 s
@@ -80,6 +83,50 @@ void sl6806_run_loop(void);
 #define CMD_USER_READMEM 64
 
 #if SL6806_RUN_MODE != SL6806_RUN_TAKEOVER
+
+/*
+ * The host decodes this with a fixed struct format (see
+ * tools/sl6806-calibrate), so padding here would silently desync the two
+ * sides. Pin the contract down at compile time, the way the console does.
+ */
+#include <stddef.h>
+_Static_assert(sizeof(sl6806_stat_t) == 40,
+               "host unpacks the status reply as '<10I'");
+_Static_assert(offsetof(sl6806_stat_t, cycles_lo) == 8,
+               "the cycle counter must be the third word");
+
+/* Counters reported by SL6806_STAT_ADDR. Not volatile: everything that
+ * touches them runs from the ROM's USB thread, and the host only ever sees a
+ * snapshot copied out under the same call. */
+static uint32_t stat_polls;
+static uint32_t stat_loops;
+
+/* Every path that runs loop() goes through here, so `loops` counts what the
+ * device really did rather than what the build mode implies. In hook mode
+ * that makes it the direct answer to "does this ROM's cb2 actually fire?" -
+ * poll the status a second apart and see whether it moved. */
+static void run_loop_counted(void)
+{
+    stat_loops++;
+    sl6806_run_loop();
+}
+
+static void fill_stat(sl6806_stat_t *st)
+{
+    uint64_t c = sl6806_cycles();
+
+    st->magic     = SL6806_STAT_MAGIC;
+    st->version   = SL6806_STAT_VERSION;
+    st->cycles_lo = (uint32_t)c;
+    st->cycles_hi = (uint32_t)(c >> 32);
+    st->polls     = stat_polls;
+    st->loops     = stat_loops;
+    st->f_cpu     = (uint32_t)F_CPU;
+    st->run_mode  = SL6806_RUN_MODE;
+    st->tick_mask = sl6806_tick_mask();
+    st->raw       = sl6806_tick_raw();
+}
+
 static int payload_scsi_cb(uint8_t *cdb)
 {
     uint32_t len, addr;
@@ -100,6 +147,24 @@ static int payload_scsi_cb(uint8_t *cdb)
     if (len > SL6806_USB_RET_BUF_SIZE)
         return SL6806_USB_ERROR;
 
+    stat_polls++;
+
+    /*
+     * Status query. Deliberately the cheapest branch here and free of side
+     * effects beyond sampling the counter - it does not drive loop() even in
+     * poll mode. tools/sl6806-calibrate times these round trips to recover
+     * the real CPU clock, and work that varies per poll would land in that
+     * measurement as jitter. See sl6806_stat.h.
+     */
+    if (addr == SL6806_STAT_ADDR) {
+        sl6806_stat_t st;
+
+        fill_stat(&st);
+        rom_memcpy(SL6806_USB_RET_BUF, &st, sizeof(st));
+        SL6806_USB_RET_LEN = sizeof(st);
+        return SL6806_USB_DATA;
+    }
+
     /* The sentinel address means "console poll", not "read this memory". It
      * is far outside any valid SL6806 address, so a genuine read can never
      * land here by accident. One round trip fetches the data and consumes
@@ -111,7 +176,7 @@ static int payload_scsi_cb(uint8_t *cdb)
         /* Drive loop() from the one callback that is known to fire. Run it
          * before draining the ring so whatever it prints goes out in this
          * same round trip rather than waiting for the next one. */
-        sl6806_run_loop();
+        run_loop_counted();
 #endif
         sl6806_console_poll(&pkt);
         rom_memcpy(SL6806_USB_RET_BUF, &pkt, sizeof(pkt));
@@ -127,7 +192,7 @@ static int payload_scsi_cb(uint8_t *cdb)
 #if SL6806_RUN_MODE == SL6806_RUN_HOOK
 static int payload_idle_cb(void)
 {
-    sl6806_run_loop();
+    run_loop_counted();
     return 0;
 }
 #endif

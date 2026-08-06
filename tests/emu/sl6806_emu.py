@@ -68,6 +68,13 @@ DWT_CYCCNT = 0xE0001004
 
 CONSOLE_MAGIC = 0x36384C53          # "SL68"
 
+# USB transfer descriptor, from cores/sl6806/sl6806_rom.h. On hardware the ROM
+# fills this in; here vendor_read() points it at scratch SRAM below the load
+# address, which nothing else uses.
+USB_DESC = 0x00800DF8
+USB_RET_BUF = 0x00810000
+USB_CDB_SCRATCH = 0x00810100
+
 
 class EmuError(RuntimeError):
     pass
@@ -268,6 +275,45 @@ class SL6806:
         if self.userfn is None:
             return None
         return struct.unpack("<I", self.uc.mem_read(self.userfn + 8, 4))[0]
+
+    def scsi_cb(self):
+        """The vendor SCSI handler the payload registered, or None."""
+        if self.userfn is None:
+            return None
+        return struct.unpack("<I", self.uc.mem_read(self.userfn + 24, 4))[0]
+
+    def vendor_read(self, addr, length):
+        """Issue the vendor read the host tools use, and return the reply.
+
+        This is `smtlink_dump read_mem2 <addr> <length>` as the device sees
+        it: a 16-byte CDB handed to scsi_cb, which answers by filling the
+        ROM's return buffer. Sentinel addresses (console poll, status query)
+        are answered by the sketch rather than read from memory, so this is
+        the only way to reach them from here.
+
+        The ROM owns the transfer descriptor on real hardware; nothing has
+        set it up here, so point it at scratch SRAM first - otherwise the
+        handler memcpy's the reply through a null pointer.
+        """
+        cb = self.scsi_cb()
+        if not cb:
+            raise EmuError("no vendor SCSI handler registered - is this a "
+                           "RUN_MODE=takeover build?")
+
+        self.uc.mem_write(USB_DESC + 0x08, struct.pack("<I", USB_RET_BUF))
+        self.uc.mem_write(USB_DESC + 0x06, struct.pack("<H", 0))
+
+        cdb = bytearray(16)
+        cdb[0] = 0xC0                       # SL6806_SCSI_VENDOR_OP
+        cdb[1] = 64                         # CMD_USER_READMEM
+        struct.pack_into("<II", cdb, 2, length, addr)
+        self.uc.mem_write(USB_CDB_SCRATCH, bytes(cdb))
+
+        rc = self.call(cb & ~1, args=(USB_CDB_SCRATCH,))
+        if rc & 0x80000000:                 # SL6806_USB_ERROR
+            return None
+        n = struct.unpack("<H", self.uc.mem_read(USB_DESC + 0x06, 2))[0]
+        return bytes(self.uc.mem_read(USB_RET_BUF, n))
 
     def run_loop(self, iterations=1, **kw):
         """Drive loop() the way the ROM's idle callback would."""

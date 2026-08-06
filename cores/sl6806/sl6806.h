@@ -168,22 +168,26 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 /*
- * [?] The CPU clock frequency is NOT known. Nothing in the dump or in the
- * dumper source establishes it, and the PLL registers have not been found.
+ * [V] The CPU clock was MEASURED at 64 MHz on one P20 Player, 2026-08-06:
+ * 64,000,071 Hz with a bracket of 63,961,008..64,039,063, which contains
+ * exactly one whole MHz. Nothing in the dump establishes it and the PLL
+ * registers have still not been found - this comes from timing the device's
+ * own cycle counter against the host clock (`make calibrate`, and see
+ * cores/sl6806/sl6806_stat.h).
  *
- * F_CPU below is a placeholder. Every millis()/micros()/delay() result is
- * wrong by exactly the ratio of this value to the real clock. It is a pure
- * scale factor, so one measurement fixes all of them:
+ * Every millis()/micros()/delay() result scales by the ratio of F_CPU to the
+ * real clock, so if you are bringing up a *different* unit, re-measure rather
+ * than assume this carries over:
  *
- *   1. flash and run examples/ClockCalibrate
- *   2. it reports the measured tick rate against a wall clock
- *   3. rebuild with -DF_CPU=<measured>
+ *   1. upload any sketch, then run `make calibrate`
+ *   2. rebuild with -DF_CPU=<measured>
  *
- * Until you do that, treat all timing as relative, not absolute.
+ * Note the measurement is of whatever counter the core found, which on this
+ * part is the SysTick fallback - the DWT cycle counter does not run. See
+ * wiring_time.c.
  */
 #ifndef F_CPU
-#define F_CPU 120000000UL  /* [?] PLACEHOLDER - calibrate before trusting */
-#define SL6806_F_CPU_IS_A_GUESS 1
+#define F_CPU 64000000UL   /* [V] measured; see above */
 #endif
 
 /* ------------------------------------------------------------------ */
