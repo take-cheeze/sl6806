@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""
+sl6806-clockcal - measure the SL6806's real CPU clock, from the host.
+
+    tools/sl6806-clockcal build/Hello.sym
+
+WHY THIS EXISTS
+F_CPU is a build-time guess (120 MHz, unverified). Every millis(), micros()
+and delay() is wrong by exactly the ratio between that guess and the truth, so
+one measurement fixes all timing at once.
+
+The obvious way to measure it - have the sketch delay(1000) thirty times while
+you hold a stopwatch - cannot be used here. In payload mode the boot ROM
+cannot service USB while the sketch is running, so a sketch that blocks for
+thirty seconds takes the USB link down with it. That is not theoretical: a
+one-second delay in the wrong place already wedged a device.
+
+So the measurement happens on this side. The device stamps a snapshot of its
+cycle counter on every console poll, taken inside the USB transaction this
+tool is timing. We collect those stamps against the host's wall clock and fit
+a line through them; the slope is the clock, in cycles per second. The device
+never blocks, the answer is better than a human with a phone, and it works
+with whatever sketch happens to be loaded - the stamping lives in the core.
+
+READING THE OUTPUT
+The measured clock, the ratio against what the build assumed, and a residual.
+A residual much above a millisecond usually means the poll rate was uneven
+(other USB traffic, or a sketch printing hard); it does not bias the answer,
+it just widens the error bar. Rerun with --seconds 60 if you want it tighter.
+
+Console output arriving during the run is printed as it comes, so you can see
+the sketch is alive. It is consumed, exactly as the monitor would consume it.
+"""
+
+import argparse
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sl6806_dev import Device, find_tool, symbol   # noqa: E402
+
+
+def fit(samples):
+    """Least-squares slope of cycles against host seconds.
+
+    Returns (cycles_per_second, rms_residual_seconds). Plain arithmetic
+    rather than numpy: this tool has to run on whatever machine the device is
+    plugged into.
+    """
+    n = len(samples)
+    mean_t = sum(t for t, _ in samples) / n
+    mean_c = sum(c for _, c in samples) / n
+
+    sxx = sum((t - mean_t) ** 2 for t, _ in samples)
+    sxy = sum((t - mean_t) * (c - mean_c) for t, c in samples)
+    if sxx == 0:
+        return None, None
+
+    slope = sxy / sxx                     # cycles per second
+    intercept = mean_c - slope * mean_t
+
+    # A counter that never advanced fits a flat line. There is no clock to
+    # report and no meaningful residual either - converting cycles to seconds
+    # is division by the slope. Hand it back for the caller to refuse.
+    if slope <= 0:
+        return slope, None
+
+    # Residuals in seconds rather than cycles, so the number means something
+    # without first knowing the answer.
+    resid = [(c - (slope * t + intercept)) / slope for t, c in samples]
+    rms = (sum(r * r for r in resid) / n) ** 0.5
+    return slope, rms
+
+
+def human(hz):
+    return "%.6f MHz" % (hz / 1e6)
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("sym", help="the .sym file emitted next to the build")
+    p.add_argument("--tool", help="path to smtlink_dump")
+    p.add_argument("--no-sudo", action="store_true")
+    p.add_argument("--seconds", type=float, default=30.0,
+                   help="how long to measure for (default 30)")
+    p.add_argument("--interval", type=float, default=0.25,
+                   help="seconds between samples (default 0.25)")
+    p.add_argument("--quiet", action="store_true",
+                   help="do not echo console output from the sketch")
+    args = p.parse_args()
+
+    stamp_addr = symbol(args.sym, "_sl6806_clockstamp")
+    dev = Device(find_tool(args.tool), not args.no_sudo)
+
+    print("clock calibration: sampling for %.0f s "
+          "(the device never blocks; ctrl-c to stop early)" % args.seconds,
+          file=sys.stderr)
+
+    samples = []          # (host seconds, device cycles)
+    brackets = []         # how tightly each sample was timed
+    assumed = None
+    last_seq = None
+    deadline = time.monotonic() + args.seconds
+
+    try:
+        while time.monotonic() < deadline:
+            # Time the poll transaction itself. The device stamps its counter
+            # at the top of the poll handler, so the stamp happened somewhere
+            # inside [t0, t1] and the midpoint is the best estimate we have.
+            t0 = time.monotonic()
+            got = dev.poll_console()
+            t1 = time.monotonic()
+
+            if got is None:
+                time.sleep(args.interval)
+                continue
+
+            data, overflowed, _pending = got
+            if data and not args.quiet:
+                sys.stdout.write(data.decode("utf-8", errors="replace"))
+                sys.stdout.flush()
+            if overflowed and not args.quiet:
+                sys.stdout.write("\n[lost output]\n")
+
+            # A second transaction to collect what the first one stamped.
+            # Nothing writes it in between, so this cannot race.
+            st = dev.read_clockstamp(stamp_addr)
+            if st is None:
+                time.sleep(args.interval)
+                continue
+            seq, cycles, f_cpu = st
+            assumed = f_cpu
+
+            # A stationary counter means the sketch is not stamping - almost
+            # always a stale build without the calibration support.
+            if seq == last_seq:
+                time.sleep(args.interval)
+                continue
+            last_seq = seq
+
+            samples.append(((t0 + t1) / 2.0, cycles))
+            brackets.append(t1 - t0)
+
+            if not args.quiet:
+                print("\r  %d samples, %.0f s left   "
+                      % (len(samples), max(0.0, deadline - time.monotonic())),
+                      end="", file=sys.stderr)
+
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+
+    print(file=sys.stderr)
+
+    if len(samples) < 8:
+        sys.exit("error: only %d samples - the device did not answer, or the "
+                 "sketch predates the calibration support. Rebuild it "
+                 "('make clean' then 'make SKETCH=... upload') and check the "
+                 "monitor works first." % len(samples))
+
+    # Drop the first sample: the first transaction of a session is reliably
+    # slower than the rest, and it sits at one end of the fit where it has the
+    # most leverage over the slope.
+    samples = samples[1:]
+    brackets = brackets[1:]
+
+    span = samples[-1][0] - samples[0][0]
+    slope, rms = fit(samples)
+    if slope is None or slope <= 0:
+        sys.exit("error: the cycle counter did not advance; is timekeeping "
+                 "initialised? (any sketch that calls millis() will do it)")
+
+    print()
+    print("=== SL6806 clock calibration ===")
+    print()
+    print("  samples          : %d over %.1f s" % (len(samples), span))
+    print("  timing bracket   : %.1f ms typical, %.1f ms worst"
+          % (1000 * sorted(brackets)[len(brackets) // 2],
+             1000 * max(brackets)))
+    print("  fit residual     : %.2f ms rms" % (1000 * rms))
+    print()
+    print("  measured clock   : %s" % human(slope))
+    if assumed:
+        print("  build assumed    : %s" % human(assumed))
+        print("  ratio            : %.4f  (delay(1000) really waits %.0f ms)"
+              % (slope / assumed, 1000.0 * slope / assumed))
+    print()
+
+    measured = int(round(slope))
+
+    if assumed and abs(slope - assumed) / assumed < 0.01:
+        print("Within 1%% of the build's F_CPU - nothing needs changing.")
+    else:
+        print("Rebuild with the measured value:")
+        print()
+        print("    make SKETCH=examples/Hello F_CPU=%d upload" % measured)
+        print()
+        print("and pass F_CPU=%d from then on. It is a property of the chip,"
+              % measured)
+        print("not of the sketch, so one number covers every build.")
+
+    # An honest error bar: the fit residual over the measurement span is the
+    # dominant term, and it shrinks with --seconds.
+    if span > 0:
+        print()
+        print("Uncertainty is roughly %.2f%% here; --seconds 120 shrinks it."
+              % (100 * rms / span))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -20,104 +20,16 @@ The device must still be in bootloader mode with the sketch resident. Without
 
 import argparse
 import os
-import re
 import select
-import shutil
 import struct
-import subprocess
 import sys
-import tempfile
 import termios
 import time
 import tty
 
-MAGIC = 0x36384C53          # "SL68"
-VERSION = 2
-POLL_ADDR = 0x434F4E53      # "CONS" - the console-poll sentinel
-
-# struct sl6806_console_t header: magic,size,version,head,tail,dropped,
-#                                 rx_head,rx_tail
-HDR_FMT = "<IIIIIIII"
-HDR_LEN = struct.calcsize(HDR_FMT)
-
-# struct sl6806_console_pkt_t: len,flags,pending,data[60]
-PKT_FMT = "<BBH60s"
-PKT_LEN = struct.calcsize(PKT_FMT)
-
-F_OVERFLOW = 0x01
-RX_SIZE = 256
-
-
-def find_tool(explicit):
-    if explicit:
-        return explicit
-    here = os.path.dirname(os.path.abspath(__file__))
-    for c in [os.path.join(here, "..", "3rd", "smartlink_flash", "smtlink_dump"),
-              shutil.which("smtlink_dump") or ""]:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return os.path.abspath(c)
-    sys.exit("error: smtlink_dump not found; pass --tool <path>")
-
-
-def console_addr_from_sym(path):
-    """Read the console address from the .sym file the build emits."""
-    try:
-        with open(path) as f:
-            for line in f:
-                m = re.match(r"([0-9a-fA-F]+)\s+\S+\s+_sl6806_console", line)
-                if m:
-                    return int(m.group(1), 16)
-    except OSError as e:
-        sys.exit("error: %s" % e)
-    sys.exit("error: no _sl6806_console symbol in %s (was the sketch built by "
-             "this framework?)" % path)
-
-
-class Device:
-    def __init__(self, tool, sudo):
-        self.tool = tool
-        self.sudo = sudo
-        self.tmp = tempfile.mkdtemp(prefix="sl6806mon.")
-
-    def _run(self, args):
-        cmd = (["sudo"] if self.sudo else []) + [self.tool, "chip", "6806"] + args
-        return subprocess.run(cmd, capture_output=True, text=True)
-
-    def read(self, addr, size):
-        """Read device memory, or None on failure."""
-        if size <= 0:
-            return b""
-        out = os.path.join(self.tmp, "r.bin")
-        try:
-            os.unlink(out)
-        except OSError:
-            pass
-        r = self._run(["read_mem2", hex(addr), hex(size), out])
-        if r.returncode != 0 or not os.path.isfile(out):
-            return None
-        with open(out, "rb") as f:
-            data = f.read()
-        return data if len(data) == size else None
-
-    def write(self, addr, data):
-        src = os.path.join(self.tmp, "w.bin")
-        with open(src, "wb") as f:
-            f.write(data)
-        r = self._run(["write_mem", hex(addr), "0", hex(len(data)), src])
-        return r.returncode == 0
-
-    def poll_console(self):
-        """One round trip: fetch and consume queued output.
-
-        Returns (data, overflowed, pending) or None if the device did not
-        answer."""
-        raw = self.read(POLL_ADDR, PKT_LEN)
-        if raw is None or len(raw) != PKT_LEN:
-            return None
-        n, flags, pending, data = struct.unpack(PKT_FMT, raw)
-        if n > 60:
-            return None
-        return data[:n], bool(flags & F_OVERFLOW), pending
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sl6806_dev import (Device, find_tool, symbol, parse_console_header,   # noqa: E402
+                        HDR_FMT, HDR_LEN, RX_SIZE, VERSION)
 
 
 def push_input(dev, base, hdr_size, text):
@@ -129,11 +41,9 @@ def push_input(dev, base, hdr_size, text):
         payload = payload[-RX_SIZE:]
 
     hdr = dev.read(base, HDR_LEN)
-    if hdr is None:
+    if parse_console_header(hdr) is None:
         return False
-    magic, size, version, _h, _t, _d, rx_head, rx_tail = struct.unpack(HDR_FMT, hdr)
-    if magic != MAGIC:
-        return False
+    _m, size, _v, _h, _t, _d, rx_head, rx_tail = struct.unpack(HDR_FMT, hdr)
 
     # Do not overrun input the sketch has not consumed yet.
     if (rx_head - rx_tail) + len(payload) > RX_SIZE:
@@ -159,15 +69,14 @@ def wait_for_console(dev, base, quiet):
     """Block until the sketch has published a valid console header."""
     warned = False
     while True:
-        hdr = dev.read(base, HDR_LEN)
-        if hdr is not None:
-            magic, size, version = struct.unpack_from("<III", hdr)
-            if magic == MAGIC:
-                if version != VERSION:
-                    sys.exit("error: sketch console is v%d, this monitor "
-                             "speaks v%d - rebuild the sketch"
-                             % (version, VERSION))
-                return size
+        got = parse_console_header(dev.read(base, HDR_LEN))
+        if got is not None:
+            size, version = got
+            if version != VERSION:
+                sys.exit("error: sketch console is v%d, this monitor "
+                         "speaks v%d - rebuild the sketch"
+                         % (version, VERSION))
+            return size
         if not warned and not quiet:
             print("(waiting for the device - is it in bootloader mode with "
                   "the sketch loaded?)", file=sys.stderr)
@@ -189,7 +98,7 @@ def main():
                    help="do not forward what you type to the sketch")
     args = p.parse_args()
 
-    base = console_addr_from_sym(args.sym)
+    base = symbol(args.sym, "_sl6806_console")
     dev = Device(find_tool(args.tool), not args.no_sudo)
 
     print("monitoring console at 0x%08x (ctrl-c to quit)" % base,

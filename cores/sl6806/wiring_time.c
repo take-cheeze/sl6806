@@ -65,6 +65,13 @@ __attribute__((weak)) void sl6806_block_clamped(uint32_t asked_ms,
         "    (reported once; further clamping is silent)\r\n\r\n");
 }
 
+/*
+ * Deliberately not static, and `used`: tools/sl6806-clockcal locates this by
+ * symbol name in the ELF. See the long comment in wiring_time.h.
+ */
+__attribute__((used, aligned(4)))
+sl6806_clockstamp_t _sl6806_clockstamp;
+
 /* Which counter we ended up with. */
 static uint32_t tick_mask;      /* counter modulus - 1 */
 static uint32_t last_raw;       /* previous raw up-count */
@@ -109,6 +116,22 @@ void sl6806_time_init(void)
     last_raw  = read_raw();
     cycle_acc = 0;
     time_ready = 1;
+
+    /* .bss is zeroed, so publish the calibration side-channel from here
+     * rather than relying on a static initialiser that the payload .bin does
+     * not carry. The magic is written last: a host that sees it knows f_cpu
+     * is already valid. */
+    _sl6806_clockstamp.f_cpu = (uint32_t)F_CPU;
+    _sl6806_clockstamp.magic = SL6806_CLOCKSTAMP_MAGIC;
+}
+
+void sl6806_time_stamp(void)
+{
+    uint64_t c = sl6806_cycles();   /* also services the wrap accumulator */
+
+    _sl6806_clockstamp.cyc_lo = (uint32_t)c;
+    _sl6806_clockstamp.cyc_hi = (uint32_t)(c >> 32);
+    _sl6806_clockstamp.seq++;
 }
 
 uint64_t sl6806_cycles(void)

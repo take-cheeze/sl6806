@@ -1,5 +1,6 @@
 #include "sl6806.h"
 #include "sl6806_console.h"
+#include "wiring_time.h"   /* sl6806_time_stamp() - see the poll handler */
 
 #if SL6806_CONSOLE_SIZE & (SL6806_CONSOLE_SIZE - 1)
 #error "SL6806_CONSOLE_SIZE must be a power of two"
@@ -124,6 +125,11 @@ int sl6806_console_poll(sl6806_console_pkt_t *pkt)
     pkt->len = 0;
     pkt->flags = 0;
     pkt->pending = 0;
+
+    /* First thing, before any work: this is the host's clock reference, and
+     * it is only useful if it lands as close to the start of the transaction
+     * the host is timing as it can. See wiring_time.h. */
+    sl6806_time_stamp();
 
     if (_sl6806_console.magic != SL6806_CONSOLE_MAGIC)
         return 0;

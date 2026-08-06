@@ -67,6 +67,7 @@ DWT_CTRL = 0xE0001000
 DWT_CYCCNT = 0xE0001004
 
 CONSOLE_MAGIC = 0x36384C53          # "SL68"
+CLOCKSTAMP_MAGIC = 0x4B4C4353       # "SCLK" - the clock-calibration stamp
 
 
 class EmuError(RuntimeError):
@@ -292,6 +293,22 @@ class SL6806:
                 return addr
             off = blob.find(want, off + 4)
         return None
+
+    def clockstamp(self, addr):
+        """The clock-calibration side-channel: (seq, cycles, f_cpu) or None.
+
+        Read at a symbol address, exactly as tools/sl6806-clockcal does with
+        the .sym file - not searched for by magic. The magic is a literal in
+        the code that writes it, so a scan finds the literal pool first; the
+        host tool cannot make that mistake and neither should this.
+
+        None means the magic is absent, which means sl6806_time_init() has not
+        run yet.
+        """
+        _m, f_cpu, seq, lo, hi = struct.unpack("<5I", self.uc.mem_read(addr, 20))
+        if _m != CLOCKSTAMP_MAGIC:
+            return None
+        return seq, (hi << 32) | lo, f_cpu
 
     def console(self):
         """Everything the sketch has printed, in order, as the monitor sees it."""

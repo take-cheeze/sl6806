@@ -7,7 +7,7 @@
 # exactly what `--help` in CI cannot check.
 
 PYTHON ?= python3
-TESTS  := test_inquiry.py
+TESTS  := test_inquiry.py test_clockcal.py
 
 .PHONY: all clean
 all:

@@ -15,6 +15,16 @@
 
 #include "sl6806_console.h"
 
+/*
+ * wiring_time.c is Cortex-M only and is not linked here, but the poll handler
+ * calls into it to stamp the clock-calibration counter. Counting the calls is
+ * more useful than an empty stub: it lets a test assert that every poll takes
+ * a stamp, which is what tools/sl6806-clockcal depends on.
+ */
+static unsigned stamps;
+void sl6806_time_stamp(void);
+void sl6806_time_stamp(void) { stamps++; }
+
 static int failures;
 static int checks;
 
@@ -61,6 +71,30 @@ static int drain(char *out, int cap, int *overflowed)
     }
     out[total] = '\0';
     return total;
+}
+
+static void test_every_poll_stamps_the_clock(void)
+{
+    sl6806_console_pkt_t pkt;
+
+    /* The host measures the real CPU clock by timing poll transactions and
+     * reading the stamp each one leaves behind. A poll that does not stamp
+     * would not fail loudly - it would just make the regression quietly wrong,
+     * so pin it down here. */
+    reset();
+    stamps = 0;
+    sl6806_console_poll(&pkt);
+    CHECK(stamps == 1, "an empty poll must still stamp, got %u", stamps);
+
+    put("x");
+    sl6806_console_poll(&pkt);
+    CHECK(stamps == 2, "a poll with data must stamp too, got %u", stamps);
+
+    /* Even with the ring uninitialised - that path returns early. */
+    memset(&_sl6806_console, 0, sizeof(_sl6806_console));
+    stamps = 0;
+    sl6806_console_poll(&pkt);
+    CHECK(stamps == 1, "the early-return path skipped the stamp");
 }
 
 static void test_roundtrip(void)
@@ -272,6 +306,7 @@ int main(void)
     test_oversized_single_write();
     test_space_accounting();
     test_rx();
+    test_every_poll_stamps_the_clock();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

@@ -41,6 +41,45 @@ uint32_t sl6806_block_limit(void);
  * the reporting. */
 void     sl6806_block_clamped(uint32_t asked_ms, uint32_t capped_ms);
 
+/*
+ * CLOCK CALIBRATION SIDE-CHANNEL
+ *
+ * F_CPU is a build-time guess. Every millis(), micros() and delay() is wrong
+ * by exactly the ratio between that guess and the truth, so one measurement
+ * fixes all timing at once - but measuring it on the device means blocking for
+ * tens of seconds, and in payload mode blocking is what wedges the USB link.
+ *
+ * So the measurement is done from the host instead. Every console poll stamps
+ * a snapshot of sl6806_cycles() here, taken *inside* the USB transaction the
+ * host is timing. tools/sl6806-clockcal collects those stamps against its own
+ * wall clock and regresses one against the other; the slope is the real clock.
+ * The device blocks for nothing and any sketch can be calibrated, because the
+ * stamping lives in the core rather than in a sketch.
+ *
+ * There is no locking and none is needed: the device only ever writes this
+ * from inside a USB command, and the host only ever reads it from a different
+ * USB command, so the two can never overlap.
+ *
+ * Like the console ring this lives in .bss - the linker picks the address and
+ * the build exports it to build/<sketch>.sym. Nothing is hardcoded.
+ */
+#define SL6806_CLOCKSTAMP_MAGIC 0x4B4C4353u   /* "SCLK" little-endian */
+
+typedef struct {
+    uint32_t magic;              /* SL6806_CLOCKSTAMP_MAGIC once time_init ran */
+    uint32_t f_cpu;              /* the F_CPU this build was compiled with     */
+    volatile uint32_t seq;       /* stamps taken so far; proves it is live     */
+    volatile uint32_t cyc_lo;    /* sl6806_cycles() at the last stamp, low     */
+    volatile uint32_t cyc_hi;    /* ... and high                               */
+} sl6806_clockstamp_t;
+
+extern sl6806_clockstamp_t _sl6806_clockstamp;
+
+/* Take a stamp. Called from the console poll handler; a sketch does not need
+ * to call it. Reading the counter here also keeps the wrap accumulator honest
+ * for free whenever a host is polling. */
+void     sl6806_time_stamp(void);
+
 #ifdef __cplusplus
 }
 #endif

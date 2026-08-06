@@ -23,6 +23,8 @@ make SKETCH=examples/Hello upload
 make SKETCH=examples/Hello monitor
 ```
 
+Bringing a real device up for the first time: **[docs/BRINGUP.md](docs/BRINGUP.md)**.
+
 ## What actually works
 
 This chip has no datasheet. Everything here was built from a firmware dump and
@@ -32,7 +34,7 @@ so it is worth being precise about which parts are real:
 | Area | Status |
 |---|---|
 | Build → link → load → run | **Works.** Verified end to end; entry lands at 0x820000 with the correct Thumb entry. |
-| `setup()` / `loop()` | **Works.** Driven from the boot ROM's idle callback so USB stays alive. |
+| `setup()` / `loop()` | **Works.** `setup()` verified on hardware. `loop()` is driven from the boot ROM's idle callback, which on at least one unit is never called — use `RUN_MODE=poll` there. See [docs/BRINGUP.md](docs/BRINGUP.md). |
 | `Serial` — bidirectional USB serial | **Works.** Print, printf, String, Stream, and `Serial.read()` from an interactive monitor. Not a UART: see below. |
 | `millis()` / `micros()` / `delay()` | **Works**, but scaled by an unverified clock — see below. |
 | Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~38 KB heap in payload mode, ~190 KB in firmware mode. |
@@ -52,9 +54,16 @@ Two honest caveats worth reading before you trust output:
 The clock and reset unit has since been found at `0x40080000`, but it holds
 dividers and gates, not a PLL multiplier, and nothing in the dump establishes
 the crystal frequency. So every `delay()` and `millis()` is still off by one
-constant ratio. It is a single scale factor —
-`make SKETCH=examples/ClockCalibrate run`, time it with a stopwatch, then
-build with `F_CPU=<measured>` and all timing is correct.
+constant ratio. It is a single scale factor, and measuring it takes about a
+minute with any sketch loaded:
+
+```sh
+tools/sl6806-clockcal build/Hello.sym
+make SKETCH=examples/Blink F_CPU=<what it printed> upload
+```
+
+The measurement runs on the host — the device stamps its cycle counter inside
+each USB poll and never blocks. See [docs/BRINGUP.md](docs/BRINGUP.md).
 
 **GPIO has one hole, with two ways to fill it.** The driver is complete;
 what is missing is either the register addresses or a way to reach the
@@ -293,9 +302,10 @@ In rough order of how much they unlock:
 2. **GPIO registers** — the only route to `digitalWrite`. Start with
    `tools/sl6806-find-mmio`. Note the mask ROM has been dumped and does *not*
    contain them.
-3. **The real CPU clock** — makes all timing absolute. A stopwatch does it;
-   finding the PLL registers does it exactly. It is *not* at the clock unit's
-   base: `0x40080000` has dividers but no multiplier.
+3. **The real CPU clock** — makes all timing absolute.
+   `tools/sl6806-clockcal` measures it to a fraction of a percent; finding the
+   PLL registers would give it exactly. It is *not* at the clock unit's base:
+   `0x40080000` has dividers but no multiplier.
 
 The mask ROM has since been dumped, which settled two questions in the
 negative: it holds no LCD driver, and the vendor SRAM routines are not
@@ -312,9 +322,13 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe
+examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe,
+                  CallbackProbe
 tests/host/       native tests for console, graphics and the panel
-docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
+tests/tools/      tests for the host tools' parsing and arithmetic
+tests/emu/        smoke tests that run built images under Unicorn
+docs/             BRINGUP.md, DUMPING.md, FLASHING.md, LCD.md,
+                  sl6806_re_notes.md
 3rd/              smartlink_flash submodule
 ```
 

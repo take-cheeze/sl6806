@@ -124,13 +124,18 @@ $(OUT).elf: $(OBJS) $(LDSCRIPT)
 	@mkdir -p $(dir $@)
 	$(CXX) $(LDFLAGS) $(OBJS) -o $@ -lc -lm -lgcc
 
-# The monitor finds the console ring by symbol, so export it next to the
-# binary instead of hardcoding an address anywhere.
+# The host tools find their device-side structures by symbol, so export them
+# next to the binary instead of hardcoding an address anywhere. Both live in
+# .bss, so the linker places them and this file is the only thing that knows
+# where.
+SYMS := _sl6806_console|_sl6806_clockstamp
+
 $(OUT).bin: $(OUT).elf
 	$(OBJCOPY) -O binary -R .bss -R .heap $< $@
-	@$(NM) $< | grep -i ' _sl6806_console$$' > $(OUT).sym || \
+	@$(NM) $< | grep -iE ' ($(SYMS))$$' > $(OUT).sym || \
 		echo "warning: console symbol not found" >&2
-	@echo "built $@  (console: $$(cut -d' ' -f1 < $(OUT).sym))"
+	@echo "built $@  (console: $$(grep -i ' _sl6806_console$$' $(OUT).sym \
+		| cut -d' ' -f1))"
 
 size: $(OUT).elf
 	@$(SIZE) $<

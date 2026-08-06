@@ -209,6 +209,62 @@ def test_poll_mode_cannot_block_the_usb_handler():
           hook_cycles)
 
 
+def symbol(sketch, name, **make_vars):
+    """Address of a symbol in a built sketch, via nm."""
+    elf = build(sketch, **make_vars)[:-4] + ".elf"
+    out = subprocess.run(["arm-none-eabi-nm", elf],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 3 and f[2] == name:
+            return int(f[0], 16)
+    return None
+
+
+def test_every_poll_stamps_the_clock():
+    """What tools/sl6806-clockcal measures against.
+
+    The host recovers the real F_CPU by timing poll transactions and fitting a
+    line through the cycle counts the device stamps inside them. If a poll
+    stops stamping, or the stamp does not advance, nothing breaks loudly - the
+    tool just fits a flat line, or prints a confident wrong number. So check
+    the stamping in a real image, driven through the same entry point the ROM
+    calls.
+    """
+    poll = symbol("Hello", "sl6806_console_poll")
+    stamp = symbol("Hello", "_sl6806_clockstamp")
+    check(poll is not None, "sl6806_console_poll was optimised away")
+    check(stamp is not None,
+          "_sl6806_clockstamp is not in the symbol table, so the .sym file "
+          "the host tool reads would be missing it too")
+    if poll is None or stamp is None:
+        return
+
+    emu = SL6806(load_image(build("Hello")))
+    emu.start()
+
+    st = emu.clockstamp(stamp)
+    check(st is not None, "no clock stamp in the image - is it initialised?")
+    if st is None:
+        return
+    check(st[2] == 120000000,
+          "the stamp should carry the build's F_CPU, got %d", st[2])
+
+    scratch = 0x00810000        # SRAM, well below where the payload loads
+    seen = []
+    for _ in range(3):
+        emu.call(poll, args=(scratch,))
+        seen.append(emu.clockstamp(stamp))
+
+    seqs = [s[0] for s in seen]
+    check(seqs == sorted(seqs) and seqs[-1] - seqs[0] == 2,
+          "the stamp sequence did not advance once per poll: %s", seqs)
+
+    cycles = [s[1] for s in seen]
+    check(all(b > a for a, b in zip(cycles, cycles[1:])),
+          "the stamped cycle count did not move forward: %s", cycles)
+
+
 def test_no_stray_peripheral_writes():
     """A sketch with no drivers must not poke unknown MMIO.
 
