@@ -62,10 +62,17 @@ SL6806_ROM_FN(0x0DD8, void,   rom_free,    (void *));
  *             [V] MEASURED, NEGATIVE, on one unit (SMTLINK DEVICE 2.00):
  *             cb2 is NOT called periodically. A Hello build printed all of
  *             setup()'s output - so _start ran and returned, and scsi_cb is
- *             being serviced - and then never ticked. Build with
- *             RUN_MODE=poll, which drives loop() from scsi_cb instead.
- *             examples/CallbackProbe finds out which slots your ROM really
- *             calls.
+ *             being serviced - and then never ticked.
+ *
+ *             Confirmed a second time by counting rather than by silence: a
+ *             60-second host status run (sl6806_stat.h) reported 0 loop()
+ *             calls against 281 answered polls. The core increments that
+ *             counter on every path that runs loop(), so the ROM really is
+ *             not calling this slot.
+ *
+ *             Build with RUN_MODE=poll, which drives loop() from scsi_cb
+ *             instead. examples/CallbackProbe finds out which *other* slots
+ *             your ROM calls, if any.
  * The remaining slots are unknown; leave them NULL.
  */
 typedef struct {

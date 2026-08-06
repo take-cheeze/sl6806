@@ -536,8 +536,17 @@ CASET/RASET — and most of the 20-byte config struct. Full map in
 5. **Dump the mask ROM** (`0x00000000`–`0x0007D000`) in bootloader mode. It is
    the SDK's shared driver library (§7d) and would hand over GPIO, the LCD
    writers and the delay routines in one go.
-6. **Find the PLL** so `F_CPU` stops being a guess. It is not at the CRU base;
-   `0x40080000` has dividers but no multiplier.
+6. ~~**Find the PLL**~~ — largely settled in practice. The clock was
+   **measured at 64.000 MHz** (2026-08-06, one P20 Player) by timing the
+   device's counter against the host's with `tools/sl6806-calibrate`; the
+   bracket was ±0.06% and contained exactly one whole MHz. Finding the PLL
+   would still give it exactly and for any unit, and it is *not* at the CRU
+   base: `0x40080000` has dividers but no multiplier.
+
+   Two hardware facts fell out of that measurement and are worth recording:
+   the **DWT cycle counter does not run** on this part (its register reads a
+   constant), so timekeeping uses the **24-bit SysTick**, which wraps every
+   262 ms at 64 MHz.
 7. **Enumerate vtable slots / message-id enum** via the central
    `__act_on_request` dispatcher (turns `method_20` + siblings into named
    methods across all scenes).

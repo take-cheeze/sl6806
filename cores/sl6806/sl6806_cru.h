@@ -102,9 +102,9 @@
  *
  * F_CPU is still a guess (see README.md). None of the registers above is a
  * PLL multiplier, and the crystal frequency is not written down anywhere in
- * the flash image. Calibrating with examples/ClockCalibrate and a stopwatch
- * remains the practical answer; finding the PLL block - which is not at this
- * base - would be the exact one.
+ * the flash image. Measuring it against the host clock (`make calibrate`, see
+ * sl6806_stat.h) remains the practical answer; finding the PLL block - which
+ * is not at this base - would be the exact one.
  */
 
 #endif /* SL6806_CRU_H */

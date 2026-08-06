@@ -22,14 +22,14 @@ import argparse
 import os
 import re
 import select
-import shutil
 import struct
-import subprocess
 import sys
-import tempfile
 import termios
 import time
 import tty
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sl6806_dev import Device as BaseDevice, find_tool     # noqa: E402
 
 MAGIC = 0x36384C53          # "SL68"
 VERSION = 2
@@ -48,15 +48,37 @@ F_OVERFLOW = 0x01
 RX_SIZE = 256
 
 
-def find_tool(explicit):
-    if explicit:
-        return explicit
-    here = os.path.dirname(os.path.abspath(__file__))
-    for c in [os.path.join(here, "..", "3rd", "smartlink_flash", "smtlink_dump"),
-              shutil.which("smtlink_dump") or ""]:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            return os.path.abspath(c)
-    sys.exit("error: smtlink_dump not found; pass --tool <path>")
+# Consecutive failed console polls before the monitor explains itself.
+STALL_AFTER = 15
+
+
+def report_stall(dev, base):
+    """Say why the console went quiet, and separate the two possible causes.
+
+    A failed console poll and a failed plain read mean different things. The
+    console poll is the only command that runs loop() (in RUN_MODE=poll), so
+    if plain reads still work, loop() is what is breaking the transaction -
+    which is a sketch problem, not a dead link.
+    """
+    why = dev.last_error or "no reason reported"
+    alive = dev.read(base, HDR_LEN) is not None
+
+    print("\n[no console output for %d polls: %s]" % (STALL_AFTER, why),
+          file=sys.stderr)
+    if alive:
+        print("[but plain memory reads still work, so the device is up and\n"
+              " _start ran. In RUN_MODE=poll the console poll is the only\n"
+              " command that runs loop() inside the boot ROM's USB handler -\n"
+              " so it is loop() breaking this transaction. Shorten it:\n"
+              "   make ... RUN_MODE=poll EXTRA_FLAGS=-DSL6806_POLL_BLOCK_LIMIT_MS=1\n"
+              " tools/sl6806-calibrate probes the same handler without ever\n"
+              " running loop(), which confirms this independently.]\n",
+              file=sys.stderr)
+    else:
+        print("[plain memory reads fail too, so the link itself is down.\n"
+              " Unplug, hold the boot key, plug back in, and upload again.\n"
+              " Nothing here writes to flash, so there is nothing to repair.]\n",
+              file=sys.stderr)
 
 
 def console_addr_from_sym(path):
@@ -73,39 +95,7 @@ def console_addr_from_sym(path):
              "this framework?)" % path)
 
 
-class Device:
-    def __init__(self, tool, sudo):
-        self.tool = tool
-        self.sudo = sudo
-        self.tmp = tempfile.mkdtemp(prefix="sl6806mon.")
-
-    def _run(self, args):
-        cmd = (["sudo"] if self.sudo else []) + [self.tool, "chip", "6806"] + args
-        return subprocess.run(cmd, capture_output=True, text=True)
-
-    def read(self, addr, size):
-        """Read device memory, or None on failure."""
-        if size <= 0:
-            return b""
-        out = os.path.join(self.tmp, "r.bin")
-        try:
-            os.unlink(out)
-        except OSError:
-            pass
-        r = self._run(["read_mem2", hex(addr), hex(size), out])
-        if r.returncode != 0 or not os.path.isfile(out):
-            return None
-        with open(out, "rb") as f:
-            data = f.read()
-        return data if len(data) == size else None
-
-    def write(self, addr, data):
-        src = os.path.join(self.tmp, "w.bin")
-        with open(src, "wb") as f:
-            f.write(data)
-        r = self._run(["write_mem", hex(addr), "0", hex(len(data)), src])
-        return r.returncode == 0
-
+class Device(BaseDevice):
     def poll_console(self):
         """One round trip: fetch and consume queued output.
 
@@ -155,9 +145,29 @@ def push_input(dev, base, hdr_size, text):
     return dev.write(base + 24, struct.pack("<I", rx_head + len(payload)))
 
 
+def describe_absence(hdr, base, last_error):
+    """Why there is no console yet - the two cases mean different things.
+
+    A device that does not answer at all is a link problem. A device that
+    answers with something that is not the console magic is a healthy device
+    with no sketch in it, which is what you get every time you replug: SRAM
+    does not survive, so the payload has to be uploaded again. Telling a user
+    to check the cable when they simply have not uploaded wastes a session.
+    """
+    if hdr is None:
+        return ("the device is not answering: %s\n"
+                " Is it plugged in and in bootloader mode? (unplug, hold the\n"
+                " boot key, plug back in)" % (last_error or "no reason given"))
+    magic = struct.unpack_from("<I", hdr)[0]
+    return ("the device answers, but there is no sketch resident: the console\n"
+            " magic at 0x%08x reads 0x%08x, not 0x%08x. Unplugging clears\n"
+            " SRAM, so upload again:  make SKETCH=<sketch> upload"
+            % (base, magic, MAGIC))
+
+
 def wait_for_console(dev, base, quiet):
     """Block until the sketch has published a valid console header."""
-    warned = False
+    warned = None
     while True:
         hdr = dev.read(base, HDR_LEN)
         if hdr is not None:
@@ -168,10 +178,12 @@ def wait_for_console(dev, base, quiet):
                              "speaks v%d - rebuild the sketch"
                              % (version, VERSION))
                 return size
-        if not warned and not quiet:
-            print("(waiting for the device - is it in bootloader mode with "
-                  "the sketch loaded?)", file=sys.stderr)
-            warned = True
+        why = describe_absence(hdr, base, dev.last_error)
+        # Re-announce if the situation changes - "not answering" turning into
+        # "no sketch" is progress and worth seeing.
+        if why != warned and not quiet:
+            print("(%s)" % why, file=sys.stderr)
+            warned = why
         time.sleep(0.3)
 
 
@@ -208,14 +220,26 @@ def main():
         tty.setcbreak(sys.stdin.fileno())
 
     pending_in = b""
+    misses = 0
 
     try:
         while True:
             got = dev.poll_console()
 
             if got is None:
+                misses += 1
+                # Retrying in silence is how a wedged device presents as "the
+                # monitor just sits there", which is the least informative
+                # symptom there is. Say what is happening, once per outage.
+                if misses == STALL_AFTER:
+                    report_stall(dev, base)
                 time.sleep(args.interval)
                 continue
+
+            if misses >= STALL_AFTER:
+                print("[device answering again after %d failed polls]\n"
+                      % misses, file=sys.stderr)
+            misses = 0
 
             data, overflowed, pending = got
 

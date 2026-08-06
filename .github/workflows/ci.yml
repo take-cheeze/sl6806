@@ -40,8 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sketch: [Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe,
-                 CallbackProbe]
+        sketch: [Hello, Blink, GfxDemo, MmioProbe, RomProbe, CallbackProbe]
         mode: [payload, firmware]
     steps:
       - uses: actions/checkout@v4
@@ -126,8 +125,10 @@ jobs:
           python-version: '3.x'
       - name: Compile and start every tool
         # --help exercises argparse and the module-level code, which is where
-        # a syntax error or a bad default actually lives.
+        # a syntax error or a bad default actually lives. The shared module
+        # has no --help, but every tool imports it, so compile it too.
         run: |
+          python3 -m py_compile tools/sl6806_dev.py
           for t in tools/sl6806-*; do
             echo "== $t"
             python3 -m py_compile "$t"

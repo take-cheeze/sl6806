@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""
+sl6806-calibrate - measure the SL6806's real CPU clock from the host.
+
+    make SKETCH=examples/Hello calibrate
+
+The PLL registers on this SoC have not been found, so F_CPU cannot be derived
+from a register - and `millis()`, `micros()` and `delay()` are all wrong by one
+constant ratio if it is wrong. One measurement fixes every one of them. On the
+one P20 Player measured this returned 64.000 MHz, which is now the default;
+re-run it on any other unit rather than assuming that carries over.
+
+HOW IT WORKS, AND WHY NOT WITH A STOPWATCH
+The device never times anything. It only reports its own free-running cycle
+counter when asked, from inside the boot ROM's USB command handler (see
+cores/sl6806/sl6806_stat.h). This tool asks repeatedly, stamps each answer
+with host wall-clock time, and regresses device cycles against host seconds.
+The slope is the clock.
+
+The sketch-side alternative - delay a known number of seconds, time it by
+hand - cannot be used here. A payload blocks the boot ROM's USB service while
+it runs, so a thirty-second measurement is a thirty-second dead link, which is
+the hazard that has already wedged this device once. It also cannot beat a
+host clock for accuracy. That sketch used to exist as examples/ClockCalibrate
+and was deleted in favour of this.
+
+WHAT IT REPORTS, AND HOW MUCH TO BELIEVE IT
+Each round trip takes some unknown time between the timestamps either side of
+it, so a sample pins the device's counter to an *interval* of host time, not
+an instant. That is not a nuisance to be averaged away: it bounds the answer.
+The tool reports both a least-squares estimate and the range of clock rates
+that no pair of samples can rule out. The bracket narrows with the duration
+you run for, not with the number of samples, so run it longer for a tighter
+answer - a minute is good to a few parts in ten thousand.
+
+If the bracket comes out empty, the samples contradict each other and the
+result is reported as untrustworthy rather than quietly averaged. The usual
+cause is the hardware counter wrapping unobserved between two polls; the tool
+says so, because the device reports how wide its counter is.
+
+Ctrl-C at any point stops sampling and reports on what it has.
+"""
+
+import argparse
+import json
+import math
+import os
+import struct
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from sl6806_dev import Device, find_tool                    # noqa: E402
+
+# cores/sl6806/sl6806_stat.h
+STAT_ADDR = 0x53544154
+STAT_MAGIC = 0x54415453
+STAT_VERSION = 2
+STAT_FMT = "<10I"
+STAT_LEN = struct.calcsize(STAT_FMT)
+
+RUN_MODES = {0: "hook", 1: "takeover", 2: "poll"}
+
+
+def parse_stat(raw):
+    """Decode a status reply, or None if it is not one.
+
+    Kept a pure function of bytes so it can be tested without a device: this
+    is the half of the tool that interprets what the hardware says back.
+    """
+    if raw is None or len(raw) < STAT_LEN:
+        return None
+    (magic, version, lo, hi, polls, loops,
+     f_cpu, run_mode, tick_mask, tick_raw) = struct.unpack(STAT_FMT,
+                                                           raw[:STAT_LEN])
+    if magic != STAT_MAGIC:
+        return None
+    return {
+        "version": version,
+        "cycles": (hi << 32) | lo,
+        "polls": polls,
+        "loops": loops,
+        "f_cpu": f_cpu,
+        "run_mode": run_mode,
+        "tick_mask": tick_mask,
+        "tick_raw": tick_raw,
+    }
+
+
+def fit_clock(samples):
+    """Recover the clock from [(t_before, t_after, cycles), ...].
+
+    Returns a dict. `hz` is the least-squares slope through the midpoints;
+    `lo`/`hi` bound it using only what the timestamps prove.
+
+    The bound: the instant a sample was taken lies somewhere in
+    [t_before, t_after], so for any two samples i < j the elapsed host time
+    between them is at least t0[j] - t1[i] and at most t1[j] - t0[i]. Each
+    pair therefore constrains the slope from both sides, and the tightest
+    surviving constraints are the answer. If they cross, the samples are
+    mutually impossible and `consistent` is False.
+    """
+    n = len(samples)
+    if n < 2:
+        return None
+
+    mid = [(t0 + t1) / 2.0 for t0, t1, _c in samples]
+    cyc = [float(c) for _t0, _t1, c in samples]
+
+    tbar = sum(mid) / n
+    cbar = sum(cyc) / n
+    var = sum((t - tbar) ** 2 for t in mid)
+    if var <= 0:
+        return None
+    cov = sum((mid[i] - tbar) * (cyc[i] - cbar) for i in range(n))
+    hz = cov / var
+    intercept = cbar - hz * tbar
+
+    # Worst deviation from the fitted line, expressed as host time - a
+    # skipped counter wrap shows up here as a step, not as noise.
+    resid = [(cyc[i] - (hz * mid[i] + intercept)) / hz for i in range(n)] \
+        if hz > 0 else [0.0] * n
+    worst = max(abs(r) for r in resid)
+    rms = math.sqrt(sum(r * r for r in resid) / n)
+
+    # The bracket is O(n^2). Long runs at a short interval can reach a few
+    # thousand samples, so cap the work on an evenly spaced subset - and say
+    # so, because a silently narrowed search would look like a tighter answer
+    # than was earned. The bound comes from widely separated pairs, which
+    # subsampling keeps.
+    bracket_over = samples
+    if n > BRACKET_MAX:
+        step = n / float(BRACKET_MAX)
+        bracket_over = [samples[int(k * step)] for k in range(BRACKET_MAX)]
+        note = ("bracket computed on %d of %d samples (evenly spaced)"
+                % (len(bracket_over), n))
+    else:
+        note = None
+
+    lo, hi = 0.0, float("inf")
+    m = len(bracket_over)
+    for i in range(m):
+        t0i, t1i, ci = bracket_over[i]
+        for j in range(i + 1, m):
+            t0j, t1j, cj = bracket_over[j]
+            dc = float(cj - ci)
+            span_max = t1j - t0i          # most host time that can have passed
+            span_min = t0j - t1i          # least host time that can have passed
+            if span_max > 0:
+                lo = max(lo, dc / span_max)
+            if span_min > 0:
+                hi = min(hi, dc / span_min)
+
+    return {
+        "hz": hz,
+        "lo": lo,
+        "hi": hi,
+        "consistent": lo <= hi,
+        "samples": n,
+        "span": mid[-1] - mid[0],
+        "worst_residual": worst,
+        "rms_residual": rms,
+        "note": note,
+    }
+
+
+def round_frequencies(lo, hi, step=1000000):
+    """Whole-MHz frequencies inside a bracket.
+
+    A real PLL output is overwhelmingly likely to be a round number. Listing
+    the round numbers the measurement has *not* excluded is more honest than
+    snapping to the nearest one and calling it the answer.
+    """
+    if not (lo > 0 and hi >= lo) or math.isinf(hi):
+        return []
+    first = int(math.ceil(lo / step))
+    last = int(math.floor(hi / step))
+    if last - first > 64:               # bracket far too wide to be useful
+        return []
+    return [k * step for k in range(first, last + 1)]
+
+
+def hz_str(hz):
+    return "%s Hz (%.3f MHz)" % ("{:,}".format(int(round(hz))), hz / 1e6)
+
+
+# How far inside a counter wrap to stay. sl6806_cycles() only notices a wrap
+# when it is read, so a poll that lands after one has passed loses 2^n cycles
+# and every later sample is wrong by that much.
+WRAP_SAFETY = 5.0
+DEFAULT_INTERVAL = 0.2
+
+# Cap on the O(n^2) bracket search. A long run at a short interval can produce
+# a few thousand samples; beyond this it runs on an evenly spaced subset.
+BRACKET_MAX = 1200
+
+
+def safe_interval(tick_mask, hz, round_trip=0.0, ceiling=DEFAULT_INTERVAL):
+    """How long to sleep between polls to stay well inside a wrap.
+
+    This matters for the SysTick fallback and not much else: at 24 bits and
+    64 MHz the counter wraps every 262 ms, so the 200 ms default sits at 81%
+    of a wrap and one slow round trip voids the run. A 32-bit DWT at any
+    plausible clock wraps in tens of seconds and needs no help.
+
+    The round trip is subtracted rather than ignored, because what has to fit
+    inside a wrap is the whole poll-to-poll spacing, not just the sleep.
+    """
+    if not tick_mask or not hz or tick_mask >= 0xFFFFFFFF:
+        return ceiling
+    target = (tick_mask + 1) / hz / WRAP_SAFETY
+    return max(0.0, min(ceiling, target - round_trip))
+
+
+def collect(dev, duration, interval, quiet):
+    """Poll the device's status until the time is up or Ctrl-C.
+
+    Ctrl-C is not an error: a run stopped early is still a measurement, just
+    a looser one, so it returns what it has.
+    """
+    samples = []
+    first = st = None
+    deadline = time.monotonic() + duration
+    failures = 0
+
+    # interval None means "work it out". The wrap period depends on the clock,
+    # which is the thing being measured, so poll flat out until there are
+    # enough samples for a rough answer and then settle at a rate that stays
+    # inside a wrap. Starting fast is safe whatever the clock turns out to be.
+    auto = interval is None
+    gap = 0.0 if auto else interval
+
+    while time.monotonic() < deadline:
+        try:
+            t0 = time.monotonic()
+            raw = dev.read(STAT_ADDR, STAT_LEN)
+            t1 = time.monotonic()
+        except KeyboardInterrupt:
+            if not quiet:
+                print("\n(stopped early)", file=sys.stderr)
+            break
+
+        st = parse_stat(raw)
+        if st is None:
+            failures += 1
+            if failures == 1 and not quiet:
+                print("(no status reply: %s)"
+                      % (dev.last_error or "the device answered something "
+                                           "that is not a status packet"),
+                      file=sys.stderr)
+            if failures > 40 and not samples:
+                sys.exit("error: no status reply after %d attempts (%s). The "
+                         "sketch must be built from this tree - the status "
+                         "query is new - and must not be a RUN_MODE=takeover "
+                         "build, which registers no USB handler at all."
+                         % (failures, dev.last_error or "no reason reported"))
+            time.sleep(0.3)
+            continue
+
+        if st["version"] != STAT_VERSION:
+            sys.exit("error: device speaks status v%d, this tool speaks v%d - "
+                     "rebuild the sketch" % (st["version"], STAT_VERSION))
+
+        if first is None:
+            first = st
+            if not quiet:
+                print("device: run_mode=%s  built F_CPU=%s  counter=%s"
+                      % (RUN_MODES.get(st["run_mode"], "?"),
+                         "{:,}".format(st["f_cpu"]),
+                         "%d-bit" % st["tick_mask"].bit_length()
+                         if st["tick_mask"] else "NONE (no time source)"),
+                      file=sys.stderr)
+
+        samples.append((t0, t1, st["cycles"]))
+
+        # Enough of a pilot run to know the clock roughly? Then settle.
+        if auto and gap == 0.0 and len(samples) >= 10 \
+                and samples[-1][0] - samples[0][0] >= 0.5:
+            pilot = fit_clock(samples)
+            trip = sorted(b - a for a, b, _c in samples)[len(samples) // 2]
+            gap = safe_interval(first["tick_mask"],
+                                pilot["hz"] if pilot else 0, trip)
+            if not quiet and gap < DEFAULT_INTERVAL:
+                wrap = ((first["tick_mask"] + 1) / pilot["hz"]
+                        if pilot and pilot["hz"] and first["tick_mask"] else 0)
+                print("\r  counter wraps every %.3f s at roughly %.1f MHz;"
+                      " polling every %.3f s        "
+                      % (wrap, pilot["hz"] / 1e6, gap + trip), file=sys.stderr)
+                if wrap and trip > wrap / 3.0:
+                    print("  WARNING: one round trip is %.3f s, over a third "
+                          "of a wrap. Polls cannot\n           stay inside "
+                          "one; expect the samples to be rejected as "
+                          "inconsistent." % trip, file=sys.stderr)
+
+        if not quiet:
+            left = max(0.0, deadline - time.monotonic())
+            print("\r  %d samples, %4.0f s left " % (len(samples), left),
+                  end="", file=sys.stderr)
+            sys.stderr.flush()
+
+        try:
+            time.sleep(gap)
+        except KeyboardInterrupt:
+            if not quiet:
+                print("\n(stopped early)", file=sys.stderr)
+            break
+
+    if not quiet:
+        print(file=sys.stderr)
+    return samples, first, st
+
+
+def report_dead_counter(first, last, samples, out_json):
+    """The device answered every poll but its counter never moved.
+
+    Reporting that as "0 Hz, rebuild with F_CPU=0" would be worse than
+    useless, so it gets its own diagnosis. This is not hypothetical: it is
+    what a real SL6806 does, and it is also the cause of the poll-mode wedge,
+    because a delay() built on a frozen counter never terminates.
+    """
+    if out_json:
+        json.dump({"hz": None, "consistent": False, "dead_counter": True,
+                   "samples": len(samples), "cycles": first["cycles"],
+                   "tick_mask": first["tick_mask"], "tick_raw": first["tick_raw"],
+                   "polls": last["polls"], "loops": last["loops"]},
+                  sys.stdout, indent=2)
+        print()
+        return 1
+
+    print()
+    print("*** The cycle counter is not running.")
+    print()
+    print("  %d polls answered, every one reporting the same cycle count (%d)."
+          % (len(samples), first["cycles"]))
+    print("  tick_mask 0x%08X, raw counter 0x%08X."
+          % (first["tick_mask"], first["tick_raw"]))
+    print()
+    if first["tick_mask"] == 0:
+        print("  The device already knows: tick_mask 0 means neither the DWT")
+        print("  nor SysTick advanced when probed, so it has no time source.")
+        print("  millis() is frozen and delay() returns immediately - which is")
+        print("  deliberate, because spinning on a dead counter never ends.")
+    else:
+        print("  The device believes it has a %d-bit counter, so its probe"
+              % first["tick_mask"].bit_length())
+        print("  passed while the counter does not actually advance. Rebuild")
+        print("  from this tree: the probe now requires the register to")
+        print("  *change*, not merely to read nonzero.")
+    print()
+    if first["tick_raw"]:
+        print("  The register reads a constant 0x%08X rather than 0, which"
+              % first["tick_raw"])
+        print("  says CYCCNT is not implemented and the address reads junk.")
+    else:
+        print("  The register reads a constant 0, which says the counter")
+        print("  exists but is never clocked - a gate or a power domain.")
+    print()
+    print("  Consequence to keep in mind: this is also why RUN_MODE=poll")
+    print("  wedges the device. delay() spins until the counter reaches a")
+    print("  target it can never reach, inside the ROM's USB handler.")
+    print()
+    print("  device counted: %d polls, %d loop() calls"
+          % (last["polls"], last["loops"]))
+    return 1
+
+
+def report(fit, first, last, out_json):
+    ratio = fit["hz"] / first["f_cpu"] if first["f_cpu"] else 0.0
+    rounds = round_frequencies(fit["lo"], fit["hi"])
+    wrap = (first["tick_mask"] + 1) / fit["hz"] if fit["hz"] > 0 else 0.0
+
+    if out_json:
+        json.dump({
+            "hz": fit["hz"], "hz_lo": fit["lo"], "hz_hi": fit["hi"],
+            "consistent": fit["consistent"], "samples": fit["samples"],
+            "span_s": fit["span"], "worst_residual_s": fit["worst_residual"],
+            "rms_residual_s": fit["rms_residual"],
+            "built_f_cpu": first["f_cpu"], "ratio": ratio,
+            "round_candidates": rounds,
+            "run_mode": RUN_MODES.get(first["run_mode"]),
+            "tick_bits": first["tick_mask"].bit_length(),
+            "wrap_period_s": wrap,
+            "polls": last["polls"], "loops": last["loops"],
+        }, sys.stdout, indent=2)
+        print()
+        return 0 if fit["consistent"] else 1
+
+    half = (fit["hi"] - fit["lo"]) / 2.0
+    print()
+    print("%d samples over %.1f s" % (fit["samples"], fit["span"]))
+    print()
+    print("  measured clock : %s" % hz_str(fit["hz"]))
+    if fit["consistent"] and not math.isinf(fit["hi"]):
+        print("  bracket        : %s .. %s  (+/- %.3f%%)"
+              % ("{:,}".format(int(fit["lo"])), "{:,}".format(int(fit["hi"])),
+                 100.0 * half / fit["hz"] if fit["hz"] else 0.0))
+    print("  built with     : F_CPU = %s" % "{:,}".format(first["f_cpu"]))
+    if ratio:
+        # delay(n) spends n*F_CPU cycles, so a faster real clock makes it
+        # shorter in real time; millis() divides by F_CPU, so it runs fast.
+        print("                   -> every delay() is %.4gx too %s, and "
+              "millis() runs %.4gx too %s"
+              % (max(ratio, 1 / ratio), "short" if ratio > 1 else "long",
+                 max(ratio, 1 / ratio), "fast" if ratio > 1 else "slow"))
+    print("  worst residual : %.1f ms off the fitted line" %
+          (fit["worst_residual"] * 1000.0))
+    spacing = fit["span"] / max(1, fit["samples"] - 1)
+    print("  counter        : %d-bit, wraps every %.3f s; polled every "
+          "%.3f s (%.0f%% of a wrap)"
+          % (first["tick_mask"].bit_length(), wrap, spacing,
+             100.0 * spacing / wrap if wrap else 0.0))
+    print("  device counted : %d polls, %d loop() calls"
+          % (last["polls"], last["loops"]))
+    if fit["note"]:
+        print("  note           : %s" % fit["note"])
+    print()
+
+    if not fit["consistent"]:
+        print("*** UNTRUSTWORTHY: no single clock rate fits all the samples.")
+        print("    Some pair of them is mutually impossible, which a constant")
+        print("    clock plus honest timestamps cannot produce. The likely")
+        print("    cause is the %d-bit counter wrapping unobserved between two"
+              % first["tick_mask"].bit_length())
+        print("    polls - it wraps every %.1f s. Re-run with --interval well"
+              % wrap)
+        print("    below that. Do not use the number above.")
+        return 1
+
+    if fit["span"] < 5.0:
+        print("*** Too short to mean much. Run for at least 30 s.")
+
+    best = int(round(fit["hz"]))
+    if math.isinf(fit["hi"]):
+        print("No upper bracket: every round trip took longer than the gap")
+        print("between polls, so nothing bounds the clock from above. Raise")
+        print("--interval. Use the measured value with that caveat:")
+    elif len(rounds) == 1:
+        print("The bracket contains exactly one whole MHz: %s Hz."
+              % "{:,}".format(rounds[0]))
+        print("A PLL output is almost certainly a round number, so use it:")
+        best = rounds[0]
+    elif rounds:
+        print("Whole-MHz frequencies the measurement does not exclude: %s."
+              % ", ".join("%g MHz" % (r / 1e6) for r in rounds))
+        print("Run longer to narrow it. Meanwhile use the measured value:")
+    else:
+        print("No whole MHz falls inside the bracket, so either the clock is")
+        print("not a round frequency or the measurement drifted. Use the")
+        print("measured value and re-run to check it reproduces:")
+
+    print()
+    print("    make SKETCH=examples/Hello F_CPU=%d run" % best)
+    print()
+    print("Change the F_CPU default in the Makefile once this reproduces.")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--duration", type=float, default=60.0,
+                   help="seconds to sample for (default 60; longer is "
+                        "tighter)")
+    p.add_argument("--interval", type=float, default=None,
+                   help="seconds between polls. The default works this out "
+                        "from the device's counter width and measured clock, "
+                        "so polls stay inside a wrap; pass a value to override "
+                        "that.")
+    p.add_argument("--tool", help="path to smtlink_dump")
+    p.add_argument("--no-sudo", action="store_true")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output")
+    args = p.parse_args()
+
+    dev = Device(find_tool(args.tool), not args.no_sudo)
+
+    if not args.json:
+        print("sampling for %.0f s at %s (ctrl-c to stop early)"
+              % (args.duration,
+                 "%.2f s intervals" % args.interval if args.interval
+                 else "an interval chosen from the device's counter"),
+              file=sys.stderr)
+
+    try:
+        samples, first, last = collect(dev, args.duration, args.interval,
+                                       args.json)
+    except KeyboardInterrupt:
+        print("\n(stopped)", file=sys.stderr)
+        return 1
+
+    if len(samples) < 8:
+        sys.exit("error: only %d samples - not enough to measure anything. "
+                 "Is the device still answering?" % len(samples))
+
+    # Check this before fitting: a counter that never moved is a hardware
+    # fault to be named, not a clock of 0 Hz to be reported.
+    if samples[-1][2] == samples[0][2]:
+        return report_dead_counter(first, last, samples, args.json)
+
+    fit = fit_clock(samples)
+    if fit is None:
+        sys.exit("error: the samples carry no time span to fit")
+    return report(fit, first, last, args.json)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

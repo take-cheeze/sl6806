@@ -34,7 +34,7 @@ so it is worth being precise about which parts are real:
 | Build → link → load → run | **Works.** Verified end to end; entry lands at 0x820000 with the correct Thumb entry. |
 | `setup()` / `loop()` | **Works.** Driven from the boot ROM's idle callback so USB stays alive. |
 | `Serial` — bidirectional USB serial | **Works.** Print, printf, String, Stream, and `Serial.read()` from an interactive monitor. Not a UART: see below. |
-| `millis()` / `micros()` / `delay()` | **Works**, but scaled by an unverified clock — see below. |
+| `millis()` / `micros()` / `delay()` | **Works**, on a measured 64 MHz clock. Backed by SysTick, whose 24-bit counter wraps every 262 ms — see the rule below. |
 | Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~38 KB heap in payload mode, ~190 KB in firmware mode. |
 | Flash image format (HLKJ, CRC16, partitions) | **Works.** Both CRCs verify and round-trip. |
 | Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM. |
@@ -48,13 +48,42 @@ so it is worth being precise about which parts are real:
 
 Two honest caveats worth reading before you trust output:
 
-**The CPU clock is a guess.** `F_CPU` defaults to 120 MHz as a placeholder.
-The clock and reset unit has since been found at `0x40080000`, but it holds
-dividers and gates, not a PLL multiplier, and nothing in the dump establishes
-the crystal frequency. So every `delay()` and `millis()` is still off by one
-constant ratio. It is a single scale factor —
-`make SKETCH=examples/ClockCalibrate run`, time it with a stopwatch, then
-build with `F_CPU=<measured>` and all timing is correct.
+**The CPU clock is measured, not documented: 64 MHz.** `F_CPU` now defaults to
+64,000,000 because that is what one P20 Player was measured at — 64,000,071 Hz
+with a bracket of ±0.06% containing exactly one whole MHz. The clock and reset
+unit at `0x40080000` holds dividers and gates, not a PLL multiplier, and
+nothing in the dump establishes the crystal, so this comes from timing the
+device against the host rather than from a register.
+
+If you are bringing up a different unit, re-measure rather than assume — it is
+a single scale factor, and one measurement fixes every `delay()` and
+`millis()` at once:
+
+```sh
+make SKETCH=examples/Hello RUN_MODE=poll calibrate
+```
+
+The device does not time anything — it reports its own cycle counter when
+asked, and the host, which knows real wall-clock time, regresses one against
+the other. Rebuild with the `F_CPU` it prints and all timing becomes absolute.
+It reports a bracket as well as a number, and refuses to answer rather than
+average if the samples contradict each other; see
+[`cores/sl6806/sl6806_stat.h`](cores/sl6806/sl6806_stat.h).
+
+⚠ **The DWT cycle counter does not run on this part**, and timekeeping uses
+the 24-bit SysTick fallback instead. Two consequences worth knowing:
+
+- **The wrap period is 262 ms**, not the ~67 s a 32-bit counter would give.
+  Wraps are only accumulated when the counter is read, so code that runs for a
+  quarter of a second without calling `millis()`, `delay()` or `yield()`
+  loses time. An ordinary `loop()` is fine; a long computation is not.
+- **`sl6806_time_init()` requires a counter to *change***, not merely to read
+  nonzero — the original probe accepted a register stuck at a constant, which
+  is exactly what the DWT does here. If neither counter advances, `millis()`
+  is frozen and `delay()` returns immediately with a one-time explanation
+  rather than spinning on a target it can never reach. In `RUN_MODE=poll` that
+  spin runs inside the boot ROM's USB handler and takes the device off the bus
+  until it is unplugged.
 
 **GPIO has one hole, with two ways to fill it.** The driver is complete;
 what is missing is either the register addresses or a way to reach the
@@ -223,7 +252,8 @@ make SKETCH=examples/Blink                  # build (payload)
 make SKETCH=examples/Blink upload           # load and run
 make SKETCH=examples/Blink monitor          # watch Serial
 make SKETCH=examples/Blink run              # upload, then monitor
-make SKETCH=examples/Blink F_CPU=48000000   # after calibrating
+make SKETCH=examples/Blink calibrate        # measure the real CPU clock
+make SKETCH=examples/Blink F_CPU=48000000   # if your unit measures differently
 make SKETCH=examples/Blink RUN_MODE=takeover
 make SKETCH=examples/Blink MODE=firmware
 make clean
@@ -293,9 +323,10 @@ In rough order of how much they unlock:
 2. **GPIO registers** — the only route to `digitalWrite`. Start with
    `tools/sl6806-find-mmio`. Note the mask ROM has been dumped and does *not*
    contain them.
-3. **The real CPU clock** — makes all timing absolute. A stopwatch does it;
-   finding the PLL registers does it exactly. It is *not* at the clock unit's
-   base: `0x40080000` has dividers but no multiplier.
+3. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+   clock, so this no longer blocks anything; finding the PLL registers would
+   still give it exactly. They are *not* at the clock unit's base:
+   `0x40080000` has dividers but no multiplier.
 
 The mask ROM has since been dumped, which settled two questions in the
 negative: it holds no LCD driver, and the vendor SRAM routines are not
@@ -312,7 +343,7 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, ClockCalibrate, MmioProbe, RomProbe
+examples/         Hello, Blink, GfxDemo, MmioProbe, RomProbe, CallbackProbe
 tests/host/       native tests for console, graphics and the panel
 docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
 3rd/              smartlink_flash submodule
