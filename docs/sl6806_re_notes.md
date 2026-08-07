@@ -1167,6 +1167,26 @@ explanation for both a stalled counter and a permanently dead `0x400E0000`.
 > unconditionally**, and print a before/after readback, or a stale device looks
 > like a negative result.
 
+**PARKED, after seven runs. The counter clock is not reachable from a payload.**
+`0x4008011C` took `0x31` and changed nothing — modctl still zero, busy still
+set. Then, with the known gate bit held, every other bit of all three CRU gate
+pairs was tried on top of it and **nothing cleared busy**. Two assumptions were
+checked from the host rather than assumed: bank 1's function register reads
+`0x12222224`, so pin 0 really is on function 4, and reading the channel twice
+gives identical words, so nothing counts.
+
+What is eliminated: the PLL, the ten power domains, the `0x4008011C` enable,
+all 96 CRU gate bits, the pair registers (nothing in flash or the blob writes
+them), the pad, and the register contents. What is left is a functional clock
+that nothing in the reachable address space turns on.
+
+**The next move is ground truth, not more register guesses.** Diff a working
+configuration against ours — read the CRU and PWM blocks while the *stock
+firmware* runs. `read_mem` is refused in card-reader mode (§7d.1), so that
+needs another way in, and §13 supplies the likeliest one: the application's
+SRAM image can be loaded out of flash by a payload, so the vendor's own driver
+stack could be brought up and called rather than reimplemented.
+
 ### 14b. DMA — the channel registers are at `0x40001000`
 
 §7c lists `0x40070000` as "DMA". That block is real but it is only the
