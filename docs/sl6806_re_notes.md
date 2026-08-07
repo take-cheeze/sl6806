@@ -45,7 +45,13 @@ Working log for the `dump.bin` analysis. Everything here was verified against th
   other, and re-reading an address returns the same bytes. The old figure of
   256 KB was the size of the first `tools/sl6806-dumpram` run, not a measurement.
   The stock firmware relies on this: its LVGL framebuffer is at `0x0087B800`
-  (§13).
+  (§13). So does this framework now — `ld/sl6806_payload.ld` gives a payload's
+  `.bss` and `.heap` everything up to `0x008F0000`, because only the *loaded*
+  bytes have to fit in the ROM's 64 KB window. That is ~650 KB of heap where
+  there used to be 38, and it is what makes a full 240×296 framebuffer
+  (138 KB) possible at all. `examples/BigBuffer` pattern-tests the region
+  before using it, with an address-derived pattern so an aliased region fails
+  rather than passing by luck.
 - Ghidra import: Raw Binary, language **`ARM:LE:32:Cortex`**, base **`0x00C00000`**.
 
 ## 4. HLKJ bootloader header (file 0x0) — FULLY DECODED

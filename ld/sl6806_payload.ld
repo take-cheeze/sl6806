@@ -5,10 +5,28 @@
  * IMAGE_START|1 (Thumb). _start MUST therefore be the very first byte of the
  * image - hence the KEEP on .text._start ahead of everything else.
  *
- * 0x00820000 / 64 KiB is the window the stock smartlink_flash payload uses,
- * so it is known to be free while the ROM is servicing USB. Everything the
- * sketch needs - code, data, bss and heap - lives inside it. The stack is NOT
- * ours: a payload runs on the ROM's stack, on the ROM's call.
+ * 0x00820000 is where the stock smartlink_flash payload is loaded, so the
+ * 64 KiB from there is known to be free while the ROM services USB. The
+ * LOADED part of the image - text and data, everything in the .bin - still
+ * has to fit in that 64 KiB, and the ASSERT below enforces it.
+ *
+ * .bss and .heap do not. They are NOLOAD, so they cost nothing in the file
+ * and only have to be memory the ROM is not using, and there is far more of
+ * that than this script used to claim: SRAM is 1 MiB, 0x00800000..0x008FFFFF,
+ * measured on hardware (docs/sl6806_re_notes.md 3). The stock firmware puts
+ * its own 138 KiB framebuffer at 0x0087B800, which is inside the range this
+ * script now hands to sketches.
+ *
+ * The old 64 KiB ceiling is why examples/GfxDemo draws a 160x40 band: a full
+ * 240x296 RGB565 framebuffer is 138 KiB and could not exist. It can now.
+ *
+ * [I] The top 64 KiB is left alone as a hedge. Nothing is known to live
+ * there, but nothing has proved it empty either, and a payload that scribbles
+ * on something the ROM needs loses the USB link it is being debugged over.
+ * examples/BigBuffer pattern-tests the region before trusting it.
+ *
+ * The stack is NOT ours: a payload runs on the ROM's stack, on the ROM's
+ * call.
  *
  * .data shares its load and run address because the ROM copies the whole blob
  * to RAM in one shot. .bss is stripped from the file and zeroed by _start.
@@ -23,7 +41,7 @@ IMAGE_SIZE  = DEFINED(IMAGE_SIZE)  ? IMAGE_SIZE  : 0x00010000;
 
 MEMORY
 {
-    PAYLOAD (rwx) : ORIGIN = 0x00820000, LENGTH = 64K
+    PAYLOAD (rwx) : ORIGIN = 0x00820000, LENGTH = 0x000D0000  /* to 0x008F0000 */
 }
 
 SECTIONS
@@ -97,8 +115,12 @@ SECTIONS
 
     __image_end = .;
 
+    /* Only the loaded bytes are constrained: the ROM writes the .bin to
+     * IMAGE_START and the 64 KiB window is what is known to be safe for it.
+     * bss and heap run on past that into memory this script vouches for
+     * separately - see the header. */
     ASSERT(__image_load_end - IMAGE_START <= IMAGE_SIZE,
-           "payload image overflows its 64 KiB window")
+           "loaded image (text+data) overflows its 64 KiB window")
     ASSERT(__heap_end__ > __heap_start__,
            "no room left for a heap - shrink the sketch")
 

@@ -35,7 +35,7 @@ so it is worth being precise about which parts are real:
 | `setup()` / `loop()` | **Works.** Driven from the boot ROM's idle callback so USB stays alive. |
 | `Serial` — bidirectional USB serial | **Works.** Print, printf, String, Stream, and `Serial.read()` from an interactive monitor. Not a UART: see below. |
 | `millis()` / `micros()` / `delay()` | **Works**, on a measured 64 MHz clock. Backed by SysTick, whose 24-bit counter wraps every 262 ms — see the rule below. |
-| Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~38 KB heap in payload mode, ~190 KB in firmware mode. |
+| Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~650 KB heap in payload mode — SRAM is 1 MiB and only the *loaded* image has to fit in the 64 KB window. `examples/BigBuffer` pattern-tests the region and draws a full-screen framebuffer. |
 | Flash image format (HLKJ, CRC16, partitions) | **Works.** Both CRCs verify and round-trip. |
 | Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM, and now onto glass. |
 | Panel: geometry, vendor init sequence, windowing, sleep/wake | **Works.** Recovered from the firmware, 53 host-side tests. |
