@@ -1307,3 +1307,68 @@ The remainder that does not divide by 8 goes out through `0x0080E5C0` with
 the `rev16` per pixel described in §13d. **Where the bulk path gets its byte
 swap is still unknown** — presumably a mode bit in the DMA or in
 `+0x20[21:20]`, and worth finding before trusting it.
+
+## 15. The keys, and the same wall as the backlight
+
+**What is established, from the dump alone.** The key manager at `0x00D1DA20`
+opens two devices and hands each a map; both maps are in the SRAM blob (§13):
+
+| Device | Map | Contents |
+|---|---|---|
+| `/dev/key_io` | `0x0081C044` | 16-byte records `{pad_id, 0, key_id, 0x101}` — bank 1 pin 17 → key `0x3E`, bank 1 pin 12 → key `0x3C` |
+| `/dev/kadc_ch0` | `0x0081C02C` | 12-byte records `{level, key_id, 0}` — `0x0200` → key `0x42`, `0x0E60` → key `0x40` |
+
+Both opens pass a count of 2, so those are all the entries. Four keys, plus
+power through the PMU.
+
+**The ADC is at `0x40096000`**, from the only MMIO literal in its HAL
+(`0x00D994F8`). Channels are `0x10` apart from `+0x20` (`0x00D993A0` dispatches
+ten of them). This board's key channel is 0, on **bank 1 pin 9, function 15** —
+the kadc constructor `0x00D3DB50` stores pad `0x00014800` with pad value
+`0x780`. `adc_init` is `0x00D994EC`: `+0x10`, `+0x18`, `+0x0C` ← 0,
+`+0x04` ← `0x0002A800`, `+0x00` ← `0x80180000`.
+
+**MEASURED, NEGATIVE — the GPIO keys are not the buttons.** Neither
+`/dev/key_io` pad moves when a button is pressed. Pin 12 idles at 1; pin 17
+sits at a steady 0, which confirms §7g's note that something external drives
+it. Nor does any of §7g's "likely button group" (bank 1 pins 22–27, 30, 31).
+Given the firmware also has `pwm_is_jack_exist` and `pwm_is_sd_exist`, these
+two are most likely detects rather than user keys — **untested**, and cheap to
+test by inserting a jack or an SD card and watching `examples/Buttons`.
+
+**MEASURED, NEGATIVE — the ADC is readable but not writable.** It reads
+structured values in a cold chip (`+0x00 = 0x00100000`, `+0x04 = 0x00000800`,
+`+0x08 = 0x000001E0`, `0x10` in the first two channel words) and **ignores
+every write**: `adc_init` leaves the block byte-identical. It is not an alias
+— `0x40095000` reads zeros and `0x40097000` is a different live block — so it
+decodes on its own and is simply gated.
+
+Tried and failed to open it: all 32 bits of each of the eleven gate-shaped CRU
+registers (`+0x60`, `+0x64`, `+0x68`, `+0x70`, `+0x74`, `+0x78`, `+0xA0`,
+`+0xB0`, `+0xDC`, `+0xEC`, `+0xFC`), and every module-clock register
+`+0x100`–`+0x13C` with enable set and each plausible source.
+
+**This is the same wall as §14a**, and it is worth stating as one problem
+rather than two. The application enables most peripherals through
+`0x400E0000` (`0x00D9A734`), and that register is dead from a payload. The CRU
+gates are a second, partial mechanism — they cover the LCDC completely, and
+the PWM's registers but not its counter. Nothing reachable turns on the rest.
+
+**So the useful next step is not another register sweep.** It is either to get
+the vendor's own driver stack running — §13 shows the app's SRAM image is in
+flash and loadable by a payload — or to observe a working configuration
+directly, which needs a way to read memory while the stock firmware runs
+(§7d.1 says `read_mem` is refused in card-reader mode).
+
+### 15a. The module clock register shape — decoded
+
+Worth recording because it was learned the hard way. `0x00D44690` writes
+`0x40080118` as: `[7:4]` ← one argument, `[11:8]` ← another, then bit 0 set.
+So CRU `+0x100`–`+0x13C` are per-module clocks with
+
+    bit 0 = enable,  [7:4] = source,  [11:8] = divider
+
+which fits both known values: the LCD's `+0x10C` = `0x911` (enabled, source 1,
+divider 9) and `+0x11C` = `0x31` (enabled, source 3). A peripheral needs *both*
+a gate bit and a module clock — the LCD driver sets both, and every sweep
+before this one only ever touched gates.
