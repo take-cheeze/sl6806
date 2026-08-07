@@ -1,54 +1,57 @@
 /*
- * Backlight - wake the clock domain the PWM lives in, then drive it.
+ * Backlight - find the clock that wakes the PWM, then drive it.
  *
- * FIRST RUN, 2026-08-07: every register read back zero, including the module
- * gate itself (modctl 0x0 -> 0x0). The gate bit was never the problem - the
- * write did not stick, so nothing downstream of it could.
+ * TWO RUNS SO FAR, both negative, and both narrowed it:
  *
- * WHAT THAT TURNED OUT TO MEAN. Reading the same addresses from the host over
- * the vendor read command, in the same bootloader mode, gives the same
- * answer: 0x400E0000 and 0x400E2000 are zeros, while the CRU at 0x40080000
- * and the LCDC at 0x400D9000 read live values. So MMIO is fine and that whole
- * region is simply unclocked - not a payload problem, and not a wrong address.
+ *   2026-08-07 a. Every register zero, including the module gate itself
+ *     (modctl 0x0 -> 0x0). The write did not stick, so the gate bit was never
+ *     the question. Reading the same addresses from the host in the same mode
+ *     gave the same answer, while the CRU and the LCDC read live - so MMIO is
+ *     fine and 0x400E**** is unclocked, not absent, and not payload-specific.
  *
- * And the firmware says why. 0x00D9A7FC, the first thing the vendor's module
- * bring-up does, starts a PLL at 0x40080008 and spins on a lock bit before it
- * ever touches 0x400E0000. In bootloader mode that register reads 0x00000801
- * with the lock bit clear: the PLL is stopped, so the domain is dark.
+ *   2026-08-07 b. Started the PLL as 0x00D9A7FC does. It locked
+ *     (0x40080008: 0x801 -> 0xD0010C04, bit 28 set) and changed nothing:
+ *     0x400E0000 still took no writes, on any of 32 gate bits.
  *
- * SO THIS SKETCH DOES THREE THINGS, one per host tick, and prints a readback
- * after every one:
+ * SO IT IS NOT THE PLL, and it is not the power domains either: 0x40000070
+ * reads 0x03FF03FF, which is all ten of 0x00D9A7AC's request bits set and all
+ * ten acknowledge bits back, so that handshake is already done before we
+ * arrive.
  *
- *   1. Bring the PLL up the way 0x00D9A7FC does, and report whether it locks.
- *   2. If the module-gate register comes alive, find the PWM's bit by
- *      experiment - set each bit in turn and see whether 0x40084000 starts
- *      answering. Nobody knows which bit it is; the previous claim of bit 2
- *      was misread from a neighbouring module's teardown.
- *   3. Once a bit works, program channel 3 with the vendor's period and ramp
- *      the duty, flashing the panel so a backlight coming on is unmistakable.
+ * WHAT IS LEFT is the CRU's own peripheral gates. 0x40080064 and 0x40080074
+ * read 0x00008008: bit 15 is the LCDC (which is why the LCD answers at all)
+ * and bit 3 is something else, and every other peripheral on the chip is
+ * gated off. Those registers demonstrably take writes - starting the PLL at
+ * 0x40080008 proved that much. So this sweeps them.
  *
- * If step 1 does not lock, stop and report - everything after it is moot, and
- * the PLL config word is then the thing to doubt.
+ * HOW IT SWEEPS. A clock gate takes effect in a few cycles, and there is
+ * nothing to look at while it happens, so the whole 32-bit sweep runs inside
+ * one loop() call rather than one bit per host tick. That keeps it well
+ * inside a single foreground monitor run, which a 32-tick sweep would not be.
+ *
+ * THE PROBE IS A WRITE AND A READ BACK, not a bare read: a register that
+ * reads zero because it is dead and one that reads zero because it is idle
+ * are the same thing from here, and the first two runs of this sketch were
+ * both misled by exactly that. Channel 3's period/duty is the scratch - the
+ * channel is not running, so scribbling on it costs nothing.
  *
  *     make SKETCH=examples/Backlight RUN_MODE=poll upload
  *     tools/sl6806-monitor --tick 3 build/Backlight.sym
  *
- * PACED BY THE HOST. Same lesson BacklightHunt records at length: neither
- * clock on this device can time a dwell, because the USB poll rate has been
- * measured anywhere from 0.3/s to 42/s. One step per byte from the host.
+ * SAFETY. The sweep only ever ORs one extra bit into a gate register and then
+ * puts the register back the way it found it - it never clears bit 3 or bit
+ * 15, because the LCDC and whatever else is running are behind them. Turning
+ * a clock on for a block whose reset is still asserted does nothing. Nothing
+ * writes flash, so a replug always recovers.
  *
- * RISK. This writes a PLL control register, which is a bigger thing than the
- * rest of the tree does - a clock tree can be misconfigured into stopping the
- * core. It is the vendor's own constant, and the lock poll is bounded so a
- * PLL that never comes up cannot hang the USB handler. Nothing writes flash,
- * so a replug always recovers. What this deliberately does NOT do is write
- * 0x4008011C, the clock-source select the vendor sets next: if that reparents
- * the core or USB onto the PLL it would end the session, and the ROM's USB
- * link is the only way to see anything here.
+ * Still not written: 0x4008011C, the clock-source select the vendor sets
+ * after the PLL locks. If it reparents the core or USB onto the PLL the
+ * session ends and takes the log with it.
  */
 
 #include <Arduino.h>
 #include "sl6806_pwm.h"
+#include "sl6806_cru.h"
 #include "sl6806_lcdc.h"
 
 static sl6806_color_t band[240 * 8];
@@ -57,15 +60,26 @@ static sl6806_color_t band[240 * 8];
 static const uint8_t ramp[] = { 0, 20, 40, 60, 80, 100, 80, 60, 40, 20 };
 #define NRAMP ((int)(sizeof ramp))
 
-/* The channel the firmware opens for the backlight. */
 #define BL_CHAN 3
+
+/* The CRU gate words, as pairs. 0x64/0x74 are the documented ones; the other
+ * two pairs are their neighbours, which hold structured non-zero values and
+ * so are plausibly more of the same. */
+typedef struct { uint16_t a, b; const char *what; } gatepair_t;
+static const gatepair_t gates[] = {
+    { 0x64, 0x74, "0x64/0x74 (the LCDC's own)" },
+    { 0x60, 0x70, "0x60/0x70" },
+    { 0x68, 0x78, "0x68/0x78" },
+};
+#define NGATES ((int)(sizeof gates / sizeof gates[0]))
 
 enum { ST_PLL, ST_SWEEP, ST_DRIVE, ST_DONE };
 
 static uint8_t state = ST_PLL;
-static int     bit;            /* gate bit under test        */
-static int     found = -1;     /* the bit that woke the PWM  */
-static int     step;           /* index into ramp[]          */
+static int     gi;             /* index into gates[]          */
+static int     hit_reg = -1;   /* the CRU offset that worked  */
+static int     hit_bit = -1;
+static int     step;
 static bool    white;
 
 static void show(const char *what, uint32_t addr)
@@ -78,12 +92,8 @@ static void show(const char *what, uint32_t addr)
     Serial.println(sl6806_mmio_read(addr), HEX);
 }
 
-/*
- * Does the PWM block answer? A register that only ever reads zero is
- * indistinguishable from one that is not there, so write a pattern and read
- * it back rather than trusting a bare read. Channel 3's period/duty is
- * harmless to scribble on: the channel is not running yet.
- */
+/* Does the PWM answer? Write a pattern and read it back - a bare read cannot
+ * tell a dead register from an idle one. */
 static bool pwm_responds(void)
 {
     uint32_t reg = SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_PERIOD_DUTY;
@@ -100,12 +110,13 @@ static bool pll_start(void)
 {
     uint32_t i;
 
+    if (sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)
+        return true;                         /* already up */
+
     sl6806_mmio_write(SL6806_PLL_CTRL, SL6806_PLL_CONFIG);
 
-    /* Bounded. The vendor spins forever; we cannot, because this runs inside
-     * the boot ROM's USB handler and a spin here takes the device off the
-     * bus until it is unplugged. A few hundred thousand reads is milliseconds
-     * at any plausible core clock. */
+    /* Bounded: this runs inside the boot ROM's USB handler, and a spin here
+     * takes the device off the bus until it is unplugged. */
     for (i = 0; i < 400000u; i++)
         if (sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)
             break;
@@ -118,11 +129,60 @@ static bool pll_start(void)
     return true;
 }
 
+/*
+ * Try every bit of one CRU gate pair. Returns the bit that woke the PWM, or
+ * -1. Restores both registers before returning, whatever happens.
+ */
+static int sweep_pair(const gatepair_t *g)
+{
+    uint32_t ra = SL6806_CRU_BASE + g->a;
+    uint32_t rb = SL6806_CRU_BASE + g->b;
+    uint32_t base_a = sl6806_mmio_read(ra);
+    uint32_t base_b = sl6806_mmio_read(rb);
+    int bit, found = -1;
+
+    Serial.print("  ");
+    Serial.print(g->what);
+    Serial.print(" = 0x");
+    Serial.print(base_a, HEX);
+    Serial.print(" / 0x");
+    Serial.println(base_b, HEX);
+
+    for (bit = 0; bit < 32; bit++) {
+        if (base_a & (1u << bit))
+            continue;                        /* already on; leave it alone */
+
+        sl6806_mmio_write(ra, base_a | (1u << bit));
+        sl6806_mmio_write(rb, base_b | (1u << bit));
+        delayMicroseconds(200);
+
+        if (pwm_responds()) {
+            found = bit;
+            break;
+        }
+
+        sl6806_mmio_write(ra, base_a);
+        sl6806_mmio_write(rb, base_b);
+    }
+
+    if (found < 0) {
+        sl6806_mmio_write(ra, base_a);
+        sl6806_mmio_write(rb, base_b);
+        Serial.println("    no bit woke the PWM");
+    } else {
+        Serial.print("    bit ");
+        Serial.print(found);
+        Serial.println(" WOKE THE PWM - left on");
+    }
+    /* Whatever happened, say what the neighbouring blocks look like now. */
+    show("modctl", SL6806_MODCTL_BASE);
+    return found;
+}
+
 static void configure(unsigned ch)
 {
     uint32_t base = SL6806_PWM_CHAN(ch);
 
-    /* The vendor writes the bare 0x40 first, then ORs the assembled flags. */
     sl6806_mmio_write(base + SL6806_PWM_CTRL, SL6806_PWM_CTRL_INIT);
     sl6806_mmio_write(base + SL6806_PWM_CTRL,
                       sl6806_mmio_read(base + SL6806_PWM_CTRL) | 0x3Fu);
@@ -140,12 +200,13 @@ void setup()
 {
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 backlight: PLL, then gate, then PWM ===");
+    Serial.println("=== SL6806 backlight: hunting the PWM's clock ===");
 
     show("pll   ", SL6806_PLL_CTRL);
+    show("domain", 0x40000070u);
     show("modctl", SL6806_MODCTL_BASE);
     show("pwm3  ", SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL);
-    Serial.println("(all three are expected to be dead before the PLL runs)");
+    Serial.println("(domain should read 0x3FF03FF - requests and acks both in)");
     Serial.println();
 
     if (!Screen.begin(band, 240, 8))
@@ -153,14 +214,12 @@ void setup()
     else
         Serial.println("lcd bus up; flashing white/black while we try");
     Serial.println();
-    Serial.println("one step per host tick; run the monitor with --tick 3");
+    Serial.println("one stage per host tick; run the monitor with --tick 3");
     Serial.println();
 }
 
 void loop()
 {
-    /* Flip every poll, not every tick, so the picture stays lively while we
-     * wait on the host. */
     white = !white;
     Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
     Screen.display();
@@ -174,52 +233,47 @@ void loop()
     switch (state) {
 
     case ST_PLL:
-        Serial.println("starting the PLL (0x40080008 <- 0xC0000C04)");
+        Serial.println("PLL:");
         if (!pll_start()) {
             show("pll   ", SL6806_PLL_CTRL);
-            Serial.println("NO LOCK. Everything after this is moot - report");
-            Serial.println("that readback; the config word is what to doubt.");
+            Serial.println("  NO LOCK - doubt the config word before anything else");
             state = ST_DONE;
             return;
         }
         show("pll   ", SL6806_PLL_CTRL);
-        show("modctl", SL6806_MODCTL_BASE);
-        Serial.println("PLL locked. Sweeping the module gate next.");
+        if (pwm_responds()) {
+            Serial.println("  ...and that alone woke the PWM");
+            state = ST_DRIVE;
+            step = 0;
+            configure(BL_CHAN);
+            return;
+        }
+        Serial.println("  locked; PWM still dead. Sweeping the CRU gates.");
         Serial.println();
-        bit = 0;
+        gi = 0;
         state = ST_SWEEP;
         return;
 
     case ST_SWEEP: {
-        uint32_t before = sl6806_mmio_read(SL6806_MODCTL_BASE);
+        int bit = sweep_pair(&gates[gi]);
 
-        sl6806_mmio_write(SL6806_MODCTL_BASE, before | (1u << bit));
-        delay(10);
-
-        Serial.print("  gate bit ");
-        Serial.print(bit);
-        Serial.print(": modctl 0x");
-        Serial.print(sl6806_mmio_read(SL6806_MODCTL_BASE), HEX);
-
-        if (pwm_responds()) {
-            found = bit;
-            Serial.println("  <- PWM ANSWERS");
+        if (bit >= 0) {
+            hit_reg = gates[gi].a;
+            hit_bit = bit;
             Serial.println();
             step = 0;
             state = ST_DRIVE;
             configure(BL_CHAN);
             return;
         }
-        Serial.println();
 
-        if (++bit >= 32) {
+        if (++gi >= NGATES) {
             Serial.println();
-            Serial.println("No bit woke 0x40084000.");
-            if (sl6806_mmio_read(SL6806_MODCTL_BASE) == 0)
-                Serial.println("modctl still reads 0 - the gate register is");
-            else
-                Serial.println("modctl took the writes, so the gate is live");
-            Serial.println("and the PWM base or its reset is the next suspect.");
+            Serial.println("=== no CRU gate woke 0x40084000 ===");
+            Serial.println("The gates are not it, or the PWM needs its reset");
+            Serial.println("released too, or 0x40084000 is not where it lives.");
+            Serial.println("Report the three baselines above - they are the");
+            Serial.println("part of this run that is worth something.");
             state = ST_DONE;
         }
         return;
@@ -228,9 +282,15 @@ void loop()
     case ST_DRIVE:
         if (step >= NRAMP) {
             Serial.println();
-            Serial.print("=== done; gate bit ");
-            Serial.print(found);
-            Serial.println(" is the one ===");
+            Serial.print("=== done");
+            if (hit_bit >= 0) {
+                Serial.print("; CRU 0x");
+                Serial.print(hit_reg, HEX);
+                Serial.print(" bit ");
+                Serial.print(hit_bit);
+                Serial.print(" is the PWM's gate");
+            }
+            Serial.println(" ===");
             state = ST_DONE;
             return;
         }
