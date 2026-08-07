@@ -35,37 +35,11 @@
 
 #include <stdint.h>
 #include "sl6806_mmio.h"
+#include "sl6806_module.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/* ------------------------------------------------------------------ */
-/* Module clocks - the mask ROM's mechanism, and it is not optional     */
-/* ------------------------------------------------------------------ */
-
-/*
- * [V] 0x00001C5C in the mask ROM is module_clock_enable(id). The module space
- * is 128 ids across four register pairs, and the fourth is not in the CRU at
- * all:
- *
- *     id  0.. 31   CRU +0x60 gate, +0x70 shadow
- *     id 32.. 63   CRU +0x64 gate, +0x74 shadow
- *     id 64.. 95   CRU +0x68 gate, +0x78 shadow
- *     id 96..127   0x400F1000 +0x20 gate, +0x30 shadow
- *
- * Nothing in the ROM, the bootloader or the application calls it - the
- * bootloader gates the LCDC through the CRU by hand and the application uses
- * 0x400E0000, which a payload cannot reach - so it documents the mechanism
- * without giving away any peripheral's id. Those have to be found by walking.
- *
- * Reimplemented rather than called because the ROM's poll is unbounded, and
- * an id nothing implements would spin forever inside the boot ROM's USB
- * handler and take the device off the bus.
- *
- * Returns 1 if the gate acknowledged, 0 on timeout.
- */
-int sl6806_module_enable(unsigned id);
 
 /* [M] The ADC's module id, found by walking 0..127. */
 #define SL6806_ADC_MODULE_ID    84

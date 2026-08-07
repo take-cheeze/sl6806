@@ -51,7 +51,7 @@ test_lcdc: test_lcdc.c $(CORE)/sl6806_lcdc.c $(CORE)/sl6806_padctl.c \
 # The ADC driver against a model that only opens its gate for the mask ROM's
 # write order, and lies plausibly until it does - which is what the real block
 # does and why this was wrong on hardware for four runs.
-test_adc: test_adc.c $(CORE)/sl6806_adc.c
+test_adc: test_adc.c $(CORE)/sl6806_adc.c $(CORE)/sl6806_module.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:

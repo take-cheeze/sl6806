@@ -47,6 +47,7 @@
 
 #include <stdint.h>
 #include "sl6806_mmio.h"
+#include "sl6806_module.h"
 
 /* ------------------------------------------------------------------ */
 /* Module gating                                                       */
@@ -96,9 +97,14 @@
  *
  * Bit 28 of CTRL appearing on its own is the busy flag that 0x00811E74 polls.
  */
-#define SL6806_PWM_CRU_GATE0    0x68       /* [V] offsets from the CRU base */
-#define SL6806_PWM_CRU_GATE1    0x78
-#define SL6806_PWM_CRU_GATE_BIT (1u << 4)  /* [V] measured                  */
+/*
+ * [M] That gate is module id 68 under the mask ROM's scheme - ids 64..95 use
+ * CRU +0x68 as the gate and +0x78 as the shadow, and bit 4 is 68 - 64. It was
+ * found by a sweep that wrote both registers at once, which happens to be
+ * survivable for this one peripheral and is not in general: see
+ * sl6806_module.h. Use sl6806_module_enable(68) rather than poking the bits.
+ */
+#define SL6806_PWM_MODULE_ID    68
 
 /*
  * [V] The pad. The PWM's configure op (0x00D45394) calls ROM 0x93C - pad
@@ -205,19 +211,11 @@
 /* ------------------------------------------------------------------ */
 
 /*
- * Ungate one module. Which bit the PWM is remains unknown - see the note
- * above - so this takes the bit rather than pretending to know it. The vendor
- * waits 10 ms after this and the caller must too; this header has no delay of
- * its own.
- *
- * Pointless until the PLL is up: the register ignores writes before that.
+ * The old ungate helper that lived here is gone. It poked 0x400E0000, which a
+ * payload cannot write at all, and took a bit rather than a module id.
+ * Use sl6806_module_enable(SL6806_PWM_MODULE_ID) from sl6806_module.h - the
+ * mask ROM's mechanism, and the one that works.
  */
-static inline void sl6806_module_enable(unsigned bit)
-{
-    uint32_t r = sl6806_mmio_read(SL6806_MODCTL_BASE + SL6806_MODCTL_ENABLE);
-    sl6806_mmio_write(SL6806_MODCTL_BASE + SL6806_MODCTL_ENABLE,
-                      r | (1u << bit));
-}
 
 /*
  * Set period and duty. The vendor's setter (0x00811D04) returns without

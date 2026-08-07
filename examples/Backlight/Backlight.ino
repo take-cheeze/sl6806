@@ -43,10 +43,26 @@
  * candidate list skipped bank 1's low pins as the panel's bus - true of pins
  * 1-8, not of pin 0.
  *
- * THE SWEEP IS STILL HERE as a fallback, in case another board disagrees
- * about the gate. It runs inside one loop() call rather than one bit per
- * tick: a clock gate settles in cycles, there is nothing to watch, and 32
- * ticks would outlive the monitor's foreground limit.
+ * WHAT CHANGED, AND WHY IT IS WORTH ANOTHER RUN. The keys were stuck on the
+ * same wall and came off it, so the method that freed them is now pointed
+ * here. The mask ROM's module_clock_enable (0x00001C5C, transcribed in
+ * sl6806_module.c) says three things every sweep in this file got wrong:
+ *
+ *   - there are 128 module ids across FOUR register pairs, and the fourth is
+ *     at 0x400F1000, not in the CRU at all - so a quarter of the space was
+ *     never tried;
+ *   - 0x60/0x64/0x68 are gates and 0x70/0x74/0x78 are their shadows, not two
+ *     independent banks;
+ *   - the shadow is written first, then the gate, then you wait for the gate
+ *     to read the bit back. Writing both at once does nothing, which is
+ *     precisely how the ADC's correct bit was recorded as dead.
+ *
+ * The gate this file already found - +0x68 bit 4 - is module id 68 under that
+ * scheme, and it makes the PWM's registers writable but not its counter run.
+ * So the counter very likely wants a second id, exactly as a peripheral with
+ * separate register and functional clocks would. This walks 0..127 looking
+ * for one, with CTRL bit 28 going clear as the test: machine-checkable, and
+ * it needs nobody watching the panel.
  *
  * THE PROBE IS A WRITE AND A READ BACK, not a bare read: a register that
  * reads zero because it is dead and one that reads zero because it is idle
@@ -72,291 +88,123 @@
 
 #include <Arduino.h>
 #include "sl6806_pwm.h"
-#include "sl6806_cru.h"
+#include "sl6806_module.h"
 #include "sl6806_padctl.h"
 #include "sl6806_lcdc.h"
 
 static sl6806_color_t band[240 * 8];
 
-/* 0 -> 100 -> 0, so a backlight that is on but dim is still obvious. */
 static const uint8_t ramp[] = { 0, 20, 40, 60, 80, 100, 80, 60, 40, 20 };
 #define NRAMP ((int)(sizeof ramp))
 
-#define BL_CHAN 3
+#define BL_CHAN   3
+#define NMODULES  128
+#define WINDOW    4
 
-/* The CRU gate words, as pairs. 0x64/0x74 are the documented ones; the other
- * two pairs are their neighbours, which hold structured non-zero values and
- * so are plausibly more of the same. */
-typedef struct { uint16_t a, b; const char *what; } gatepair_t;
-static const gatepair_t gates[] = {
-    { 0x64, 0x74, "0x64/0x74 (the LCDC's own)" },
-    { 0x60, 0x70, "0x60/0x70" },
-    { 0x68, 0x78, "0x68/0x78" },
-};
-#define NGATES ((int)(sizeof gates / sizeof gates[0]))
+enum { ST_HUNT, ST_DRIVE, ST_DONE };
 
-enum { ST_PLL, ST_SWEEP, ST_FCLK, ST_DRIVE, ST_DONE };
+static uint8_t  state = ST_HUNT;
+static unsigned next_id;
+static int      found = -1;
+static int      step;
+static bool     white;
 
-static uint8_t state = ST_PLL;
-static int     gi;             /* index into gates[]          */
-static int     hit_reg = -1;   /* the CRU offset that worked  */
-static int     hit_bit = -1;
-static int     step;
-static bool    white;
+static bool busy(void)
+{
+    return (sl6806_mmio_read(SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL)
+            & SL6806_PWM_CTRL_BUSY) != 0;
+}
 
 static void show(const char *what, uint32_t addr)
 {
     Serial.print("  ");
     Serial.print(what);
-    Serial.print(" @0x");
-    Serial.print(addr, HEX);
     Serial.print(" = 0x");
     Serial.println(sl6806_mmio_read(addr), HEX);
 }
 
-/* Does the PWM answer? Write a pattern and read it back - a bare read cannot
- * tell a dead register from an idle one. */
-static bool pwm_responds(void)
+/* Program channel 3 the way 0x00D99C34 and 0x00D102F4 do. */
+static void configure(void)
 {
-    uint32_t reg = SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_PERIOD_DUTY;
+    uint32_t base = SL6806_PWM_CHAN(BL_CHAN);
 
-    sl6806_mmio_write(reg, 0x12345678u);
-    if (sl6806_mmio_read(reg) == 0)
-        return false;
-    sl6806_mmio_write(reg, 0);
-    return true;
-}
-
-/* 0x00D9A7FC in full, now including the clock enable. True if it locked. */
-static bool pll_start(void)
-{
-    uint32_t i;
-
-    /*
-     * THE DEVICE KEEPS CRU STATE ACROSS PAYLOAD UPLOADS. Uploading does not
-     * reset the clock tree, so a PLL left locked by the previous run is still
-     * locked when the next one starts. Run e was lost to exactly that: this
-     * function used to return early on "already locked", which skipped the
-     * clock enable below - the one thing that run existed to test. The log
-     * said so plainly (clken @0x4008011C = 0x0) and cost a whole cycle.
-     *
-     * So: skip the *bring-up* when it is already up, but never skip a step
-     * that has to be true afterwards. Every stage below this line is written
-     * unconditionally, and that is the rule for anything driving this board.
-     */
-    if (!(sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)) {
-        sl6806_mmio_write(SL6806_PLL_CTRL, SL6806_PLL_CONFIG);
-
-        /* Bounded: this runs inside the boot ROM's USB handler, and a spin
-         * here takes the device off the bus until it is unplugged. */
-        for (i = 0; i < 400000u; i++)
-            if (sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)
-                break;
-
-        if (!(sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK))
-            return false;
-
-        sl6806_mmio_write(SL6806_PLL_CTRL,
-                          sl6806_mmio_read(SL6806_PLL_CTRL)
-                          | SL6806_PLL_OUT_ENABLE);
-        delay(10);
-    }
-
-    /*
-     * The last step of 0x00D9A7FC. 0x31 up, 0x30 down - one bit apart, so it
-     * is an enable rather than the reparent it looked like, and a plain
-     * enable cannot take USB with it.
-     */
-    sl6806_mmio_write(SL6806_CRU_CLK_ENABLE, SL6806_CRU_CLK_ON);
-    delay(10);
-    return true;
-}
-
-/*
- * Is the counter actually running? Bit 28 is the busy flag the vendor spins on
- * before every period/duty write (0x00811E74). If it never clears, the vendor's
- * own driver would hang there - so stuck-set means this channel has no clock,
- * whatever its other registers say. That is the single most diagnostic bit on
- * the block and it is worth printing every time.
- */
-static void show_busy(unsigned ch)
-{
-    uint32_t c = sl6806_mmio_read(SL6806_PWM_CHAN(ch) + SL6806_PWM_CTRL);
-
-    Serial.print("  ctrl 0x");
-    Serial.print(c, HEX);
-    Serial.println((c & SL6806_PWM_CTRL_BUSY) ? "  busy STUCK (no counter clock)"
-                                              : "  busy clear (counter runs)");
-}
-
-/*
- * Hunt a second gate bit: the one that starts the counter.
- *
- * The first sweep found bit 4 of 0x68/0x78 and stopped there, and it tested
- * bits one at a time, restoring after each. So a peripheral that needs two
- * bits - a register clock and a functional clock, which is an ordinary way to
- * build one - would have been invisible to it: bit 4 alone makes the
- * registers answer, and nothing tried bit 4 *plus* anything else.
- *
- * This holds bit 4 set and tries every other bit of all three pairs on top of
- * it. The success test is CTRL bit 28 going clear, which needs no one
- * watching a panel and cannot be misread.
- *
- * Returns 1 if something cleared it. Leaves a winning bit set; restores
- * everything else.
- */
-static int hunt_fclk(void)
-{
-    int gj, bit;
-
-    for (gj = 0; gj < NGATES; gj++) {
-        uint32_t ra = SL6806_CRU_BASE + gates[gj].a;
-        uint32_t rb = SL6806_CRU_BASE + gates[gj].b;
-        uint32_t base_a = sl6806_mmio_read(ra);
-        uint32_t base_b = sl6806_mmio_read(rb);
-
-        Serial.print("  ");
-        Serial.print(gates[gj].what);
-        Serial.print(" = 0x");
-        Serial.println(base_a, HEX);
-
-        for (bit = 0; bit < 32; bit++) {
-            if (base_a & (1u << bit))
-                continue;
-
-            sl6806_mmio_write(ra, base_a | (1u << bit));
-            sl6806_mmio_write(rb, base_b | (1u << bit));
-            delayMicroseconds(200);
-
-            if (!(sl6806_mmio_read(SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL)
-                  & SL6806_PWM_CTRL_BUSY)) {
-                Serial.print("    bit ");
-                Serial.print(bit);
-                Serial.println(" CLEARED BUSY - the counter is running");
-                return 1;
-            }
-
-            sl6806_mmio_write(ra, base_a);
-            sl6806_mmio_write(rb, base_b);
-        }
-    }
-    Serial.println("  nothing cleared busy");
-    return 0;
-}
-
-/*
- * Try every bit of one CRU gate pair. Returns the bit that woke the PWM, or
- * -1. Restores both registers before returning, whatever happens.
- */
-static int sweep_pair(const gatepair_t *g)
-{
-    uint32_t ra = SL6806_CRU_BASE + g->a;
-    uint32_t rb = SL6806_CRU_BASE + g->b;
-    uint32_t base_a = sl6806_mmio_read(ra);
-    uint32_t base_b = sl6806_mmio_read(rb);
-    int bit, found = -1;
-
-    Serial.print("  ");
-    Serial.print(g->what);
-    Serial.print(" = 0x");
-    Serial.print(base_a, HEX);
-    Serial.print(" / 0x");
-    Serial.println(base_b, HEX);
-
-    for (bit = 0; bit < 32; bit++) {
-        if (base_a & (1u << bit))
-            continue;                        /* already on; leave it alone */
-
-        sl6806_mmio_write(ra, base_a | (1u << bit));
-        sl6806_mmio_write(rb, base_b | (1u << bit));
-        delayMicroseconds(200);
-
-        if (pwm_responds()) {
-            found = bit;
-            break;
-        }
-
-        sl6806_mmio_write(ra, base_a);
-        sl6806_mmio_write(rb, base_b);
-    }
-
-    if (found < 0) {
-        sl6806_mmio_write(ra, base_a);
-        sl6806_mmio_write(rb, base_b);
-        Serial.println("    no bit woke the PWM");
-    } else {
-        Serial.print("    bit ");
-        Serial.print(found);
-        Serial.println(" WOKE THE PWM - left on");
-    }
-    /* Whatever happened, say what the neighbouring blocks look like now. */
-    show("modctl", SL6806_MODCTL_BASE);
-    return found;
-}
-
-static void configure(unsigned ch)
-{
-    uint32_t base = SL6806_PWM_CHAN(ch);
-    int rc;
-
-    /*
-     * Mux the pin first. A PWM that runs into a pad still selected for GPIO
-     * drives nothing, which is the most likely reason the previous run
-     * programmed every register correctly and changed nothing on the panel.
-     */
-    rc = sl6806_pad_configure(SL6806_PWM_BL_PAD);
     Serial.print("  pad 0x");
     Serial.print(SL6806_PWM_BL_PAD, HEX);
-    Serial.print(" (bank ");
-    Serial.print(SL6806_PAD_BANK(SL6806_PWM_BL_PAD));
-    Serial.print(" pin ");
-    Serial.print(SL6806_PAD_PIN(SL6806_PWM_BL_PAD));
-    Serial.print(" fn ");
-    Serial.print(SL6806_PAD_FUNC(SL6806_PWM_BL_PAD));
-    Serial.print(") -> ");
-    Serial.println(rc == 0 ? "ok" : "REFUSED");
+    Serial.print(" (bank 1 pin 0 fn 4) -> ");
+    Serial.println(sl6806_pad_configure(SL6806_PWM_BL_PAD) == 0 ? "ok" : "REFUSED");
 
     sl6806_mmio_write(base + SL6806_PWM_CTRL, SL6806_PWM_CTRL_INIT);
     sl6806_mmio_write(base + SL6806_PWM_CTRL,
                       sl6806_mmio_read(base + SL6806_PWM_CTRL) | 0x3Fu);
+    sl6806_pwm_set(BL_CHAN, SL6806_PWM_BL_PERIOD, SL6806_PWM_BL_DUTY(60));
+    sl6806_pwm_enable(BL_CHAN, 1);
+    sl6806_pwm_run(BL_CHAN, 1);
 
-    sl6806_pwm_set(ch, SL6806_PWM_BL_PERIOD, SL6806_PWM_BL_DUTY(60));
-    sl6806_pwm_enable(ch, 1);
-    sl6806_pwm_run(ch, 1);
-
+    show("ctrl", base + SL6806_PWM_CTRL);
     show("p/d ", base + SL6806_PWM_PERIOD_DUTY);
-    show("mode", base + SL6806_PWM_MODE);
+}
 
-    /* Pulse the update trigger the vendor's accessors expose (CTRL bit 8,
-     * set by 0x00811E62 and polled clear by 0x00811E6C). Nothing in the
-     * firmware calls it, so it is probably not required - but it costs one
-     * write, and if the counter is stalled waiting to latch it is free. */
-    sl6806_mmio_write(base + SL6806_PWM_CTRL,
-                      sl6806_mmio_read(base + SL6806_PWM_CTRL)
-                      | SL6806_PWM_CTRL_UPDATE);
-    delayMicroseconds(500);
-    show_busy(ch);
+/* One window of ids per loop() call. Same pacing as examples/Buttons, and for
+ * the same two reasons: the USB handler must get control back, and each line
+ * has to reach the host before the next id is tried, because the console is a
+ * ring in this device's RAM read over the link that would die. */
+static int hunt_step(void)
+{
+    unsigned end = next_id + WINDOW, id;
+
+    if (next_id >= NMODULES)
+        return -1;
+    if (end > NMODULES)
+        end = NMODULES;
+
+    Serial.print("  ids ");
+    Serial.print(next_id);
+    Serial.print("..");
+    Serial.print(end - 1);
+    Serial.print(": ");
+
+    for (id = next_id; id < end; id++) {
+        sl6806_module_enable(id);
+        if (!busy()) {
+            Serial.print("id ");
+            Serial.print(id);
+            Serial.println(" CLEARED BUSY - the counter runs");
+            next_id = NMODULES;
+            return 1;
+        }
+    }
+    Serial.println("still busy");
+    next_id = end;
+    return 0;
 }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 backlight: hunting the PWM's clock ===");
+    Serial.println("=== SL6806 backlight: the module walk, again ===");
 
-    show("pll   ", SL6806_PLL_CTRL);
-    show("domain", 0x40000070u);
-    show("modctl", SL6806_MODCTL_BASE);
-    show("pwm3  ", SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL);
-    Serial.println("(domain should read 0x3FF03FF - requests and acks both in)");
-    Serial.println();
+    /* Module 68 is what makes the registers answer - already known. */
+    Serial.print("module ");
+    Serial.print(SL6806_PWM_MODULE_ID);
+    Serial.print(" (registers) -> ack ");
+    Serial.println(sl6806_module_enable(SL6806_PWM_MODULE_ID) ? "yes" : "no");
+
+    configure();
+    Serial.print("  busy: ");
+    Serial.println(busy() ? "STUCK (counter stopped)" : "clear (counter runs)");
+
+    if (!busy()) {
+        Serial.println("Already running - skipping the walk.");
+        state = ST_DRIVE;
+        next_id = NMODULES;
+    } else {
+        Serial.println("Walking module ids 0..127 for the counter clock.");
+        Serial.println("If the log stops, the last range printed is where.");
+    }
 
     if (!Screen.begin(band, 240, 8))
         Serial.println("no panel - the flash below will do nothing");
-    else
-        Serial.println("lcd bus up; flashing white/black while we try");
-    Serial.println();
-    Serial.println("one stage per host tick; run the monitor with --tick 3");
     Serial.println();
 }
 
@@ -369,112 +217,37 @@ void loop()
     if (state == ST_DONE)
         return;
 
+    if (state == ST_HUNT) {
+        int r = hunt_step();
+
+        if (r == 1) {
+            found = 1;
+            state = ST_DRIVE;
+            step = 0;
+        } else if (r == -1) {
+            Serial.println();
+            Serial.println("=== no module id started the counter ===");
+            Serial.println("Every id, in the ROM's own order, with the ack");
+            Serial.println("waited for. That is a real negative now.");
+            state = ST_DONE;
+        }
+        return;
+    }
+
     if (Serial.read() < 0)
         return;
 
-    switch (state) {
-
-    case ST_PLL:
-        Serial.println("PLL:");
-        show("clken before", SL6806_CRU_CLK_ENABLE);
-        if (!pll_start()) {
-            show("pll   ", SL6806_PLL_CTRL);
-            Serial.println("  NO LOCK - doubt the config word before anything else");
-            state = ST_DONE;
-            return;
-        }
-        show("pll   ", SL6806_PLL_CTRL);
-        show("clken after ", SL6806_CRU_CLK_ENABLE);
-        show("modctl", SL6806_MODCTL_BASE);
-        Serial.println("  (clken must read 0x31 now. If it reads 0 the write");
-        Serial.println("   was dropped and that register is gated too. If");
-        Serial.println("   modctl went non-zero, this was what it waited for.)");
-
-        /* The gate is known now - measured, not guessed. Set it directly and
-         * only fall back to the sweep if this board disagrees. */
-        sl6806_mmio_write(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE0,
-                          sl6806_mmio_read(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE0)
-                          | SL6806_PWM_CRU_GATE_BIT);
-        sl6806_mmio_write(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE1,
-                          sl6806_mmio_read(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE1)
-                          | SL6806_PWM_CRU_GATE_BIT);
-        delayMicroseconds(200);
-        show("gate0 ", SL6806_CRU_BASE + SL6806_PWM_CRU_GATE0);
-
-        if (pwm_responds()) {
-            Serial.println("  PWM answers.");
-            Serial.println();
-            state = ST_FCLK;
-            step = 0;
-            configure(BL_CHAN);
-            return;
-        }
-        Serial.println("  PWM still dead - falling back to the full sweep.");
+    if (step >= NRAMP) {
         Serial.println();
-        gi = 0;
-        state = ST_SWEEP;
-        return;
-
-    case ST_SWEEP: {
-        int bit = sweep_pair(&gates[gi]);
-
-        if (bit >= 0) {
-            hit_reg = gates[gi].a;
-            hit_bit = bit;
-            Serial.println();
-            step = 0;
-            state = ST_FCLK;
-            configure(BL_CHAN);
-            return;
-        }
-
-        if (++gi >= NGATES) {
-            Serial.println();
-            Serial.println("=== no CRU gate woke 0x40084000 ===");
-            Serial.println("The gates are not it, or the PWM needs its reset");
-            Serial.println("released too, or 0x40084000 is not where it lives.");
-            Serial.println("Report the three baselines above - they are the");
-            Serial.println("part of this run that is worth something.");
-            state = ST_DONE;
-        }
+        Serial.println(found > 0 ? "=== done; counter started ==="
+                                 : "=== done ===");
+        state = ST_DONE;
         return;
     }
-
-    case ST_FCLK:
-        if (sl6806_mmio_read(SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL)
-            & SL6806_PWM_CTRL_BUSY) {
-            Serial.println("busy is stuck; hunting a second gate bit for the");
-            Serial.println("counter clock, on top of the one already set:");
-            hunt_fclk();
-        }
-        show_busy(BL_CHAN);
-        Serial.println();
-        state = ST_DRIVE;
-        step = 0;
-        return;
-
-    case ST_DRIVE:
-        if (step >= NRAMP) {
-            Serial.println();
-            Serial.print("=== done");
-            if (hit_bit >= 0) {
-                Serial.print("; CRU 0x");
-                Serial.print(hit_reg, HEX);
-                Serial.print(" bit ");
-                Serial.print(hit_bit);
-                Serial.print(" is the PWM's gate");
-            }
-            Serial.println(" ===");
-            state = ST_DONE;
-            return;
-        }
-        sl6806_pwm_set(BL_CHAN, SL6806_PWM_BL_PERIOD,
-                       SL6806_PWM_BL_DUTY(ramp[step]));
-        show_busy(BL_CHAN);
-        Serial.print("  duty ");
-        Serial.print(ramp[step]);
-        Serial.println("%");
-        step++;
-        return;
-    }
+    sl6806_pwm_set(BL_CHAN, SL6806_PWM_BL_PERIOD, SL6806_PWM_BL_DUTY(ramp[step]));
+    Serial.print("  duty ");
+    Serial.print(ramp[step]);
+    Serial.print("%  busy ");
+    Serial.println(busy() ? "stuck" : "clear");
+    step++;
 }

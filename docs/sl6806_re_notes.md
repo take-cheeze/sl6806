@@ -1214,7 +1214,16 @@ explanation for both a stalled counter and a permanently dead `0x400E0000`.
 > unconditionally**, and print a before/after readback, or a stale device looks
 > like a negative result.
 
-**PARKED, after seven runs. The counter clock is not reachable from a payload.**
+**REOPENED — the gate we found is module id 68, and the walk that freed the
+keys has not been tried here.** §15b's `module_clock_enable` says ids 64–95
+gate through CRU `+0x68` with `+0x78` as the shadow, so "bit 4 of `0x68`" is
+module 68. The sweep that found it wrote both registers at once, which happens
+to be survivable for this peripheral and is not in general — the ADC's correct
+bit was recorded as dead by exactly that mistake. `examples/Backlight` now
+enables module 68 properly and then walks 0–127 for a second id, with CTRL bit
+28 going clear as the test. Everything below this line predates that.
+
+**Parked after seven runs. The counter clock was not found by sweeping.**
 `0x4008011C` took `0x31` and changed nothing — modctl still zero, busy still
 set. Then, with the known gate bit held, every other bit of all three CRU gate
 pairs was tried on top of it and **nothing cleared busy**. Two assumptions were
