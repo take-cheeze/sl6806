@@ -16,6 +16,16 @@ before any of that: **the backlight is a separate PWM channel that nothing
 here turns on**, so a dark screen does not yet mean a broken driver. This
 document is half "how it works" and half "what to try when it doesn't".
 
+> **The backlight registers are now known**, which changes the order you
+> should try things in. It is PWM channel 3 of a block at `0x40084000`:
+> channel registers at `0x40084020 + ch * 0x20`, `+0x04 = (period << 16) |
+> duty` with the vendor using 48000/`percent * 480`, `+0x10` bit 0 to enable
+> and `+0x00` bit 4 to run. See §14a of docs/sl6806_re_notes.md. Nothing here
+> drives it yet, and it has not been tried on hardware — but it is now a
+> ten-line experiment rather than an open question, and it should be run
+> before any more work on the bus driver, because it is the cheaper of the
+> two explanations for a dark screen.
+
 ```cpp
 #include <Arduino.h>
 

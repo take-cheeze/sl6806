@@ -317,6 +317,11 @@ by USB polling, the freeze also destroys the evidence of which pad did it.
 - Scanning raw 32-bit words does NOT work for this: Thumb-2 instruction
   encodings dominate (`0x46202000` is `mov r0,r4; movs r0,#0`). Use
   `tools/sl6806-find-mmio`, which decodes LDR-literal instructions.
+- **And the literal scan has a blind spot worth knowing.** A block whose
+  per-channel base is computed — one literal plus `ch << 5` — appears once
+  and then never again, because every later access goes through a cached
+  table. Both blocks in §14 hid that way, and so did the LCDC (§12b). If a
+  peripheral is "missing", look for the table it is cached in.
 
 **Blocks identified so far.** Doing the same literal scan over the *HLKJ
 bootloader* rather than FIRM is what named most of these: the bootloader is a
@@ -327,7 +332,9 @@ are legible where FIRM's are buried.
 |---|---|---|
 | `0x40000000` | pad / pin function mux | `0x00820650` rewrites four byte-lanes of `+0x04` (per-pad function nibbles) and a 5-bit field at `+0x08`, switching one bus between two functions |
 | `0x40009000` | timers | channels at 0x100 stride (`+0x108`, `+0x208`) with write-1-clear flags and per-channel callbacks; register triples at 0x20 stride |
-| `0x40070000` | DMA | per-channel IRQ status at `+0x24`/`+0x2c`, callback table indexed by channel, request routing at `+0x00`/`+0x20`/`+0x28` |
+| `0x40070000` | DMA **control only** | per-channel IRQ status at `+0x24`/`+0x2c`, callback table indexed by channel, request routing at `+0x00`/`+0x20`/`+0x28`. The data path is **not** here — see `0x40001000` below |
+| `0x40001000` | **DMA channel registers** | 8 channels at `+ch*0x40`, `{ctrl, src, dst, len}`; §14b |
+| `0x40084000` | **PWM** | 6 channels at `+0x20 + ch*0x20`; channel 3 is the backlight; §14a |
 | `0x40080000` | **clock & reset unit** | dividers at `+0x40`/`+0x48` with a bit-31 busy poll; module gates at `+0x64`/`+0x74` bit 15; see `cores/sl6806/sl6806_cru.h` |
 | `0x40081000` + `0x400F6000` | **GPIO / pad controller** | six banks, bases in a mask ROM table at `0x00065004`; see §7f and `cores/sl6806/sl6806_padctl.h` |
 | `0x400D9000` | **LCD controller** | the bootloader logs `HAL_lcdc_module_init` from the routine that caches this base; see §12b and `cores/sl6806/sl6806_lcdc.h` |
@@ -779,8 +786,17 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
    `__act_on_request` dispatcher (turns `method_20` + siblings into named
    methods across all scenes).
 9. **Build a Unicorn harness** to execute functions from the image.
-10. **Re-run every "not in the image" search against the blob** (§13). The
-   backlight PWM driver is the one that matters; §13 has the lead.
+10. ~~**Re-run every "not in the image" search against the blob**~~ **DONE**
+   for the two that mattered — §14. The PWM (backlight) is at `0x40084000`
+   and the DMA data path at `0x40001000`.
+11. **Turn the backlight on.** §14a gives the registers and the vendor's own
+   period and duty. This is now the top of the list: it is a handful of
+   register writes, it does not wedge USB the way a pad sweep does, and it is
+   the cheaper of the two explanations for a dark panel.
+12. **Find the bulk path's byte swap** (§14c). The remainder path swaps in
+   software; the DMA path must be getting it from a mode bit somewhere.
+13. **Read `0x00D3D094`** to get the device-record layout, which would settle
+   whether the PWM record's `0x00030000` really is the backlight's pad.
 
 ## 13. The SRAM-resident half of the application is in flash — and LVGL
 
@@ -1007,4 +1023,157 @@ readable. Two concrete leads:
   narrower target than "find the PWM registers", and the timer block's layout
   is already partly known.
 
-Neither has been followed through.
+Both have now been followed through — **§14 has the registers.** The second
+lead was half wrong: the backlight is a PWM peripheral, just not the one §7c
+found, and not at `0x40009000`.
+
+## 14. The PWM (backlight) and the DMA, both found
+
+Two blocks that no previous scan located, because neither is addressed as
+`base + offset` from a literal — both compute a per-channel base from one
+literal and a shift, so `tools/sl6806-find-mmio` had nothing to see.
+
+### 14a. PWM at `0x40084000` — this is the backlight
+
+`0x00D99C34` initialises one channel and is where the base falls out:
+
+```
+r0 = 0x40084020 + (ch << 5)              ; the channel's registers
+[0x0082B3F8 + (ch + 4) * 4] = r0         ; cached in a table
+[0x0082B3F8 + (ch >> 1) * 4 + 4] = 0x40084010 + (ch >> 1) * 4
+[0x0082B3F8] = 0x40084000
+```
+
+So: **block base `0x40084000`, six channels at `0x40084020 + ch * 0x20`**, a
+global register at `0x40084000`, and a per-pair register at
+`0x40084010 + (ch >> 1) * 4`. Everything else reaches a channel through the
+table at `0x0082B3F8`, which is why the base appears exactly twice.
+
+Channel registers, from the accessors in the blob at `0x00811E48`–`0x00811EC0`:
+
+| Off | Role |
+|---|---|
+| `+0x00` | control. bit 4 = **run**; bit 8 = update trigger, and the same bit is polled until clear; bit 28 polled as busy; `0x40` written at init; `0x00811EC0` writes `src \| (div << 8)` |
+| `+0x04` | **`(period << 16) \| duty`** — written by `0x00811D04`, which returns without writing unless `period >= duty` |
+| `+0x10` | bit 0 = enable; `0x00811E9A` writes `(x << 16) \| (mode << 1) \| bit0`, and forces bit 0 low first if bits [3:1] change |
+| `+0x14`, `+0x18`, `+0x1C` | three more `(hi << 16) \| lo` pairs |
+
+Entry points, all in the blob: `0x00811CE4` run/stop (`+0x00` bit 4),
+`0x00811CF4` enable (`+0x10` bit 0), `0x00811D04` set period/duty,
+`0x00811D2C`/`0x00811D3C` trigger and wait.
+
+**The backlight is PWM channel 3, and the numbers are exact.** `0x00D102F4`
+is `set_brightness(percent)`:
+
+```c
+if (pct > 100) pct = 100;
+req.op     = 3;
+req.period = 48000;              // a count, not a frequency
+req.duty   = pct * 480;          // rsb r3,r0,r0 lsl #4 ; lsls #5  ->  pct*15*32
+ioctl(pwm_dev, 0, &req);         // 0x00D3D374
+```
+
+`0x00D10354` opens `/dev/pwm_ch3` through the driver framework
+(`open` = `0x00D3D1E8`), with an initial period/duty of 48000/24000 and a
+completion callback at `0x00D102D4`, then immediately calls
+`set_brightness(60)` — which is where §7b's "default is 60%" comes from.
+
+The driver itself is registered from a table of ~21 device records at
+`0x00D3CF40`, each handed to `0x00D3D094`. The PWM record is at flash
+`0x00C7DE88`; its constructor `0x00D452A0` allocates 80 bytes and installs
+ops at `0x00D452F0`, `0x00D45394` (configure), `0x00D4534C` (stop) and
+`0x00D45200`.
+
+**What is still missing is the pad.** The record carries `0x00030000`, which
+decodes under §7f as bank 3 pin 0 — and §7g independently lists
+`0x000300C0`, the same pad as an output driven high at `0x00D46432`. That is
+suggestive, not established: the record's field order has not been read out
+of `0x00D3D094`, so `0x00030000` may be something else entirely. It also sits
+badly with §7b's result that driving every pad high lights nothing — although
+a backlight that wants a pulse train rather than a level would explain both.
+
+**Not confirmed on hardware.** In bootloader mode `0x40084000`,
+`0x40084020` and `0x40084080` all read as zeros. That is inconclusive: the
+CRU at `0x40080000` reads live structured data in the same mode, but
+unmapped space (`0x00900000`) also reads as zeros, so a gated-off block and a
+non-existent one look identical from here. `0x40084000` being `0x4000` above
+the CRU is at least the right neighbourhood.
+
+**The experiment this enables.** Gate the block on, write
+`+0x04 = (48000 << 16) | 28800`, set `+0x10` bit 0 and `+0x00` bit 4, and see
+whether the panel lights. That is a far smaller thing to try than another pad
+sweep, and unlike a pad sweep it does not wedge USB.
+
+### 14b. DMA — the channel registers are at `0x40001000`
+
+§7c lists `0x40070000` as "DMA". That block is real but it is only the
+request router and interrupt controller; the data path is somewhere else.
+The bootloader's channel allocator at `0x00829768` gives it away:
+
+```
+r2 = 64 * ch + 0x40001000        ; smlabb
+[handle + 8]  = r2               ; the channel's registers
+[handle + 12] = ch
+```
+
+**Eight channels at `0x40001000 + ch * 0x40`.** Handles are 16-byte records
+in a table (`0x0082EE00` in the bootloader), with `+0x0D` as the in-use flag.
+
+Channel registers, from the blob's API at `0x0080DA74`ff:
+
+| Off | Role |
+|---|---|
+| `+0x00` | control. bit 30 = start, bit 29 = cleared to arm / cleared again to abort, bit 31 = enable, bit 25 = a mode bit set by the allocator |
+| `+0x04` | **source** |
+| `+0x08` | **destination** |
+| `+0x0C` | `[17:0]` = length in bytes, `[31:18]` preserved config. Reading it back gives the remaining count (`0x0080DAFC`) |
+
+Eighteen bits of length means **256 KB per transfer** — a whole 240×296
+RGB565 frame (138.75 KB) goes in one.
+
+API in the blob: `0x0080DA74` start, `0x0080DAC8` abort, `0x0080DADE`
+enable/disable, `0x0080DAFC` remaining.
+
+The `0x40070000` block is the other half:
+
+| Off | Role |
+|---|---|
+| `+0x00` | request routing, 4 bits per channel |
+| `+0x20`, `+0x28` | request routing, 2 bits per channel each |
+| `+0x24` | interrupt status for the write direction, **write-1-to-clear** |
+| `+0x2C` | interrupt status for the read direction, W1C |
+
+Each channel occupies bits `2n` and `2n+1` of a status word. The two ISRs are
+`0x00806394` (`+0x24`) and `0x008063E0` (`+0x2C`); both read the status,
+write it straight back, then dispatch on bits 0, 2, 4 and 6 to callback slots
+at `0x008273D0 + 8` .. `+36`. The bootloader has a byte-identical pair at
+`0x00821DBC` — same silicon, same SDK code, so either copy can be read.
+
+Routing is allocated by `0x00CC6E34`, which walks four slots and then sets a
+regular pattern: channel `c` uses `+0x00` bits `4c` and `4c+4` (one for each
+direction), and bits `[2c+1:2c]` of `+0x20` and `+0x28`.
+
+### 14c. How the display uses the DMA
+
+`0x00D9982C` is the application's LCDC transfer, and it is worth comparing
+against `cores/sl6806/sl6806_lcdc.c` because it differs from the polled
+transcription in ways that matter:
+
+- it waits on `+0x14 & 0x60000000` before touching anything;
+- `+0x24` gets the QSPI opcode and `+0x2C` the DCS command, both read from
+  the panel descriptor (`0x32` and RAMWR);
+- **`+0x28[15:0]` is the pixel count minus one, not the byte count** — the
+  element width comes from `+0x20[21:20]`;
+- for the pixel stream both command-field lengths are zero, so `+0x20[3:2]`
+  is set to 2 (FIFO only) and **no command frame is emitted at all**; RAMWR
+  was already sent separately by `0x00D3E5A4`. A driver that re-sends RAMWR
+  with every chunk is not doing what the vendor does;
+- `+0x08` bit 4 is explicitly cleared — register mode, not command-list mode,
+  which matches the measurement in §12b;
+- then `0x0080DA74(handle, LCDC + 0x30, src, len)` hands the buffer to a DMA
+  channel writing into the LCDC FIFO, and `+0x20` bit 0 starts it.
+
+The remainder that does not divide by 8 goes out through `0x0080E5C0` with
+the `rev16` per pixel described in §13d. **Where the bulk path gets its byte
+swap is still unknown** — presumably a mode bit in the DMA or in
+`+0x20[21:20]`, and worth finding before trusting it.
