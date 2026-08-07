@@ -41,10 +41,25 @@
  * HOLD EACH BUTTON for a few seconds - loop() runs at the USB poll rate,
  * measured between 0.3 and 42 times a second.
  *
- * SAFETY. Clocks are only ever turned on, never off, and the ROM's own
- * disable (0x00001CE8) is deliberately not used - switching a clock off under
- * a running peripheral is how you lose USB. Progress is printed every eight
- * ids, so if one of them does wedge the device the log names the range.
+ * SAFETY, rewritten after this sketch wedged the device once.
+ *
+ * Clocks are only ever turned on, never off; the ROM's disable (0x00001CE8)
+ * is deliberately unused, because switching a clock off under a running
+ * peripheral is how you lose USB.
+ *
+ * The wedge was not a dangerous module, it was time. The first version polled
+ * each gate 100000 times for an acknowledgement, and every id that nothing
+ * implements paid the full count - 128 of those is over a second spent inside
+ * the boot ROM's USB handler, which is exactly the failure the notes warn
+ * about. The poll is now 200, which is generous for something that answers in
+ * a few cycles.
+ *
+ * And the walk runs a few ids per loop() call rather than all of it in
+ * setup(), so the handler keeps getting control back. That also fixes the
+ * other half of that failure: the console is a ring in this device's RAM, read
+ * over the very link that dies, so a log printed in the same breath as a fatal
+ * write never arrives. Printing a window and returning means a wedge is
+ * bracketed by output you already have.
  */
 
 #include <Arduino.h>
@@ -95,7 +110,14 @@ static bool module_enable(unsigned id)
     sl6806_mmio_write(base + shadow, sl6806_mmio_read(base + shadow) | bit);
     sl6806_mmio_write(base + gate,   sl6806_mmio_read(base + gate)   | bit);
 
-    for (i = 0; i < 100000u; i++)
+    /*
+     * SHORT on purpose. An acknowledgement is a few cycles of hardware; a
+     * long poll only costs time when the id is one nothing implements, and
+     * every one of those is paid 128 times over. The first version polled
+     * 100000 times and spent over a second inside the boot ROM's USB handler,
+     * which is precisely how you take the device off the bus.
+     */
+    for (i = 0; i < 200u; i++)
         if (sl6806_mmio_read(base + gate) & bit)
             return true;
     return false;
@@ -140,29 +162,50 @@ static void dump(const char *tag)
     Serial.println();
 }
 
-/* Turn on every module id in turn until the ADC answers a write. */
-static int hunt_module(void)
+/*
+ * One window of module ids per loop() call, not the whole walk in setup().
+ *
+ * Two reasons, both learned by wedging the device. The USB handler must get
+ * control back promptly, and a walk that runs to completion inside setup()
+ * does not give it back. And the log has to reach the host *as it goes*: the
+ * console is a ring in this device's RAM, read over the very link that dies,
+ * so anything printed in the same breath as the fatal write is lost. Printing
+ * a window, returning, and printing the next means a wedge is bracketed by
+ * what already arrived.
+ */
+#define WINDOW 4
+static unsigned next_id;
+
+/* Returns 1 when the ADC opens, -1 when the walk is done, 0 while running. */
+static int hunt_step(void)
 {
+    unsigned end = next_id + WINDOW;
     unsigned id;
 
-    for (id = 0; id < NMODULES; id++) {
-        if ((id & 7) == 0) {
-            Serial.print("  ids ");
-            Serial.print(id);
-            Serial.print("..");
-            Serial.print(id + 7);
-            Serial.println(" ...");
-        }
+    if (next_id >= NMODULES)
+        return -1;
+    if (end > NMODULES)
+        end = NMODULES;
+
+    Serial.print("  ids ");
+    Serial.print(next_id);
+    Serial.print("..");
+    Serial.print(end - 1);
+    Serial.print(": ");
+
+    for (id = next_id; id < end; id++) {
         module_enable(id);
-        delayMicroseconds(200);
         if (adc_writable()) {
-            Serial.print("  module id ");
+            Serial.print("id ");
             Serial.print(id);
             Serial.println(" OPENS THE ADC");
-            return (int)id;
+            next_id = NMODULES;
+            return 1;
         }
     }
-    return -1;
+    Serial.println("no");
+    next_id = end;
+    return 0;
 }
 
 void setup()
@@ -188,23 +231,14 @@ void setup()
 
     if (adc_writable()) {
         Serial.println("ADC already accepts writes.");
+        next_id = NMODULES;
+        opened_by = -2;              /* nothing to hunt */
     } else {
-        Serial.println("ADC ignores writes; enabling module clocks the way");
-        Serial.println("the mask ROM does (0x00001C5C), ids 0..127:");
-        opened_by = hunt_module();
-        if (opened_by < 0)
-            Serial.println("  no module id opened it.");
+        Serial.println("ADC ignores writes. Enabling module clocks the way the");
+        Serial.println("mask ROM does (0x00001C5C), ids 0..127, a few per poll.");
+        Serial.println("If the log stops, the last range printed is where it");
+        Serial.println("died - that is the whole point of printing as we go.");
     }
-
-    adc_init();
-    delay(10);
-    dump("after: ");
-    Serial.print("writable now: ");
-    Serial.println(adc_writable() ? "yes" : "no");
-
-    Serial.println();
-    Serial.println("Words are 0x40096000 +0,4,8,... Press and HOLD a button;");
-    Serial.println("any word that changes is printed with its offset.");
     Serial.println();
 }
 
@@ -212,6 +246,31 @@ void loop()
 {
     uint32_t now[NWORDS];
     int i, changes = 0;
+
+    /* Walk the module ids first, a window at a time, then settle into
+     * watching the block. */
+    if (next_id < NMODULES) {
+        int r = hunt_step();
+
+        if (r == 1) {
+            opened_by = 1;
+            adc_init();
+            dump("after: ");
+            Serial.print("writable now: ");
+            Serial.println(adc_writable() ? "yes" : "no");
+            Serial.println("Press and HOLD a button.");
+        } else if (r == -1) {
+            Serial.println("no module id opened it.");
+        }
+        return;
+    }
+    if (opened_by == -2) {
+        opened_by = -3;
+        adc_init();
+        dump("after: ");
+        Serial.println("Press and HOLD a button.");
+        return;
+    }
 
     for (i = 0; i < NWORDS; i++)
         now[i] = sl6806_mmio_read(ADC_BASE + (uint32_t)i * 4);
