@@ -69,11 +69,29 @@
  * A counter with no source is exactly what "every register correct, nothing
  * moves" looks like.
  *
- * So this sweeps that register: sources 0..15 against a few dividers, with
- * CTRL bit 28 going clear as the test. It is the last thing this file has to
- * try. If it comes back empty the honest conclusion is that the backlight
- * needs something outside the reachable address space, and the answer is
- * ground truth from a running stock firmware rather than another guess.
+ * SWEPT, AND IT WAS NOT THE ANSWER EITHER. Sixteen sources against six
+ * dividers: the counter stayed stopped. The sweep did pin the register's
+ * shape - it only retains 0x10F, so src is [3:0] and the divider is one bit
+ * at [8], not the eight-bit field `div << 8` implied.
+ *
+ * ---------------------------------------------------------------------
+ * THIS SKETCH HAS RUN OUT OF THINGS TO TRY, AND THAT IS THE POINT OF IT.
+ *
+ * The gate, the pad, the register contents, all 128 module ids in the ROM's
+ * own order, every gate-shaped CRU register, every module clock, and the
+ * counter's clock select have each been covered by measurement. The PWM is
+ * correctly programmed and its counter does not move. Whatever starts it is
+ * not in the address space a payload can reach.
+ *
+ * So do not add another register guess here. The next move is ground truth:
+ * read the CRU and this block while the stock firmware runs, and diff it
+ * against the cold state in 13f. That needs a way past read_mem being refused
+ * in card-reader mode (7d.1), which is a project rather than a run.
+ *
+ * What this sketch is still good for is confirming the map on another board,
+ * and as the place the sweep lives if someone finds a new register class to
+ * point it at.
+ * ---------------------------------------------------------------------
  *
  * THE PROBE IS A WRITE AND A READ BACK, not a bare read: a register that
  * reads zero because it is dead and one that reads zero because it is idle

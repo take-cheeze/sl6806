@@ -1220,14 +1220,42 @@ CTRL bit 28 never cleared. So the counter does not want a second module clock,
 and this is the first negative in this section that was reached with the right
 method rather than the wrong one.
 
-What remains untried is the **pair clock register**, `0x40084010 + (ch>>1)*4`.
-`0x00811EC0` writes it as `src | (div << 8)` — the shape of a counter clock
-select — and nothing in flash or in the SRAM blob ever writes it. It reads 0 on
-a cold chip and stays 0, and a counter with no source is exactly what "every
-register correct, nothing moves" looks like. `examples/Backlight` sweeps it.
+**The pair clock register was swept too, and is not the answer.** Sixteen
+sources against six dividers into `0x40084014`: the counter stayed stopped. The
+sweep did measure the register's shape, which is worth keeping — it only
+retains `0x10F`, so `src` is `[3:0]` and the divider is a single bit at `[8]`,
+not the eight-bit field `div << 8` in `0x00811EC0` implied.
 
 Also checked and eliminated: FIRM's `HAL_timer_*` is at `0x40099000`, a
 different block, so the PWM is not the timer and its clock is not the timer's.
+
+### CLOSED for now. What is established, and what is left
+
+Everything reachable has been tried, most of it twice and the second time
+correctly. Established and verified on hardware:
+
+| | |
+|---|---|
+| PWM block | `0x40084000`, channels at `+0x20 + ch*0x20` |
+| Module id | 68 — CRU `+0x68` gate, `+0x78` shadow, bit 4 |
+| Backlight channel | 3 |
+| Pad | `0x00010200` — bank 1 pin 0, function 4; confirmed by reading the bank's function register back as `0x12222224` |
+| Registers | CTRL takes `0x7F`, period/duty takes `(48000 << 16) \| duty` exactly |
+| CTRL bit 28 | busy, and permanently set |
+
+Eliminated, each by measurement: the PLL (locks, changes nothing); the ten
+power domains (already acknowledged before a payload starts); `0x4008011C`
+(takes `0x31`, changes nothing); all 128 module ids in the ROM's own order with
+the acknowledgement waited for; every bit of the eleven gate-shaped CRU
+registers; every module-clock register `+0x100`–`+0x13C`; the pair clock
+select; the pad; the register contents.
+
+So the counter's clock is not in the address space a payload can reach, and no
+further register guess is worth a run. **The next move is ground truth**: read
+the CRU and the PWM while the stock firmware is running and diff against §13f's
+cold state. `read_mem` is refused in card-reader mode (§7d.1), so that needs a
+way in first — the likeliest being a patched FIRM, which §4 and §6 make
+repackable and which the mask ROM makes recoverable.
 
 **Background — the gate is module id 68.** §15b's `module_clock_enable` says ids 64–95
 gate through CRU `+0x68` with `+0x78` as the shadow, so "bit 4 of `0x68`" is

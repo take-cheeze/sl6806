@@ -173,9 +173,13 @@
  * block that nothing in flash or in the SRAM blob ever writes - it reads 0 on
  * a cold chip and stays 0.
  *
- * [I] Which makes it the standing explanation for a channel that is correctly
- * programmed, correctly gated, and whose counter never moves: a counter with
- * no source. Nothing has confirmed that.
+ * [M] SWEPT, AND IT IS NOT THE ANSWER. Sixteen sources against six dividers,
+ * 2026-08-07: the counter stayed stopped throughout.
+ *
+ * [M] The sweep did measure the register's shape, which is worth keeping. It
+ * only retains `0x10F`: writing `0x3F0F` reads back `0x10F`. So `src` is
+ * [3:0] and the divider is a single bit at [8] - not the eight-bit field the
+ * `div << 8` in 0x00811EC0 suggested.
  */
 #define SL6806_PWM_PAIR(ch)     (SL6806_PWM_BASE + 0x10u + ((ch) >> 1) * 4u)
 #define SL6806_PWM_PAIR_VALUE(src, div) ((uint32_t)(src) | ((uint32_t)(div) << 8))
