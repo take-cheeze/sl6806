@@ -41,6 +41,18 @@
  * ordinary blocking sketch alive and honest rather than wedging the link, but
  * its timing will be wrong - pace loop() with millis() if the timing matters.
  *
+ * SETUP() OUTPUT IS NOT READABLE UNTIL SETUP() RETURNS. The USB handler is
+ * installed at the bottom of _start, *after* sl6806_run_setup(). Serial output
+ * goes into a ring buffer that only the host's polling drains, and the host
+ * cannot poll until that handler exists. So a setup() that hangs or faults
+ * takes its own diagnostics down with it and the device looks silent rather
+ * than broken - there is no partial output to read, not even the banner.
+ *
+ * A probe that does something risky should therefore do it from loop(), one
+ * step per call, announcing each step and returning so the host drains that
+ * line before the risky write happens. examples/PadScope is built that way,
+ * and says why.
+ *
  * THE VENDOR HANDLER ANSWERS TWO QUERIES OF ITS OWN, at sentinel addresses no
  * real read can land on: the console poll (sl6806_console.h) and a status
  * report (sl6806_stat.h) that exists so the host can measure the real CPU
