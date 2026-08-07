@@ -146,8 +146,38 @@ void setup()
         return;
     }
     draw();
-    Screen.display();
-    Serial.println("full-screen frame pushed.");
+
+    /*
+     * Time one full-screen push. The bus driver writes the FIFO 16 bytes at a
+     * time because that is its depth, so a 240x296 RGB565 frame is 142080
+     * bytes in about 8880 transfers, each with its own status poll. Whether
+     * that is worth replacing with the DMA path in 14c is a question about a
+     * number, so measure the number.
+     *
+     * micros() is SysTick-backed and its 24-bit counter wraps every 262 ms at
+     * 64 MHz, so a push that takes longer than that reads short. The report
+     * says so rather than quietly lying.
+     */
+    {
+        uint32_t t0 = micros();
+        uint32_t dt;
+
+        Screen.display();
+        dt = micros() - t0;
+
+        Serial.print("full-screen push: ");
+        Serial.print(dt);
+        Serial.print(" us");
+        if (dt >= 262000u) {
+            Serial.println("  (>= one SysTick wrap - treat as a lower bound)");
+        } else {
+            Serial.print("   ");
+            Serial.print((uint32_t)((uint64_t)FB_W * FB_H * 2 * 1000000u / dt / 1024u));
+            Serial.print(" KiB/s   ");
+            Serial.print(1000000u / dt);
+            Serial.println(" fps");
+        }
+    }
 }
 
 void loop()
@@ -158,7 +188,20 @@ void loop()
         return;
     next = millis() + 2000;
 
-    draw();
-    Screen.display();
-    Serial.println("frame");
+    {
+        uint32_t t0 = micros();
+        uint32_t dt;
+
+        draw();
+        dt = micros() - t0;
+        Serial.print("draw ");
+        Serial.print(dt);
+        Serial.print(" us, push ");
+
+        t0 = micros();
+        Screen.display();
+        dt = micros() - t0;
+        Serial.print(dt);
+        Serial.println(" us");
+    }
 }
