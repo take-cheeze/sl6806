@@ -29,7 +29,7 @@ import time
 import tty
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sl6806_dev import Device as BaseDevice, find_tool     # noqa: E402
+from sl6806_dev import Device as BaseDevice, find_tool, take_lock  # noqa: E402
 
 MAGIC = 0x36384C53          # "SL68"
 VERSION = 2
@@ -210,6 +210,8 @@ def main():
                         "SECONDS. Handy when a sketch prints a finite report "
                         "and then goes quiet.")
     args = p.parse_args()
+
+    take_lock()
 
     base = console_addr_from_sym(args.sym)
     dev = Device(find_tool(args.tool), not args.no_sudo)

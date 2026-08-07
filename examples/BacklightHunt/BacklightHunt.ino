@@ -71,12 +71,28 @@ static const cand_t cands[] = {
 };
 #define NCANDS ((int)(sizeof(cands) / sizeof(cands[0])))
 
-#define HOLD_MS  2500u
-#define FLASH_MS  400u
+/*
+ * COUNT POLLS, NOT MILLISECONDS.
+ *
+ * millis() is useless for pacing here and two attempts were wasted before
+ * that was obvious. loop() is driven by USB polls; smtlink_dump spawns a
+ * process per poll, so it runs about once a second; and the 24-bit SysTick
+ * wraps every 262 ms with wraps only accumulated on read, so most of the
+ * elapsed time is simply lost. A nominal 2500 ms hold measured 18 s of wall
+ * clock, and dropping it to 800 ms changed nothing, because the limit was
+ * never the clock.
+ *
+ * Holding for a fixed number of loop() calls is predictable: at roughly one
+ * poll per second, HOLD_POLLS of 3 gives about three seconds per pad and puts
+ * a whole 17-pad cycle inside a single one-minute monitor run - which matters,
+ * because a monitor that outlives the foreground limit gets backgrounded, and
+ * a second one started alongside it wedges the device off the bus.
+ */
+#define HOLD_POLLS 3u
 
 static int cursor = -1;
 static bool announced;
-static uint32_t holdUntil, flashNext;
+static unsigned held;
 static bool white;
 
 static void release(int i)
@@ -104,19 +120,16 @@ void setup()
 
 void loop()
 {
-    uint32_t now = millis();
+    /* Flip every poll, so a backlight coming on is unmissable and says at the
+     * same time whether the picture is right. */
+    white = !white;
+    Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
+    Screen.display();
 
-    /* Keep the panel changing, so a backlight coming on is unmissable and
-     * tells us whether the picture is right at the same time. */
-    if ((int32_t)(now - flashNext) >= 0) {
-        flashNext = now + FLASH_MS;
-        white = !white;
-        Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
-        Screen.display();
-    }
-
-    if ((int32_t)(now - holdUntil) < 0)
+    if (held < HOLD_POLLS) {
+        held++;
         return;                 /* still holding the current candidate */
+    }
 
     if (!announced) {
         int next = (cursor + 1) % NCANDS;
@@ -137,6 +150,6 @@ void loop()
     /* Function 1 is output; keep the pad's own drive and pull settings. */
     sl6806_pad_configure((cands[cursor].id & ~0x00000780u) | (1u << 7) | (1u << 6));
 
-    holdUntil = now + HOLD_MS;
+    held = 0;
     announced = false;
 }
