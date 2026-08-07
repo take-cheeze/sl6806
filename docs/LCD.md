@@ -258,9 +258,14 @@ a scope on the panel flex, not more software.
 
 **On the reference unit this has been run, and the answer is that software is
 blind.** `P` finds pull selector 8 holds a plain input high, and the same pull
-on the same pad in function 2 reads 0 — the input buffer is off in alternate
-mode. So `p` cannot see the bus either way, and neither can anything else that
-does not involve a probe on the flex.
+on the same pad in function 2 reads 0.
+
+`examples/PadScope` then settled it properly, sweeping all eight LCD pads
+through all sixteen function nibbles with a pull-up applied. Every pad gives
+the same answer: the input register reads 1 in function 0 and function 14, and
+0 in every other function. So the buffer is off outside those two modes, there
+is no function where the controller is connected *and* the pin is readable,
+and nothing that does not involve a probe on the flex can see this bus.
 
 What is known on that unit: transfers complete in a clock-dependent number of
 polls (3 at modclk `0x910`, 1 at `0x310`, so the controller is doing real

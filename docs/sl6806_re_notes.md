@@ -255,12 +255,23 @@ emitted or not, which supports reading bit 17 as "emit the frame". Neither
 polarity, nor either polarity of bit 18, nor any of the eight combinations of
 those with bit 4, produces a picture.
 
-**The pad input buffer is off in alternate-function mode.** Measured on the
-reference unit: pull selector 8 holds bank 1 pin 1 high when the pad is a
-plain input (function 0), and the same pull with the pad in function 2 reads
-0. So `+0x10` cannot observe a pad that a peripheral owns, and no software
-test can watch the LCD bus. That is worth knowing before designing another
-one.
+**The pad input buffer is off in almost every alternate function.** Measured
+across all eight of bank 1's LCD pads and all sixteen function nibbles, with a
+pull-up applied (`examples/PadScope`), and the result is identical on every
+pad:
+
+| function | 0 | 2-13 | 14 | 15 |
+|---|---|---|---|---|
+| input register reads | 1 | 0 | 1 | 0 |
+
+Function 0 is the control - a plain input, where the pull-up is visible.
+Function 14 is the only other mode that leaves the buffer alive. Twelve
+different peripheral functions all happening to drive the pad low is not a
+credible reading, so the buffer is simply switched off outside those two.
+
+Consequence: **there is no pad function in which the LCD controller is
+connected and the pin is also readable**, so no software test can watch that
+bus. Anyone tempted to write another one should read this table first.
 
 **Do not sweep pads to find a rail.** Driving all 192 wedges the device -
 something USB needs is among them - and because the console ring is only read
