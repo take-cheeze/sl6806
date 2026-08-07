@@ -57,12 +57,23 @@
  *     to read the bit back. Writing both at once does nothing, which is
  *     precisely how the ADC's correct bit was recorded as dead.
  *
- * The gate this file already found - +0x68 bit 4 - is module id 68 under that
- * scheme, and it makes the PWM's registers writable but not its counter run.
- * So the counter very likely wants a second id, exactly as a peripheral with
- * separate register and functional clocks would. This walks 0..127 looking
- * for one, with CTRL bit 28 going clear as the test: machine-checkable, and
- * it needs nobody watching the panel.
+ * THE MODULE WALK IS DONE AND IT WAS A CLEAN NEGATIVE. All 128 ids, in the
+ * ROM's order, with the acknowledgement waited for: the counter stayed
+ * stopped. That is a real result, unlike the sweeps before it, and it means
+ * the counter does not want a second module clock.
+ *
+ * SO WHAT IS LEFT IS THE ONE REGISTER NOBODY WRITES. Each channel *pair* has
+ * a register at 0x40084010 + (ch >> 1) * 4, and 0x00811EC0 writes it as
+ * `src | (div << 8)` - the shape of a counter clock select. Nothing in flash
+ * or in the SRAM blob ever writes it; it reads 0 on a cold chip and stays 0.
+ * A counter with no source is exactly what "every register correct, nothing
+ * moves" looks like.
+ *
+ * So this sweeps that register: sources 0..15 against a few dividers, with
+ * CTRL bit 28 going clear as the test. It is the last thing this file has to
+ * try. If it comes back empty the honest conclusion is that the backlight
+ * needs something outside the reachable address space, and the answer is
+ * ground truth from a running stock firmware rather than another guess.
  *
  * THE PROBE IS A WRITE AND A READ BACK, not a bare read: a register that
  * reads zero because it is dead and one that reads zero because it is idle
@@ -97,17 +108,19 @@ static sl6806_color_t band[240 * 8];
 static const uint8_t ramp[] = { 0, 20, 40, 60, 80, 100, 80, 60, 40, 20 };
 #define NRAMP ((int)(sizeof ramp))
 
-#define BL_CHAN   3
-#define NMODULES  128
-#define WINDOW    4
+#define BL_CHAN 3
 
-enum { ST_HUNT, ST_DRIVE, ST_DONE };
+/* Dividers worth trying: none, a couple of small ones, and a big one. */
+static const uint8_t divs[] = { 0, 1, 3, 7, 15, 63 };
+#define NDIVS ((int)(sizeof divs / sizeof divs[0]))
 
-static uint8_t  state = ST_HUNT;
-static unsigned next_id;
-static int      found = -1;
-static int      step;
-static bool     white;
+enum { ST_SWEEP, ST_DRIVE, ST_DONE };
+
+static uint8_t state = ST_SWEEP;
+static int     di;                 /* index into divs[] */
+static int     found_src = -1, found_div = -1;
+static int     step;
+static bool    white;
 
 static bool busy(void)
 {
@@ -123,7 +136,6 @@ static void show(const char *what, uint32_t addr)
     Serial.println(sl6806_mmio_read(addr), HEX);
 }
 
-/* Program channel 3 the way 0x00D99C34 and 0x00D102F4 do. */
 static void configure(void)
 {
     uint32_t base = SL6806_PWM_CHAN(BL_CHAN);
@@ -142,39 +154,40 @@ static void configure(void)
 
     show("ctrl", base + SL6806_PWM_CTRL);
     show("p/d ", base + SL6806_PWM_PERIOD_DUTY);
+    show("pair", SL6806_PWM_PAIR(BL_CHAN));
 }
 
-/* One window of ids per loop() call. Same pacing as examples/Buttons, and for
- * the same two reasons: the USB handler must get control back, and each line
- * has to reach the host before the next id is tried, because the console is a
- * ring in this device's RAM read over the link that would die. */
-static int hunt_step(void)
+/* One divider's worth of sources per loop() call. */
+static int sweep_step(void)
 {
-    unsigned end = next_id + WINDOW, id;
+    uint32_t reg = SL6806_PWM_PAIR(BL_CHAN);
+    unsigned src;
 
-    if (next_id >= NMODULES)
+    if (di >= NDIVS)
         return -1;
-    if (end > NMODULES)
-        end = NMODULES;
 
-    Serial.print("  ids ");
-    Serial.print(next_id);
-    Serial.print("..");
-    Serial.print(end - 1);
-    Serial.print(": ");
+    Serial.print("  div ");
+    Serial.print(divs[di]);
+    Serial.print(", src 0..15: ");
 
-    for (id = next_id; id < end; id++) {
-        sl6806_module_enable(id);
+    for (src = 0; src < 16; src++) {
+        sl6806_mmio_write(reg, SL6806_PWM_PAIR_VALUE(src, divs[di]));
+        delayMicroseconds(300);
         if (!busy()) {
-            Serial.print("id ");
-            Serial.print(id);
+            Serial.print("src ");
+            Serial.print(src);
             Serial.println(" CLEARED BUSY - the counter runs");
-            next_id = NMODULES;
+            found_src = (int)src;
+            found_div = divs[di];
+            di = NDIVS;
             return 1;
         }
     }
-    Serial.println("still busy");
-    next_id = end;
+    Serial.print("still busy (pair reads 0x");
+    Serial.print(sl6806_mmio_read(reg), HEX);
+    Serial.println(")");
+    sl6806_mmio_write(reg, 0);
+    di++;
     return 0;
 }
 
@@ -182,12 +195,11 @@ void setup()
 {
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 backlight: the module walk, again ===");
+    Serial.println("=== SL6806 backlight: the counter's clock source ===");
 
-    /* Module 68 is what makes the registers answer - already known. */
     Serial.print("module ");
     Serial.print(SL6806_PWM_MODULE_ID);
-    Serial.print(" (registers) -> ack ");
+    Serial.print(" -> ack ");
     Serial.println(sl6806_module_enable(SL6806_PWM_MODULE_ID) ? "yes" : "no");
 
     configure();
@@ -195,12 +207,11 @@ void setup()
     Serial.println(busy() ? "STUCK (counter stopped)" : "clear (counter runs)");
 
     if (!busy()) {
-        Serial.println("Already running - skipping the walk.");
+        Serial.println("Already running - skipping the sweep.");
         state = ST_DRIVE;
-        next_id = NMODULES;
+        di = NDIVS;
     } else {
-        Serial.println("Walking module ids 0..127 for the counter clock.");
-        Serial.println("If the log stops, the last range printed is where.");
+        Serial.println("Sweeping the pair clock register 0x40084014.");
     }
 
     if (!Screen.begin(band, 240, 8))
@@ -217,18 +228,18 @@ void loop()
     if (state == ST_DONE)
         return;
 
-    if (state == ST_HUNT) {
-        int r = hunt_step();
+    if (state == ST_SWEEP) {
+        int r = sweep_step();
 
         if (r == 1) {
-            found = 1;
             state = ST_DRIVE;
             step = 0;
         } else if (r == -1) {
             Serial.println();
-            Serial.println("=== no module id started the counter ===");
-            Serial.println("Every id, in the ROM's own order, with the ack");
-            Serial.println("waited for. That is a real negative now.");
+            Serial.println("=== no clock source started the counter ===");
+            Serial.println("Module ids exhausted, gate correct, pad correct,");
+            Serial.println("registers correct, clock select swept. The next");
+            Serial.println("move is ground truth, not another guess.");
             state = ST_DONE;
         }
         return;
@@ -239,8 +250,15 @@ void loop()
 
     if (step >= NRAMP) {
         Serial.println();
-        Serial.println(found > 0 ? "=== done; counter started ==="
-                                 : "=== done ===");
+        if (found_src >= 0) {
+            Serial.print("=== counter runs with src ");
+            Serial.print(found_src);
+            Serial.print(", div ");
+            Serial.print(found_div);
+            Serial.println(" ===");
+        } else {
+            Serial.println("=== done ===");
+        }
         state = ST_DONE;
         return;
     }

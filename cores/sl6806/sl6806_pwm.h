@@ -164,8 +164,21 @@
  * read so far touches it after init. */
 #define SL6806_PWM_GLOBAL       (SL6806_PWM_BASE + 0x00u)
 
-/* [V] One register per channel *pair*, 0x40084010 + (ch >> 1) * 4. [?] Role. */
+/*
+ * [V] One register per channel *pair*, 0x40084010 + (ch >> 1) * 4.
+ *
+ * 0x00811EC0 writes it as `src | (div << 8)`, reached through the thunk at
+ * 0x00811D50 which indexes the pair table rather than the channel table. That
+ * is the shape of a counter clock select, and it is the one register on this
+ * block that nothing in flash or in the SRAM blob ever writes - it reads 0 on
+ * a cold chip and stays 0.
+ *
+ * [I] Which makes it the standing explanation for a channel that is correctly
+ * programmed, correctly gated, and whose counter never moves: a counter with
+ * no source. Nothing has confirmed that.
+ */
 #define SL6806_PWM_PAIR(ch)     (SL6806_PWM_BASE + 0x10u + ((ch) >> 1) * 4u)
+#define SL6806_PWM_PAIR_VALUE(src, div) ((uint32_t)(src) | ((uint32_t)(div) << 8))
 
 /* [V] Per-channel register block, 0x20 apart starting at +0x20. */
 #define SL6806_PWM_CHAN(ch)     (SL6806_PWM_BASE + 0x20u + (uint32_t)(ch) * 0x20u)

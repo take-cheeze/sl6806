@@ -1214,8 +1214,22 @@ explanation for both a stalled counter and a permanently dead `0x400E0000`.
 > unconditionally**, and print a before/after readback, or a stale device looks
 > like a negative result.
 
-**REOPENED — the gate we found is module id 68, and the walk that freed the
-keys has not been tried here.** §15b's `module_clock_enable` says ids 64–95
+**The module walk was run properly and came back empty — a real negative.**
+All 128 ids, in the mask ROM's order, with the acknowledgement waited for:
+CTRL bit 28 never cleared. So the counter does not want a second module clock,
+and this is the first negative in this section that was reached with the right
+method rather than the wrong one.
+
+What remains untried is the **pair clock register**, `0x40084010 + (ch>>1)*4`.
+`0x00811EC0` writes it as `src | (div << 8)` — the shape of a counter clock
+select — and nothing in flash or in the SRAM blob ever writes it. It reads 0 on
+a cold chip and stays 0, and a counter with no source is exactly what "every
+register correct, nothing moves" looks like. `examples/Backlight` sweeps it.
+
+Also checked and eliminated: FIRM's `HAL_timer_*` is at `0x40099000`, a
+different block, so the PWM is not the timer and its clock is not the timer's.
+
+**Background — the gate is module id 68.** §15b's `module_clock_enable` says ids 64–95
 gate through CRU `+0x68` with `+0x78` as the shadow, so "bit 4 of `0x68`" is
 module 68. The sweep that found it wrote both registers at once, which happens
 to be survivable for this peripheral and is not in general — the ADC's correct
