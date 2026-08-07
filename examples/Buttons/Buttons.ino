@@ -72,6 +72,68 @@
 
 #define NWORDS 16                   /* 0x40096000..0x4009603F */
 
+/*
+ * CRU registers that hold gate-shaped values in a cold chip. 0x60..0x78 are
+ * the pairs the backlight hunt used; the rest were found by dumping the whole
+ * CRU and are new. Sweeping is how the PWM's gate turned up (14a), and it is
+ * cheaper than reasoning about a block with no datasheet.
+ */
+#define CRU_BASE 0x40080000u
+static const uint16_t cru_gates[] = {
+    0x60, 0x64, 0x68, 0x70, 0x74, 0x78,
+    0xA0, 0xB0, 0xDC, 0xEC, 0xFC,
+};
+#define NCRU ((int)(sizeof cru_gates / sizeof cru_gates[0]))
+
+/*
+ * Does the ADC take a write? +0x04 is the config register the vendor's init
+ * writes; it reads 0x800 in a cold chip. A bare read cannot tell a gated
+ * block from an idle one - that mistake cost three runs on the PWM - so this
+ * writes and reads back, then puts it right again.
+ */
+static bool adc_writable(void)
+{
+    uint32_t reg = ADC_BASE + ADC_CFG;
+    uint32_t saved = sl6806_mmio_read(reg);
+    bool ok;
+
+    sl6806_mmio_write(reg, 0x0002A800u);
+    ok = (sl6806_mmio_read(reg) == 0x0002A800u);
+    sl6806_mmio_write(reg, saved);
+    return ok;
+}
+
+/* Set each bit of each candidate in turn; restore unless it worked. */
+static int hunt_adc_gate(void)
+{
+    int i, bit;
+
+    for (i = 0; i < NCRU; i++) {
+        uint32_t r = CRU_BASE + cru_gates[i];
+        uint32_t base = sl6806_mmio_read(r);
+
+        Serial.print("  +0x");
+        Serial.print(cru_gates[i], HEX);
+        Serial.print(" = 0x");
+        Serial.println(base, HEX);
+
+        for (bit = 0; bit < 32; bit++) {
+            if (base & (1u << bit))
+                continue;
+            sl6806_mmio_write(r, base | (1u << bit));
+            delayMicroseconds(200);
+            if (adc_writable()) {
+                Serial.print("    bit ");
+                Serial.print(bit);
+                Serial.println(" OPENS THE ADC - left on");
+                return 1;
+            }
+            sl6806_mmio_write(r, base);
+        }
+    }
+    return 0;
+}
+
 static uint32_t last[NWORDS];
 static bool     have_last;
 
@@ -120,10 +182,21 @@ void setup()
     Serial.print(" (bank 1 pin 9 fn 15, analog) -> ");
     Serial.println(sl6806_pad_configure(ADC_KEY_PAD) == 0 ? "ok" : "REFUSED");
 
-    dump("before init:");
+    dump("before:");
+    if (adc_writable()) {
+        Serial.println("ADC already accepts writes.");
+    } else {
+        Serial.println("ADC ignores writes - hunting a CRU gate:");
+        if (!hunt_adc_gate()) {
+            Serial.println("  nothing opened it. The ADC is readable but not");
+            Serial.println("  writable, same shape as the PWM in 14a.");
+        }
+    }
     adc_init();
     delay(10);
-    dump("after  init:");
+    dump("after: ");
+    Serial.print("writable now: ");
+    Serial.println(adc_writable() ? "yes" : "no");
 
     Serial.println();
     Serial.println("Words are 0x40096000 +0,4,8,... Press and HOLD a button;");

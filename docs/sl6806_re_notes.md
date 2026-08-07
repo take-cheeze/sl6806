@@ -1037,6 +1037,53 @@ Both have now been followed through — **§14 has the registers.** The second
 lead was half wrong: the backlight is a PWM peripheral, just not the one §7c
 found, and not at `0x40009000`.
 
+## 13f. What state a payload actually starts in
+
+Measured from the host in bootloader mode on a cold chip (2026-08-07). Read
+this before assuming any peripheral is available: **almost nothing is.**
+
+CRU at `0x40080000`, every non-zero register:
+
+| Off | Value | Reading |
+|---|---|---|
+| `+0x000` | `0xD0010802` | core PLL, **locked** (bit 28) |
+| `+0x008` | `0x00000801` | CPU PLL, **stopped** — §12.6 |
+| `+0x010` | `0x02103AB4` | |
+| `+0x018` | `0x02206060` | |
+| `+0x01C` | `0x00010000` | |
+| `+0x030` | `0x00000070` | |
+| `+0x040` | `0x00000009` | divider A (§`sl6806_cru.h`) |
+| `+0x048` | `0x00000051` | divider B |
+| `+0x060`/`+0x070` | `0x00000002` | |
+| `+0x064`/`+0x074` | `0x00000008` | module gates. **Only bit 3.** The LCDC's bit 15 is *off* until something calls `Screen.begin()` |
+| `+0x068`/`+0x078` | `0x01000160` | more gates; bit 4 here is the PWM (§14a) |
+| `+0x0A0` | `0x00000101` | gate-shaped, **unexamined** |
+| `+0x0B0`, `+0x0DC`, `+0x0FC` | `0x00000001` | gate-shaped, **unexamined** |
+| `+0x0EC` | `0x00000700` | gate-shaped, **unexamined** |
+| `+0x100` | `0x00001701` | |
+| `+0x108` | `0x007C7C00` | |
+| `+0x10C` | `0` | the LCD module clock, until the LCD driver sets `0x911` |
+| `+0x11C` | `0` | the clock enable §14a writes `0x31` to |
+
+Power domains at `0x40000070` read `0x03FF03FF` — all ten requested and all
+ten acknowledged — so `0x00D9A7AC`'s handshake is already done. That is the
+one thing that *is* set up for you.
+
+> ⚠ **Do not assume state survives between runs.** It sometimes does — a
+> payload upload does not by itself reset the clock tree, and one run saw the
+> PWM still gated and configured from the previous one. But a replug (which is
+> how you get back into bootloader mode) resets everything, and the table above
+> is what you get afterwards. Treat every run as cold, write every step
+> unconditionally, and print a before/after readback. A stale chip and a
+> negative result look identical otherwise, and one run was lost to exactly
+> that.
+
+**The consequence worth internalising:** a peripheral that reads as zeros is
+gated, and a peripheral that reads structured values but ignores writes is
+*also* gated — `0x40096000` (the ADC) does the second. The only reliable test
+is write-then-read-back. Three runs of the backlight hunt were spent reading
+correct-looking values as though they meant the block was working.
+
 ## 14. The PWM (backlight) and the DMA, both found
 
 Two blocks that no previous scan located, because neither is addressed as
