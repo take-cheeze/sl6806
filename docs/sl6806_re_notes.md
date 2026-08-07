@@ -1336,7 +1336,40 @@ Given the firmware also has `pwm_is_jack_exist` and `pwm_is_sd_exist`, these
 two are most likely detects rather than user keys — **untested**, and cheap to
 test by inserting a jack or an SD card and watching `examples/Buttons`.
 
-**MEASURED, NEGATIVE — the ADC is readable but not writable.** It reads
+### RESOLVED — the keys read, and here is the whole recipe
+
+Working on hardware 2026-08-07. In order:
+
+1. **Enable module id 84** the way the mask ROM's `module_clock_enable`
+   (`0x00001C5C`) does — CRU `+0x78` (shadow) first, then `+0x68` (gate), bit
+   20, then poll `+0x68` until the bit reads back. Order matters; see §15b.
+2. **Mux the pad**: `0x00014F80` — bank 1 pin 9, function 15 (analog).
+3. **`adc_init`**, transcribed from `0x00D994EC`: `+0x10`, `+0x18`, `+0x0C` ← 0,
+   `+0x04` ← `0x0002A800`, `+0x00` ← `0x80180000`.
+4. **Enable the channel**, which `adc_init` has just switched off and which
+   nothing else turns back on: `+0x00 |= (1 << ch)` (`0x00D994BC`) and
+   `+0x0C |= (1 << ch)` (`0x00D9948C`).
+5. **Read the result** at `+0x24` for channel 0 — i.e. `+0x04` inside the
+   channel block at `+0x20 + ch*0x10`.
+
+Measured plateaus, jittering about 5 LSB:
+
+| ADC | Meaning |
+|---|---|
+| ~`0xFE9`–`0xFEE` | nothing pressed |
+| ~`0xD54`–`0xD5B` | key `0x40` |
+| ~`0x1B`–`0x2C` | key `0x42` |
+
+**The vendor's map is a list of ascending thresholds, not exact values.**
+`0x0081C02C` holds `{0x0200, 0x42}` then `{0x0E60, 0x40}`, and all three
+measured plateaus land where "below `0x200` → `0x42`, below `0x0E60` → `0x40`,
+else nothing" predicts. `examples/Buttons` decodes it that way.
+
+Still open: which physical button is which. The ids are `0x40` and `0x42`;
+mapping those to volume up and down needs one press each with someone
+watching, or the key-id enum out of the scene framework.
+
+**Superseded — the ADC is readable but not writable.** It reads
 structured values in a cold chip (`+0x00 = 0x00100000`, `+0x04 = 0x00000800`,
 `+0x08 = 0x000001E0`, `0x10` in the first two channel words) and **ignores
 every write**: `adc_init` leaves the block byte-identical. It is not an alias

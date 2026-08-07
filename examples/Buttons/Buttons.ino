@@ -72,6 +72,21 @@
 #define ADC_CFG         0x04        /* [V] init writes 0x0002A800 */
 #define ADC_CHAN(ch)    (0x20u + (uint32_t)(ch) * 0x10u)   /* [V] 0x00D993A0 */
 
+/*
+ * [V, MEASURED] +0x04 within a channel block is the conversion result, so
+ * channel 0's is 0x40096024. Measured 2026-08-07, three clean plateaus:
+ *
+ *     ~0xFE9..0xFEE   idle          (jitters about 5 LSB)
+ *     ~0xD54..0xD5B   one button
+ *     ~0x1B ..0x2C    the other
+ *
+ * which decode against the vendor's map read as ascending thresholds:
+ * below 0x0200 is key 0x42, below 0x0E60 is key 0x40, anything higher is
+ * nothing pressed. The map is at 0x0081C02C in ascending order, and all three
+ * measured plateaus land where that predicts.
+ */
+#define ADC_RESULT(ch)  (ADC_CHAN(ch) + 0x04u)
+
 /* [V] kadc constructor 0x00D3DB50: channel 0 is pad 0x00014800, value 0x780. */
 #define ADC_KEY_PAD     (0x00014800u | 0x780u)
 #define ADC_KEY_CHAN    0
@@ -98,9 +113,22 @@
 #define NMODULES        128
 #define NWORDS          16            /* 0x40096000..0x4009603F */
 
-static uint32_t last[NWORDS];
-static bool     have_last;
 static int      last_gpio = -1;
+static int      last_key = -2;
+
+/*
+ * Which key, if any, a conversion means. Thresholds rather than equality: the
+ * reading jitters a few LSB and the vendor's own map is a list of bounds.
+ * Returns the key id, or -1 for nothing pressed.
+ */
+static int decode_key(uint32_t v)
+{
+    if (v < KEY_LEVEL_A)
+        return KEY_ID_A;
+    if (v < KEY_LEVEL_B)
+        return KEY_ID_B;
+    return -1;
+}
 
 /*
  * The two /dev/key_io pads. They do not move on a button press, but the
@@ -297,11 +325,11 @@ void setup()
 
 void loop()
 {
-    uint32_t now[NWORDS];
-    int i, changes = 0;
+    uint32_t raw;
+    int key;
 
-    /* Walk the module ids first, a window at a time, then settle into
-     * watching the block. */
+    /* Walk the module ids first if the known one did not take, then settle
+     * into reading. */
     if (next_id < NMODULES) {
         int r = hunt_step();
 
@@ -310,9 +338,6 @@ void loop()
             adc_init();
             adc_start(ADC_KEY_CHAN);
             dump("after: ");
-            Serial.print("writable now: ");
-            Serial.println(adc_writable() ? "yes" : "no");
-            Serial.println("Press and HOLD a button.");
         } else if (r == -1) {
             Serial.println("no module id opened it.");
         }
@@ -325,36 +350,26 @@ void loop()
         dump("after: ");
         Serial.print("chan0 enable bit set; +0x00 = 0x");
         Serial.println(sl6806_mmio_read(ADC_BASE + 0x00), HEX);
-        Serial.println("Press and HOLD a button. Jack/SD also watched.");
-        return;
-    }
-
-    for (i = 0; i < NWORDS; i++)
-        now[i] = sl6806_mmio_read(ADC_BASE + (uint32_t)i * 4);
-
-    if (!have_last) {
-        for (i = 0; i < NWORDS; i++)
-            last[i] = now[i];
-        have_last = true;
-        return;
-    }
-
-    for (i = 0; i < NWORDS; i++) {
-        if (now[i] == last[i])
-            continue;
-        if (!changes++)
-            Serial.print("change:");
-        Serial.print(" +0x");
-        Serial.print(i * 4, HEX);
-        Serial.print(" 0x");
-        Serial.print(last[i], HEX);
-        Serial.print("->0x");
-        Serial.print(now[i], HEX);
-        last[i] = now[i];
-    }
-    if (changes) {
+        Serial.println();
+        Serial.println("Press and HOLD each button. Jack/SD also watched.");
         Serial.println();
         return;
+    }
+
+    raw = sl6806_mmio_read(ADC_BASE + ADC_RESULT(ADC_KEY_CHAN));
+    key = decode_key(raw);
+
+    if (key != last_key) {
+        if (key < 0) {
+            Serial.print("released           (adc 0x");
+        } else {
+            Serial.print("KEY 0x");
+            Serial.print(key, HEX);
+            Serial.print(" pressed      (adc 0x");
+        }
+        Serial.print(raw, HEX);
+        Serial.println(")");
+        last_key = key;
     }
 
     {
@@ -374,9 +389,12 @@ void loop()
     }
 
     if (Serial.read() >= 0) {
-        Serial.print("steady: chan0 = 0x");
-        Serial.print(sl6806_mmio_read(ADC_BASE + ADC_CHAN(ADC_KEY_CHAN)), HEX);
-        Serial.print("   +0x08 = 0x");
-        Serial.println(sl6806_mmio_read(ADC_BASE + 0x08), HEX);
+        Serial.print("idle: adc 0x");
+        Serial.print(raw, HEX);
+        Serial.print("  key ");
+        if (key < 0)
+            Serial.println("none");
+        else
+            Serial.println(key, HEX);
     }
 }
