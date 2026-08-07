@@ -1,0 +1,174 @@
+/*
+ * sl6806_pwm.h - the SL6806 PWM block at 0x40084000, and the backlight.
+ *
+ * =====================================================================
+ *  NOTHING HERE HAS BEEN SEEN TO WORK
+ * =====================================================================
+ * Every address and bit below was read out of the stock firmware and none of
+ * it has been confirmed against the hardware. The block reads as zeros in
+ * bootloader mode - but so does unmapped space, so that measurement cannot
+ * tell a clock-gated peripheral from an imaginary one. Treat a dark panel
+ * after using this as "no information", not as "the map is wrong".
+ *
+ * WHY THIS BLOCK
+ *
+ * docs/sl6806_re_notes.md 7b used to say the PWM registers were not
+ * recoverable, because the device-name strings had no code referencing them
+ * and the driver was SRAM-resident. Both halves of that turned out to be
+ * wrong: the SRAM-resident code is in the flash image after all (13), and the
+ * block's base appears exactly once, in 0x00D99C34:
+ *
+ *     r0 = 0x40084020 + (ch << 5)          ; the channel's registers
+ *     [0x0082B3F8 + (ch + 4) * 4] = r0     ; cached in a table
+ *     [0x0082B3F8] = 0x40084000
+ *
+ * Everything afterwards reaches a channel through that table, which is why no
+ * literal scan ever found it. The accessors that use the table are at
+ * 0x00811E48..0x00811EC0 and are where the bit assignments below come from.
+ *
+ * THE BACKLIGHT IS CHANNEL 3, and the numbers are the vendor's own.
+ * 0x00D102F4 clamps a percentage to 100 and asks for period 48000, duty
+ * percent * 480 - so 100% is duty == period. 0x00D10354 opens the channel
+ * with 48000/24000 and then immediately calls set_brightness(60), which is
+ * where the "default is 60%" in the notes comes from.
+ *
+ * WHAT IS STILL UNKNOWN. Which pad the channel comes out on. The driver's
+ * device record carries 0x00030000, which decodes as bank 3 pin 0, and 7g
+ * independently lists that pad as an output driven high - but the record's
+ * field order has not been read, so that is a guess. If the block turns out
+ * to be right and the panel still does not light, the pad mux is the next
+ * suspect, not this file.
+ *
+ * Provenance markers as elsewhere: [V] verified against the dump,
+ * [I] inferred, [?] unknown.
+ */
+#ifndef SL6806_PWM_H
+#define SL6806_PWM_H
+
+#include <stdint.h>
+#include "sl6806_mmio.h"
+
+/* ------------------------------------------------------------------ */
+/* Module gating                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * [V] A module enable register, one bit per module. 0x00D9A734(n) sets bit n
+ * and then delays 10 ms; 0x00D9A74C(n) clears it. 0x00D9A768(n) pulses bit n
+ * of +0x08 low for 10 ms as a reset.
+ *
+ * [V] PWM is bit 2: the PWM teardown at 0x00D99C14 calls 0x00D9A74C(2).
+ */
+#define SL6806_MODCTL_BASE      0x400E0000u
+#define SL6806_MODCTL_ENABLE    0x00       /* [V] 1 = module clocked        */
+#define SL6806_MODCTL_RESET     0x08       /* [V] 0 = held in reset         */
+#define SL6806_MODCTL_BIT_PWM   2          /* [V] from the teardown path    */
+
+/* ------------------------------------------------------------------ */
+/* The block                                                           */
+/* ------------------------------------------------------------------ */
+
+#define SL6806_PWM_BASE         0x40084000u
+#define SL6806_PWM_CHANNELS     6          /* [V] the driver loops 0..5     */
+
+/* [V] Written to the table as entry 0. Role unknown - nothing in the paths
+ * read so far touches it after init. */
+#define SL6806_PWM_GLOBAL       (SL6806_PWM_BASE + 0x00u)
+
+/* [V] One register per channel *pair*, 0x40084010 + (ch >> 1) * 4. [?] Role. */
+#define SL6806_PWM_PAIR(ch)     (SL6806_PWM_BASE + 0x10u + ((ch) >> 1) * 4u)
+
+/* [V] Per-channel register block, 0x20 apart starting at +0x20. */
+#define SL6806_PWM_CHAN(ch)     (SL6806_PWM_BASE + 0x20u + (uint32_t)(ch) * 0x20u)
+
+/*
+ * Channel registers, as offsets from SL6806_PWM_CHAN(ch).
+ */
+#define SL6806_PWM_CTRL         0x00
+#define SL6806_PWM_PERIOD_DUTY  0x04       /* [V] (period << 16) | duty     */
+#define SL6806_PWM_MODE         0x10
+#define SL6806_PWM_REG14        0x14       /* [V] (a << 16) | b   [?] role  */
+#define SL6806_PWM_REG18        0x18       /* [V] a plain word    [?] role  */
+#define SL6806_PWM_REG1C        0x1C       /* [V] (a << 16) | b   [?] role  */
+
+/* CTRL bits. */
+#define SL6806_PWM_CTRL_RUN     (1u << 4)  /* [V] 0x00811CE4 sets/clears it */
+#define SL6806_PWM_CTRL_UPDATE  (1u << 8)  /* [V] 0x00811D3C sets it,
+                                            *     0x00811D4C polls it clear */
+#define SL6806_PWM_CTRL_BUSY    (1u << 28) /* [V] 0x00811D2C polls it clear */
+#define SL6806_PWM_CTRL_INIT    0x40u      /* [V] written bare at init      */
+
+/* MODE bits, from 0x00811E9A and 0x00811CF4. */
+#define SL6806_PWM_MODE_ENABLE  (1u << 0)  /* [V] toggled on its own        */
+#define SL6806_PWM_MODE_SHIFT   1          /* [V] a 3-bit field at [3:1]    */
+
+/*
+ * [V] The control word the stock firmware builds for the backlight.
+ *
+ * 0x00D99C34 assembles it from four config bytes as
+ *   ((c0 & 1) << 4) | ((c1 & 1) << 7) | (c3 & 0x0F) | ((c2 & 1) << 5)
+ * and the backlight's open passes c0=3, c1=0, c2=1, c3=0x0F, giving 0x3F,
+ * which is OR'd on top of the bare 0x40. So CTRL ends up 0x7F: RUN set, the
+ * low nibble all ones, bit 5 and bit 6 set.
+ */
+#define SL6806_PWM_CTRL_BACKLIGHT  (SL6806_PWM_CTRL_INIT | 0x3Fu)
+
+/* [V] The vendor's period, and its duty for a given percentage. */
+#define SL6806_PWM_BL_PERIOD    48000u
+#define SL6806_PWM_BL_DUTY(pct) ((uint32_t)(pct) * 480u)
+
+/* ------------------------------------------------------------------ */
+/* The little that can be called a driver                              */
+/* ------------------------------------------------------------------ */
+
+/* Ungate the PWM block. The vendor waits 10 ms after this; the caller must,
+ * because this header has no delay of its own. */
+static inline void sl6806_pwm_module_enable(void)
+{
+    uint32_t r = sl6806_mmio_read(SL6806_MODCTL_BASE + SL6806_MODCTL_ENABLE);
+    sl6806_mmio_write(SL6806_MODCTL_BASE + SL6806_MODCTL_ENABLE,
+                      r | (1u << SL6806_MODCTL_BIT_PWM));
+}
+
+/*
+ * Set period and duty. The vendor's setter (0x00811D04) returns without
+ * writing anything when duty > period, so this does too - a silent clamp
+ * would hide a caller's arithmetic bug behind a screen that is merely dim.
+ * Returns 0 if it wrote, -1 if it refused.
+ */
+static inline int sl6806_pwm_set(unsigned ch, uint16_t period, uint16_t duty)
+{
+    uint32_t base;
+
+    if (ch >= SL6806_PWM_CHANNELS || duty > period)
+        return -1;
+
+    base = SL6806_PWM_CHAN(ch);
+    sl6806_mmio_write(base + SL6806_PWM_PERIOD_DUTY,
+                      ((uint32_t)period << 16) | duty);
+    return 0;
+}
+
+/* CTRL bit 4. */
+static inline void sl6806_pwm_run(unsigned ch, int on)
+{
+    uint32_t base = SL6806_PWM_CHAN(ch);
+    uint32_t r = sl6806_mmio_read(base + SL6806_PWM_CTRL);
+
+    sl6806_mmio_write(base + SL6806_PWM_CTRL,
+                      on ? (r | SL6806_PWM_CTRL_RUN)
+                         : (r & ~SL6806_PWM_CTRL_RUN));
+}
+
+/* MODE bit 0. */
+static inline void sl6806_pwm_enable(unsigned ch, int on)
+{
+    uint32_t base = SL6806_PWM_CHAN(ch);
+    uint32_t r = sl6806_mmio_read(base + SL6806_PWM_MODE);
+
+    sl6806_mmio_write(base + SL6806_PWM_MODE,
+                      on ? (r | SL6806_PWM_MODE_ENABLE)
+                         : (r & ~SL6806_PWM_MODE_ENABLE));
+}
+
+#endif /* SL6806_PWM_H */
