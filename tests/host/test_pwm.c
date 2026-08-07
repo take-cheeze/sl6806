@@ -126,6 +126,22 @@ int main(void)
      * caller's arithmetic bug shows up as no change instead of a dim panel. */
     CHECK(sl6806_pwm_set(3, 100, 200) == -1, "duty above period is refused");
 
+    /* The update trigger fires on every brightness change: without it the
+     * registers hold a new duty and the output keeps the old one. */
+    pwm[(chan - PWM) / 4] &= ~SL6806_PWM_CTRL_UPDATE;
+    sl6806_backlight_set(25);
+    CHECK(pwm[(chan - PWM) / 4] & SL6806_PWM_CTRL_UPDATE,
+          "brightness change sets the update bit");
+
+    /* Bring-up must survive a warm chip. CTRL carries read-only status, so a
+     * read-back equality test on it fails on every re-upload - which it did,
+     * and reported a working board as a refused module clock. */
+    pwm[(chan - PWM) / 4] |= SL6806_PWM_CTRL_BUSY;
+    CHECK(sl6806_backlight_begin(100) == 1,
+          "bring-up succeeds again with status bits set in CTRL");
+    CHECK(pwm[(pair - PWM) / 4] & SL6806_PWM_PAIR_CLK_EN,
+          "and the pair clock enable survives it");
+
     /* A block that never ungates must not report success. */
     reset_model();
     cru[6] = 0;                            /* shadow stays clear -> no gate */

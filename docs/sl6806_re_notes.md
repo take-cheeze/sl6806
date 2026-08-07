@@ -1257,10 +1257,27 @@ period and duty, so it means *something* — but it is not a busy flag, and
 nothing should test it.
 
 Driver in `cores/sl6806/sl6806_pwm.[ch]` (`sl6806_backlight_begin`,
-`sl6806_backlight_set`), 13 host tests in `tests/host/test_pwm.c` aimed
+`sl6806_backlight_set`), 16 host tests in `tests/host/test_pwm.c` aimed
 squarely at the pair-register write, because a reader checking this driver
 against the disassembly would find no vendor code for it and reasonably
 conclude it was spurious.
+
+**Two follow-ups from the first working run.**
+
+*Brightness did not change.* Period and duty land in the register and the
+output keeps the old value, which is a shadow register wanting a commit. The
+vendor exposes exactly that: `0x00811E62` sets **CTRL bit 8** and `0x00811E6C`
+polls it clear. `sl6806_backlight_set` now pulses it after every write.
+**Unconfirmed** — the symptom fits and the accessors exist, but it has not been
+seen to dim yet.
+
+*Bring-up failed on the second upload* with "the module clock refused", on a
+board that was visibly working. That was a bug in the driver, not the chip:
+it wrote `CTRL = 0x40` and compared the read-back for equality, and CTRL
+carries read-only status (bit 28 among them), so on a warm chip it read
+`0x10000040` and the check failed. It now probes period/duty, which has no
+status bits. **Any writable test on this chip has to pick a register that is
+purely writable** — the same trap in a different costume.
 
 ### Superseded — the state before the panel lit
 

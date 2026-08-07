@@ -75,6 +75,11 @@ void loop()
     sl6806_backlight_set(ramp[step]);
     Serial.print("  brightness ");
     Serial.print(ramp[step]);
-    Serial.println("%");
+    Serial.print("%   p/d 0x");
+    Serial.print(sl6806_mmio_read(SL6806_PWM_CHAN(3)
+                                  + SL6806_PWM_PERIOD_DUTY), HEX);
+    Serial.print("  ctrl 0x");
+    Serial.println(sl6806_mmio_read(SL6806_PWM_CHAN(3)
+                                    + SL6806_PWM_CTRL), HEX);
     step = (step + 1) % NRAMP;
 }
