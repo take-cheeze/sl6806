@@ -95,7 +95,7 @@ static const gatepair_t gates[] = {
 };
 #define NGATES ((int)(sizeof gates / sizeof gates[0]))
 
-enum { ST_PLL, ST_SWEEP, ST_DRIVE, ST_DONE };
+enum { ST_PLL, ST_SWEEP, ST_FCLK, ST_DRIVE, ST_DONE };
 
 static uint8_t state = ST_PLL;
 static int     gi;             /* index into gates[]          */
@@ -187,6 +187,61 @@ static void show_busy(unsigned ch)
     Serial.print(c, HEX);
     Serial.println((c & SL6806_PWM_CTRL_BUSY) ? "  busy STUCK (no counter clock)"
                                               : "  busy clear (counter runs)");
+}
+
+/*
+ * Hunt a second gate bit: the one that starts the counter.
+ *
+ * The first sweep found bit 4 of 0x68/0x78 and stopped there, and it tested
+ * bits one at a time, restoring after each. So a peripheral that needs two
+ * bits - a register clock and a functional clock, which is an ordinary way to
+ * build one - would have been invisible to it: bit 4 alone makes the
+ * registers answer, and nothing tried bit 4 *plus* anything else.
+ *
+ * This holds bit 4 set and tries every other bit of all three pairs on top of
+ * it. The success test is CTRL bit 28 going clear, which needs no one
+ * watching a panel and cannot be misread.
+ *
+ * Returns 1 if something cleared it. Leaves a winning bit set; restores
+ * everything else.
+ */
+static int hunt_fclk(void)
+{
+    int gj, bit;
+
+    for (gj = 0; gj < NGATES; gj++) {
+        uint32_t ra = SL6806_CRU_BASE + gates[gj].a;
+        uint32_t rb = SL6806_CRU_BASE + gates[gj].b;
+        uint32_t base_a = sl6806_mmio_read(ra);
+        uint32_t base_b = sl6806_mmio_read(rb);
+
+        Serial.print("  ");
+        Serial.print(gates[gj].what);
+        Serial.print(" = 0x");
+        Serial.println(base_a, HEX);
+
+        for (bit = 0; bit < 32; bit++) {
+            if (base_a & (1u << bit))
+                continue;
+
+            sl6806_mmio_write(ra, base_a | (1u << bit));
+            sl6806_mmio_write(rb, base_b | (1u << bit));
+            delayMicroseconds(200);
+
+            if (!(sl6806_mmio_read(SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL)
+                  & SL6806_PWM_CTRL_BUSY)) {
+                Serial.print("    bit ");
+                Serial.print(bit);
+                Serial.println(" CLEARED BUSY - the counter is running");
+                return 1;
+            }
+
+            sl6806_mmio_write(ra, base_a);
+            sl6806_mmio_write(rb, base_b);
+        }
+    }
+    Serial.println("  nothing cleared busy");
+    return 0;
 }
 
 /*
@@ -349,7 +404,7 @@ void loop()
         if (pwm_responds()) {
             Serial.println("  PWM answers.");
             Serial.println();
-            state = ST_DRIVE;
+            state = ST_FCLK;
             step = 0;
             configure(BL_CHAN);
             return;
@@ -368,7 +423,7 @@ void loop()
             hit_bit = bit;
             Serial.println();
             step = 0;
-            state = ST_DRIVE;
+            state = ST_FCLK;
             configure(BL_CHAN);
             return;
         }
@@ -384,6 +439,19 @@ void loop()
         }
         return;
     }
+
+    case ST_FCLK:
+        if (sl6806_mmio_read(SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL)
+            & SL6806_PWM_CTRL_BUSY) {
+            Serial.println("busy is stuck; hunting a second gate bit for the");
+            Serial.println("counter clock, on top of the one already set:");
+            hunt_fclk();
+        }
+        show_busy(BL_CHAN);
+        Serial.println();
+        state = ST_DRIVE;
+        step = 0;
+        return;
 
     case ST_DRIVE:
         if (step >= NRAMP) {
