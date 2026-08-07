@@ -103,6 +103,61 @@ static bool adc_writable(void)
     return ok;
 }
 
+/*
+ * The other register class, and the one every sweep so far has missed.
+ *
+ * The LCDC needs two things to work from a payload, not one: a gate bit
+ * (0x64/0x74 bit 15) *and* a module clock at 0x4008010C, which its driver
+ * sets to 0x911. 0x00D44690 shows the shape of those registers plainly -
+ * it builds [7:4] from one argument and [11:8] from another, stores, then
+ * ORs in bit 0:
+ *
+ *     bit 0 = enable,  [7:4] = source,  [11:8] = divider
+ *
+ * and 0x4008011C's 0x31 fits it too: enabled, source 3. In a cold chip
+ * +0x104 and +0x110..+0x13C all read 0, which under that reading is a row of
+ * *disabled module clocks*. A gate without a module clock is exactly what
+ * the PWM looked like in 14a - registers writable, counter stopped - so this
+ * is the likeliest thing wrong with both peripherals.
+ */
+#define CRU_MODCLK_LO 0x100
+#define CRU_MODCLK_HI 0x13C
+
+static int hunt_module_clock(void)
+{
+    /* Enable, with each plausible source, then a couple with a divider. */
+    static const uint32_t vals[] = {
+        0x001, 0x011, 0x021, 0x031, 0x041, 0x051, 0x061, 0x071,
+        0x111, 0x911,
+    };
+    const int nvals = (int)(sizeof vals / sizeof vals[0]);
+    uint16_t off;
+    int v;
+
+    for (off = CRU_MODCLK_LO; off <= CRU_MODCLK_HI; off += 4) {
+        uint32_t r = CRU_BASE + off;
+        uint32_t base = sl6806_mmio_read(r);
+
+        if (base & 1u)
+            continue;                 /* already enabled; leave it alone */
+
+        for (v = 0; v < nvals; v++) {
+            sl6806_mmio_write(r, vals[v]);
+            delayMicroseconds(200);
+            if (adc_writable()) {
+                Serial.print("    +0x");
+                Serial.print(off, HEX);
+                Serial.print(" <- 0x");
+                Serial.print(vals[v], HEX);
+                Serial.println(" OPENS THE ADC - left on");
+                return 1;
+            }
+        }
+        sl6806_mmio_write(r, base);
+    }
+    return 0;
+}
+
 /* Set each bit of each candidate in turn; restore unless it worked. */
 static int hunt_adc_gate(void)
 {
@@ -188,8 +243,12 @@ void setup()
     } else {
         Serial.println("ADC ignores writes - hunting a CRU gate:");
         if (!hunt_adc_gate()) {
-            Serial.println("  nothing opened it. The ADC is readable but not");
-            Serial.println("  writable, same shape as the PWM in 14a.");
+            Serial.println("  no gate bit did it; trying module clocks");
+            Serial.println("  (CRU +0x100..+0x13C, bit 0 = enable):");
+            if (!hunt_module_clock()) {
+                Serial.println("  nothing opened it. The ADC is readable but");
+                Serial.println("  not writable, same shape as the PWM in 14a.");
+            }
         }
     }
     adc_init();
