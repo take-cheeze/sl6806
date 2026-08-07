@@ -1229,7 +1229,40 @@ not the eight-bit field `div << 8` in `0x00811EC0` implied.
 Also checked and eliminated: FIRM's `HAL_timer_*` is at `0x40099000`, a
 different block, so the PWM is not the timer and its clock is not the timer's.
 
-### REOPENED — the panel lit during the sweep, and CTRL bit 28 is not a busy flag
+### RESOLVED — the backlight works. The missing bit was `0x40084014` bit 8
+
+Verified on hardware 2026-08-07, after twelve runs that were not. The recipe:
+
+1. `sl6806_module_enable(68)` — CRU `+0x78` shadow, then `+0x68` gate, bit 4,
+   then poll the gate. Order matters (§15b).
+2. Mux the pad `0x00010200` — bank 1 pin 0, function 4.
+3. `CTRL` ← `0x40`, then OR `0x3F`.
+4. Period and duty: `(48000 << 16) | percent * 480`.
+5. `MODE` bit 0.
+6. **`0x40084010 + (ch>>1)*4` bit 8** — the pair's clock enable.
+
+Step 6 is the whole story. **Nothing in flash or in the SRAM blob ever writes
+that register**, so no amount of reading the vendor's code could have produced
+it; it was found by holding each of the 32 settings the register accepts and
+watching the panel. The light came on at `0x100` and stayed on through `0x10F`,
+so bits `[3:0]` — what `0x00811EC0` assembles as a source select — make no
+difference to whether it runs. The writable mask is `0x10F`, so the "divider"
+implied by `div << 8` is that single enable bit.
+
+**The instrument was the problem, not the map.** CTRL bit 28 stays set while
+the backlight runs perfectly. Three separate "the counter never starts"
+conclusions in this section came from using it as a success test, including one
+that closed the investigation. `0x00811E74` does spin on it before writing
+period and duty, so it means *something* — but it is not a busy flag, and
+nothing should test it.
+
+Driver in `cores/sl6806/sl6806_pwm.[ch]` (`sl6806_backlight_begin`,
+`sl6806_backlight_set`), 13 host tests in `tests/host/test_pwm.c` aimed
+squarely at the pair-register write, because a reader checking this driver
+against the disassembly would find no vendor code for it and reasonably
+conclude it was spurious.
+
+### Superseded — the state before the panel lit
 
 **The backlight came on**, blinking, while the pair-register sweep ran, and
 went dark for good once it finished (2026-08-07). First light out of this board

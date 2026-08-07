@@ -1,45 +1,38 @@
 /*
- * sl6806_pwm.h - the SL6806 PWM block at 0x40084000, and the backlight.
+ * sl6806_pwm.h - the SL6806 PWM at 0x40084000, and the panel backlight.
  *
  * =====================================================================
- *  NOTHING HERE HAS BEEN SEEN TO WORK
+ *  THIS WORKS. THE PANEL LIGHTS.
  * =====================================================================
- * Every address and bit below was read out of the stock firmware and none of
- * it has been confirmed against the hardware. The block reads as zeros in
- * bootloader mode - but so does unmapped space, so that measurement cannot
- * tell a clock-gated peripheral from an imaginary one. Treat a dark panel
- * after using this as "no information", not as "the map is wrong".
+ * Verified on a P20 Player, 2026-08-07, after twelve hardware runs that did
+ * not. Everything below is measured unless marked otherwise.
  *
- * WHY THIS BLOCK
+ * THE RECIPE, in order, because every step of it cost something:
  *
- * docs/sl6806_re_notes.md 7b used to say the PWM registers were not
- * recoverable, because the device-name strings had no code referencing them
- * and the driver was SRAM-resident. Both halves of that turned out to be
- * wrong: the SRAM-resident code is in the flash image after all (13), and the
- * block's base appears exactly once, in 0x00D99C34:
+ *   1. sl6806_module_enable(SL6806_PWM_MODULE_ID) - module 68. The order of
+ *      the two gate writes matters; see sl6806_module.h.
+ *   2. Mux the pad: SL6806_PWM_BL_PAD, bank 1 pin 0 on function 4.
+ *   3. CTRL <- 0x40, then OR in 0x3F.
+ *   4. Period and duty: (period << 16) | duty, period 48000.
+ *   5. MODE bit 0.
+ *   6. THE PAIR CLOCK ENABLE - bit 8 of 0x40084010 + (ch >> 1) * 4. This is
+ *      the one that was missing, and nothing in flash or in the SRAM blob
+ *      ever writes it, so no amount of reading the vendor's code would have
+ *      produced it. It was found by holding each of the register's 32
+ *      reachable settings in turn and watching the panel.
  *
- *     r0 = 0x40084020 + (ch << 5)          ; the channel's registers
- *     [0x0082B3F8 + (ch + 4) * 4] = r0     ; cached in a table
- *     [0x0082B3F8] = 0x40084000
+ * TWO THINGS THAT WILL MISLEAD YOU, both of which did:
  *
- * Everything afterwards reaches a channel through that table, which is why no
- * literal scan ever found it. The accessors that use the table are at
- * 0x00811E48..0x00811EC0 and are where the bit assignments below come from.
+ *   CTRL bit 28 is NOT a busy or "counter stopped" flag. It is set while the
+ *   backlight is running perfectly well. 0x00811E74 does spin on it before
+ *   writing period and duty, so it means something - but using it as a
+ *   success test produces confident, wrong negatives, and produced several.
  *
- * THE BACKLIGHT IS CHANNEL 3, and the numbers are the vendor's own.
- * 0x00D102F4 clamps a percentage to 100 and asks for period 48000, duty
- * percent * 480 - so 100% is duty == period. 0x00D10354 opens the channel
- * with 48000/24000 and then immediately calls set_brightness(60), which is
- * where the "default is 60%" in the notes comes from.
+ *   The block reads as zeros before its module clock is enabled and silently
+ *   drops writes, so a bare read cannot tell "gated" from "idle". Test with a
+ *   write and a read back.
  *
- * WHAT IS STILL UNKNOWN. Which pad the channel comes out on. The driver's
- * device record carries 0x00030000, which decodes as bank 3 pin 0, and 7g
- * independently lists that pad as an output driven high - but the record's
- * field order has not been read, so that is a guess. If the block turns out
- * to be right and the panel still does not light, the pad mux is the next
- * suspect, not this file.
- *
- * Provenance markers as elsewhere: [V] verified against the dump,
+ * Provenance: [V] verified against the dump, [M] measured on hardware,
  * [I] inferred, [?] unknown.
  */
 #ifndef SL6806_PWM_H
@@ -167,22 +160,22 @@
 /*
  * [V] One register per channel *pair*, 0x40084010 + (ch >> 1) * 4.
  *
- * 0x00811EC0 writes it as `src | (div << 8)`, reached through the thunk at
- * 0x00811D50 which indexes the pair table rather than the channel table. That
- * is the shape of a counter clock select, and it is the one register on this
- * block that nothing in flash or in the SRAM blob ever writes - it reads 0 on
- * a cold chip and stays 0.
+ * [M] Bit 8 is the pair's CLOCK ENABLE, and without it the channel is
+ * configured, gated, muxed and completely dead. Measured by holding each of
+ * the 32 settings the register accepts: the panel lit at 0x100 and stayed lit
+ * through 0x10F, so bits [3:0] - what 0x00811EC0 assembles as a source
+ * select - make no difference to whether it runs.
  *
- * [M] SWEPT, AND IT IS NOT THE ANSWER. Sixteen sources against six dividers,
- * 2026-08-07: the counter stayed stopped throughout.
+ * [M] The writable mask is 0x10F. Writing 0x3F0F reads back 0x10F, so the
+ * "divider" implied by `div << 8` in 0x00811EC0 is a single bit, and that
+ * bit is this enable.
  *
- * [M] The sweep did measure the register's shape, which is worth keeping. It
- * only retains `0x10F`: writing `0x3F0F` reads back `0x10F`. So `src` is
- * [3:0] and the divider is a single bit at [8] - not the eight-bit field the
- * `div << 8` in 0x00811EC0 suggested.
+ * Nothing in flash or in the SRAM blob writes this register. It reads 0 on a
+ * cold chip and stays 0, which is why reading the vendor's code was never
+ * going to yield it.
  */
 #define SL6806_PWM_PAIR(ch)     (SL6806_PWM_BASE + 0x10u + ((ch) >> 1) * 4u)
-#define SL6806_PWM_PAIR_VALUE(src, div) ((uint32_t)(src) | ((uint32_t)(div) << 8))
+#define SL6806_PWM_PAIR_CLK_EN  (1u << 8)   /* [M] the missing bit */
 
 /* [V] Per-channel register block, 0x20 apart starting at +0x20. */
 #define SL6806_PWM_CHAN(ch)     (SL6806_PWM_BASE + 0x20u + (uint32_t)(ch) * 0x20u)
@@ -274,5 +267,27 @@ static inline void sl6806_pwm_enable(unsigned ch, int on)
                       on ? (r | SL6806_PWM_MODE_ENABLE)
                          : (r & ~SL6806_PWM_MODE_ENABLE));
 }
+
+/* ------------------------------------------------------------------ */
+/* The backlight                                                       */
+/* ------------------------------------------------------------------ */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * Bring the backlight up and set it to `percent`. Does the whole recipe at
+ * the top of this file. Returns 1 on success, 0 if the PWM's module clock
+ * refused to come up.
+ */
+int sl6806_backlight_begin(unsigned percent);
+
+/* Set brightness, 0..100. Clamped, exactly as 0x00D102F4 clamps it. */
+void sl6806_backlight_set(unsigned percent);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SL6806_PWM_H */

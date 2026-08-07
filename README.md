@@ -39,12 +39,12 @@ so it is worth being precise about which parts are real:
 | Flash image format (HLKJ, CRC16, partitions) | **Works.** Both CRCs verify and round-trip. |
 | Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM. |
 | Panel: geometry, vendor init sequence, windowing, sleep/wake | **Works.** Recovered from the firmware, 53 host-side tests. |
-| Getting those pixels onto the glass | **Written; does not work yet.** The panel is a QSPI display and the controller at `0x400D9000` has a driver, checked by 195 host-side tests against a model. On hardware it initialises cleanly, completes every transfer and produces no picture — cause still unknown. See [docs/LCD.md](docs/LCD.md) for what has been ruled out. |
+| Getting those pixels onto the glass | **Written; not yet seen.** The backlight now works, so a dark panel is finally a statement about the bus driver rather than about the lamp. **Untested since.** The panel is a QSPI display and the controller at `0x400D9000` has a driver, checked by 195 host-side tests against a model. On hardware it initialises cleanly, completes every transfer and produces no picture — cause still unknown. See [docs/LCD.md](docs/LCD.md) for what has been ruled out. |
 | `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | Keys — the two volume buttons | **Works.** They are an ADC resistor ladder, not GPIO; driver in [`cores/sl6806/sl6806_adc.c`](cores/sl6806/sl6806_adc.c), board map in the variant, 97 host tests. Verified on hardware. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
-| Backlight | **Lit, briefly, and being pinned down.** The PWM is at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, all verified. Sweeping the counter's clock select made the panel blink, so the hardware path works; which setting did it is what `examples/Backlight` is now finding. See §14a. |
+| Backlight | **Works.** `sl6806_backlight_begin(100)`. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
