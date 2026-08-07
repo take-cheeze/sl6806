@@ -12,6 +12,8 @@ This module is that plumbing, shared so the monitor and the calibrator cannot
 drift apart in how they reach the device.
 """
 
+import atexit
+import errno
 import os
 import shutil
 import subprocess
@@ -38,6 +40,40 @@ def _why(r):
         if lines:
             return lines[-1]
     return "exit status %d, no output" % r.returncode
+
+
+LOCK_PATH = "/tmp/.sl6806-device.lock"
+
+
+def take_lock():
+    """Refuse to run if another tool already owns the device.
+
+    Two processes talking to this device at once desynchronises its USB
+    endpoint, and the device then drops off the bus entirely and needs a
+    physical replug. That is a bad enough outcome - and easy enough to cause
+    by leaving a monitor running in another window - to be worth a lock file
+    rather than a warning in the docs.
+    """
+    try:
+        fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+        try:
+            with open(LOCK_PATH) as f:
+                owner = f.read().strip()
+            pid = int(owner.split()[0])
+            os.kill(pid, 0)          # still alive?
+        except Exception:
+            os.unlink(LOCK_PATH)     # stale; take it
+            return take_lock()
+        sys.exit("error: another SL6806 tool already has the device (%s).\n"
+                 "       Two at once wedges it off the bus. Stop that one, or\n"
+                 "       remove %s if it is stale." % (owner, LOCK_PATH))
+
+    os.write(fd, ("%d %s" % (os.getpid(), " ".join(sys.argv))).encode())
+    os.close(fd)
+    atexit.register(lambda: os.path.exists(LOCK_PATH) and os.unlink(LOCK_PATH))
 
 
 class Device:

@@ -13,21 +13,19 @@
  *   COLMOD 0x55 = RGB565, MADCTL 0x00, display inversion on
  *   33 vendor commands, ending INVON / SLPOUT / 120 ms / DISPON / 50 ms
  *
- * WHAT IS STILL MISSING - and it is one specific thing:
- * the byte-level transport. The stock firmware puts bytes on the wire with
- * two routines that live in SRAM and are not in the flash image at any
- * offset (0x0080E842 lcd_write_cmd, 0x0080E8D8 lcd_write_data), so they
- * cannot be read out of a dump. They belong to the mask ROM's driver set -
- * see docs/sl6806_re_notes.md 7d. The ROM has since been dumped, and it does
- * not contain them either, nor are they resident in bootloader mode (7f), so
- * the route to pixels is the LCD controller at 0x400D9000.
+ * The byte-level transport - the last thing that was missing - is the LCD
+ * controller at 0x400D9000, driven as a QSPI master. It lives in
+ * cores/sl6806/sl6806_lcdc.c, and this board's half of it (pads, module
+ * clock, lane map) is in lcdc.c next door. sl6806_panel_get() brings it up
+ * on first use, so a sketch needs nothing but Screen.begin().
  *
- * Register an sl6806_lcd_bus_t and everything below starts working:
+ * A board that wants a different transport registers its own before touching
+ * Screen:
  *
  *     sl6806_lcd_bus_register(&my_bus);
  *     Screen.begin();
  *
- * Until something does, sl6806_panel_get() returns NULL, because a panel
+ * If no bus comes up, sl6806_panel_get() still returns NULL, because a panel
  * whose flush did nothing would make Display::available() claim success and
  * then silently drop every frame.
  *
@@ -44,10 +42,10 @@
  *   +0x02 u16  296      height
  *   +0x04 u16  0        x offset
  *   +0x06 u16  12       y offset
- *   +0x08 u8   1        colour/bus mode
- *   +0x0A u8   2
- *   +0x0C u8   50
- *   +0x0D u8   2        device/channel id, passed to the command writer
+ *   +0x08 u8   1        colour mode: 1 = RGB565, 2 = RGB888
+ *   +0x0A u8   2        display rotation index
+ *   +0x0C u8   50       0x32, the QSPI four-lane write opcode (pixels)
+ *   +0x0D u8   2        0x02, the QSPI one-lane write opcode (commands)
  *   +0x0E u8   0x0B
  *   +0x0F u8   0x2C     RAMWR
  *   +0x10 u8   0x2E     RAMRD
@@ -199,6 +197,13 @@ static const sl6806_panel_t p20_panel = {
 
 const sl6806_panel_t *sl6806_panel_get(void)
 {
+    /* Bring the LCD controller up on first use, so a sketch needs nothing
+     * but Screen.begin(). On this board that lands in lcdc.c; in a host test,
+     * which links this file but not that one, it is the weak no-op in
+     * LcdBus.c and nothing touches a peripheral. */
+    if (!sl6806_lcd_bus())
+        sl6806_lcd_bus_autoinit();
+
     /* No transport, no panel. Reporting NULL here is what keeps
      * Display::available() honest. */
     return sl6806_lcd_bus() ? &p20_panel : 0;

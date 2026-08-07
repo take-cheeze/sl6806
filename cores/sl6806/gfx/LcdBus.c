@@ -18,6 +18,39 @@
 
 static const sl6806_lcd_bus_t *g_bus;
 
+/*
+ * Panel timing is not advisory, and the framework's own delay cap breaks it.
+ *
+ * RUN_MODE=poll caps delay() at 50 ms, because loop() runs inside the boot
+ * ROM's USB handler and blocking past the host's SCSI timeout desynchronises
+ * the endpoint. That cap is right for a sketch. It is wrong for a panel: the
+ * 120 ms after SLPOUT, and the 120 ms after reset is released, are how long
+ * the controller takes to become able to answer at all. Shorten them and
+ * DISPON lands on a controller that is still asleep - which produces a
+ * working driver, completed transfers, and a black screen, with nothing
+ * anywhere to say why.
+ *
+ * So panel waits run at their real length. The exposure is bounded: a whole
+ * bring-up is about 320 ms of waiting, once, well inside the ~1 s timeout
+ * that cap exists to stay under, and no single wait may exceed the limit
+ * below however wrong a variant's table is. 500 ms clears every real DCS
+ * wait - the longest anyone specifies is 300 - while still catching a
+ * corrupt table before it wedges the link.
+ */
+#define PANEL_MAX_DELAY_MS 500
+
+static void panel_delay(uint32_t ms)
+{
+    uint32_t saved = sl6806_block_limit();
+
+    if (ms > PANEL_MAX_DELAY_MS)
+        ms = PANEL_MAX_DELAY_MS;
+
+    sl6806_set_block_limit(0);
+    delay(ms);
+    sl6806_set_block_limit(saved);
+}
+
 int sl6806_lcd_bus_register(const sl6806_lcd_bus_t *bus)
 {
     if (bus && (!bus->command || !bus->pixels))
@@ -29,6 +62,12 @@ int sl6806_lcd_bus_register(const sl6806_lcd_bus_t *bus)
 const sl6806_lcd_bus_t *sl6806_lcd_bus(void)
 {
     return g_bus;
+}
+
+/* Overridden by a variant that has a bus to bring up. See Panel.h. */
+__attribute__((weak)) int sl6806_lcd_bus_autoinit(void)
+{
+    return g_bus ? 0 : -1;
 }
 
 int sl6806_lcd_run(const uint8_t *seq)
@@ -56,7 +95,7 @@ int sl6806_lcd_run(const uint8_t *seq)
         if (op == SL6806_LCD_DELAY) {
             uint32_t ms = (uint32_t)seq[0] | ((uint32_t)seq[1] << 8);
             seq += 2;
-            delay(ms);
+            panel_delay(ms);
             continue;
         }
 
@@ -75,11 +114,11 @@ int sl6806_dcs_begin(const sl6806_dcs_panel_t *p)
 
     if (bus->reset) {
         bus->reset(1);
-        delay(p->reset_high_ms);
+        panel_delay(p->reset_high_ms);
         bus->reset(0);
-        delay(p->reset_low_ms);
+        panel_delay(p->reset_low_ms);
         bus->reset(1);
-        delay(p->reset_settle_ms);
+        panel_delay(p->reset_settle_ms);
     }
 
     return sl6806_lcd_run(p->init);
@@ -141,6 +180,10 @@ void sl6806_dcs_flush(const sl6806_dcs_panel_t *p,
             src += src_stride;
         }
     }
+
+    /* Tell a bus that spans several pixels() calls where the stream ends. */
+    if (bus->pixels_end)
+        bus->pixels_end();
 }
 
 int sl6806_dcs_sleep(const sl6806_dcs_panel_t *p)

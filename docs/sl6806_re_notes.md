@@ -170,14 +170,17 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
 - **Panel: 240 x 296, drawn at offset (0, 12).** Descriptor in flash at
   `0x00C519FC`, copied to SRAM `0x0081C1CC`. Layout:
   `+00 u16 width=240, +02 u16 height=296, +04 u16 xoff=0, +06 u16 yoff=12,`
-  `+08 u8 mode=1, +0A u8 2, +0C u8 50, +0D u8 devid=2, +0E u8 0x0B,`
+  `+08 u8 colour mode=1 (RGB565), +0A u8 rotation=2,`
+  `+0C u8 0x32 = QSPI quad-lane write opcode, +0D u8 0x02 = one-lane opcode,`
+  `+0E u8 0x0B,`
   `+0F RAMWR 0x2C, +10 RAMRD 0x2E, +11 CASET 0x2A, +12 RASET 0x2B, +13 MADCTL 0x36,`
   `+14 init=0x00D3F46D, +18 sleep=0x00D3F8CD, +1C wake=0x00D3F8F9,`
   `+20 0x00D3F941, +24 0x00D3F925`
   Found by scanning flash for `+17/+18 == 0x2A/0x2B`; exactly one match, and
   its function pointers match the disassembled routines.
-- **Standard MIPI DCS panel** behind a **hardware LCDC with DMA**, not an RGB
-  scanout panel. Sleep = DISPOFF 0x28 / 10ms / SLPIN 0x10 / 120ms; wake =
+- **Standard MIPI DCS panel on a QSPI bus** behind a **hardware LCDC with
+  DMA**, not an RGB scanout panel. See §12b for what QSPI means for the
+  command encoding. Sleep = DISPOFF 0x28 / 10ms / SLPIN 0x10 / 120ms; wake =
   SLPOUT 0x11 / 120ms / DISPON 0x29 / 10ms. Descriptor `+0x20` is display-on
   (DISPON / 10ms), `+0x24` is display-off (DISPOFF / 10ms).
 - **The full init sequence is recovered.** It is not stored as a table: the
@@ -189,8 +192,99 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
   0xB1-0xB6, 0xDF-0xEC and 0xF1-0xF6, so it is a vendor variant rather than a
   stock ST7789. The tables live in `variants/p20_player/panel.c` and are
   checked byte for byte by `tests/host/test_panel.c`.
-- Reset over GPIO id `0x13800`: high / 10ms / low / 20ms / high / 120ms
-  (`0x00D3E1A4`).
+- **The backlight is a PWM channel, not part of the LCD path.** `/dev/pwm_ch3`
+  (`0x00C68585`), opened at `0x00D10354` with a 48000 Hz period and a duty of
+  `percent * 480`; the default is 60% and the setter is `0x00D102F4`. Strings
+  `brightness percent %d time:%ld` and `pwm1_event_callback` are alongside.
+  Consequence for bring-up: **a working LCD driver still shows a black screen**
+  unless something turns this on.
+
+  **The PWM registers are not recoverable from these dumps.** The device-name
+  strings `/dev/pwm_ch0`..`ch5` sit at `0x00C7DE9A`, but nothing in the image
+  references them - no literal-pool entry, no ADR - so the driver that
+  registers them is SRAM-resident, the same wall §7d describes. The driver
+  framework (`open` at `0x00D3D1E8`) walks a runtime linked list, so the
+  registration is not a static table either. And unlike the LCD writers there
+  is no bootloader copy: the HLKJ image contains no PWM code or strings at
+  all. The mask ROM has none either.
+
+  The practical route looked like a GPIO rather than PWM - a backlight enable
+  driven high is usually full brightness. **That has now been tested
+  exhaustively and it is not one.** Every pad on the part, all six banks, was
+  driven high individually on hardware (`examples/PadSweep`); none lights the
+  panel, while the stock firmware lights it brightly. Either the enable is
+  active low (untested), or the driver wants a pulse train rather than a
+  level, or it hangs off the PMU rather than a pad.
+
+### 7g. The board's pad map, recovered from the call sites
+
+`tools/sl6806-padscan` decodes every pad id the firmware passes to the pad
+and GPIO routines - 78 of them - which is this board's pin assignment. The
+seven plain outputs are the ones that matter for bring-up:
+
+| pad id | bank/pin | evidence |
+|---|---|---|
+| `0x000138CB` | 1/20 -> 1/7 | the panel reset line; a check that the scan is right |
+| `0x0001A0D0` | 1/20 | **`vcomo`** - the console handler at `0x00D0AEE0` maps that string to this id and its low twin `0x0001A090`. VCOM is an LCD supply |
+| `0x000508C0` | 5/1 | driven high at `0x00D3CBFE` and low at `0x00D3C9DC`/`0x00D3CC3C`, the display's suspend/resume pair |
+| `0x000300C0` | 3/0 | output set high, `0x00D46432` |
+| `0x00047080` | 4/14 | `gpio_write`, power sequencing at `0x00D44AB8` |
+| `0x00047880` | 4/15 | same routine |
+
+Other groups worth naming: bank 1 pins 1-8 are the LCD's QSPI pads
+(function 2) with a matching teardown to function 15; bank 4 pins 0-15 are a
+sixteen-pad function-2 group; bank 3 pins 1-6 are function 11; bank 1 pins
+22-27, 30, 31 go through `gpio_config` and are the likely button group -
+these are the ids §7d recorded under the old, wrong 6-bit pin decode.
+
+**LCDC `+0x14` bits 27 and 17 are not clearable, so they are level status, not
+latched flags.** Writing bit 27 back the way the vendor's ISR does
+(`0x00829C9C`: write the mask, spin until it reads 0) leaves `+0x14` reading
+`0x08020000` exactly as before. So the fact that this driver never runs that
+ISR is *not* a divergence worth worrying about - the bits are almost certainly
+steady-state indicators such as "FIFO empty" or "idle" rather than pending
+completions. Tried on hardware; no effect on the panel.
+
+**LCDC `+0x08` bit 4 is command-list mode — measured, not inferred.** Setting
+it and then using the register-driven transfer path produces a controller that
+never reports completion: every transfer times out. So the bit switches the
+controller between being fed by a command list and being fed by its registers,
+which is consistent with the vendor setting it only in the command-list
+builder. Corollary worth keeping: the controller demonstrably changes
+behaviour in response to what we write, so we are talking to a live
+peripheral, not a dead address.
+
+**Inverting `+0x20` bit 17 makes a 16-byte data transfer take 21 status polls
+instead of 6.** That is the signature of a per-transfer command frame being
+emitted or not, which supports reading bit 17 as "emit the frame". Neither
+polarity, nor either polarity of bit 18, nor any of the eight combinations of
+those with bit 4, produces a picture.
+
+**The pad input buffer is off in almost every alternate function.** Measured
+across all eight of bank 1's LCD pads and all sixteen function nibbles, with a
+pull-up applied (`examples/PadScope`), and the result is identical on every
+pad:
+
+| function | 0 | 2-13 | 14 | 15 |
+|---|---|---|---|---|
+| input register reads | 1 | 0 | 1 | 0 |
+
+Function 0 is the control - a plain input, where the pull-up is visible.
+Function 14 is the only other mode that leaves the buffer alive. Twelve
+different peripheral functions all happening to drive the pad low is not a
+credible reading, so the buffer is simply switched off outside those two.
+
+Consequence: **there is no pad function in which the LCD controller is
+connected and the pin is also readable**, so no software test can watch that
+bus. Anyone tempted to write another one should read this table first.
+
+**Do not sweep pads to find a rail.** Driving all 192 wedges the device -
+something USB needs is among them - and because the console ring is only read
+by USB polling, the freeze also destroys the evidence of which pad did it.
+- Reset over GPIO id `0x13800` = bank 1 pin 7 (§7f): high / 10ms / low / 20ms
+  / high / 120ms (`0x00D3E1A4`). The pad is configured as `0x000138CB` -
+  output, initially high - by the LCD pad setup at `0x00D3E9DC`, which also
+  puts bank 1 pins 1..6 and 8 on function 2 as the QSPI data pads.
 - `lv_lcd_init` (`0x00D3E34C`) installs 8 ops into a struct at `0x008298B8`;
   the resolution getter returns `[[0x008298B8]+0]` / `+2`.
 - `lcdc_set_descriptor` (`0x00D3E728`) builds a DMA descriptor in SRAM at
@@ -229,6 +323,7 @@ are legible where FIRM's are buried.
 | `0x40009000` | timers | channels at 0x100 stride (`+0x108`, `+0x208`) with write-1-clear flags and per-channel callbacks; register triples at 0x20 stride |
 | `0x40070000` | DMA | per-channel IRQ status at `+0x24`/`+0x2c`, callback table indexed by channel, request routing at `+0x00`/`+0x20`/`+0x28` |
 | `0x40080000` | **clock & reset unit** | dividers at `+0x40`/`+0x48` with a bit-31 busy poll; module gates at `+0x64`/`+0x74` bit 15; see `cores/sl6806/sl6806_cru.h` |
+| `0x40081000` + `0x400F6000` | **GPIO / pad controller** | six banks, bases in a mask ROM table at `0x00065004`; see §7f and `cores/sl6806/sl6806_padctl.h` |
 | `0x400D9000` | **LCD controller** | the bootloader logs `HAL_lcdc_module_init` from the routine that caches this base; see §12b and `cores/sl6806/sl6806_lcdc.h` |
 | `0x400F7000` | storage host (SD/MMC + SPI flash) | `+0x100`/`+0x104` command registers with a bit-31 start/busy, `+0x108` argument, `+0x10C`/`+0x110` response, `sdio(e):rx error` strings nearby |
 
@@ -400,10 +495,43 @@ runtime by the application — still unexplained.
 - `0x40030000`, `0x40040000` and `0x40020000` are addressed as absolute
   16-bit registers rather than base+offset, so they need a different scan.
 
-**Still not found: GPIO.** No block in the ROM has the read-modify-write-on-a-
-bit-index shape, and the `ubfx rX, rX, #11, #6` at `0x0041DC` — which looks
-exactly like the vendor pin-id field — is a false lead: it is inside the
-SD/MMC driver, extracting a response field.
+- **GPIO — FOUND.** (Corrected 2026-08-07; the paragraph that used to be here
+  said it was not in the ROM. It is, and the earlier scan missed it because
+  the ROM does not address GPIO as base+offset from a literal: it looks the
+  bank base up in a table.)
+
+  `0x00000902` splits a packed pin id into a bank base and a pin index, using
+  a **six-entry table at `0x00065004`**:
+
+  ```
+  0x40081000  0x40081040  0x400F6080  0x400810C0  0x40081100  0x400F6000
+  ```
+
+  Pin id: bank `[19:16]`, pin `[15:11]`, pad function `[10:7]`, initial output
+  level `[6]`, drive `[5:4]`, pull selector `[3:0]` (indexes a 12-entry table
+  at `0x0006501C` from 4). Function 0 is input and 1 is output — ROM `0x718`
+  sets function 1 and then drives the pin, which pins that down.
+
+  Registers, offsets from a bank base:
+
+  | Off | Role | ROM |
+  |---|---|---|
+  | `+0x000 + (pin>>3)*4` | function, 4 bits per pin | `0x6F0` |
+  | `+0x010` | input data | `0x97C` |
+  | `+0x014 + (pin>>4)*4` | drive, 2 bits per pin | `0x76A` |
+  | `+0x024`, `+0x02C` `+ (pin>>4)*4` | pull, 2 bits per pin each | `0x736` |
+  | `+0x034` / `+0x038` | set / clear output bit | `0x6DE` |
+  | `+0x200 + (pin>>3)*4` | interrupt mode, 4 bits per pin | `0x78C` |
+  | `+0x210` / `+0x214` | interrupt enable / pending (W1C) | `0x7D0`, `0x7BC` |
+
+  Entry points: `0x93C` configure a pad from a full id, `0x99E` set level,
+  `0x97C` read level, `0xAAE` set function only. The bootloader's thunks are
+  at `0x008207B0` and `0x00823C68`..`0x00823C84`.
+
+  Reimplemented in `cores/sl6806/sl6806_padctl.[ch]`. The `ubfx rX, rX, #11,
+  #6` at `0x0041DC` really was a false lead — it is in the SD/MMC driver — but
+  the field width it suggested was close: the pin field is `[15:11]`, five
+  bits, with the bank in the four above it.
 
 ### What this changes
 
@@ -497,6 +625,48 @@ Register map (offsets from `0x400D9000`), read out of the bootloader:
 **That answers the old open thread.** The handoff is: build the descriptor,
 store its address to `+0x88`, set `+0x80` bit 0, set `+0x84` bit 0.
 
+### RESOLVED: it is a QSPI display, and the driver is in flash
+
+The observation that closes this section: the bootloader's command writer at
+`0x00821BB2` sends **four bytes for every DCS command** — `0x02`, `0x00`,
+`cmd`, `0x00`. That is the standard QSPI display command frame: a one-lane
+`0x02` write opcode and a 24-bit address whose middle byte is the command.
+Pixel data follows behind a `0x32` four-lane opcode (`0x00827D58` sends
+exactly `lcd_write_cmd(last=1, 0x32, RAMWR)` before every frame).
+
+Everything unexplained falls out at once:
+
+- the panel descriptor's `+0x0C = 0x32` and `+0x0D = 0x02` are those two
+  opcodes, not "50" and a device id;
+- the command list's `a` field is the opcode and its `b` field is
+  `cmd << 8` — the DCS command inside the address. The old note could not
+  settle this because it compared the bootloader's descriptor against the
+  *application's*, which has an extra `x_offset`/`y_offset` pair at `+0x04`
+  and so numbers every later field four higher. Aligned, the bootloader's
+  `+0x0D`/`+0x0E` are CASET and RASET, exactly as the window records need.
+
+And the whole byte-level driver is in the bootloader, in flash:
+
+| Address | Role |
+|---|---|
+| `0x008218D4` | send one byte of a command frame, out of `+0x24` |
+| `0x00821940` | send data bytes out of the FIFO at `+0x30` |
+| `0x00821B88` / `0x00821B9C` | assert / release chip select (`+0x20` bit 18) |
+| `0x00821BB2` | `lcd_write_cmd(last, opcode, cmd)` |
+| `0x00821C00` | `lcd_write_data(last, byte)` |
+| `0x008219A4` / `0x008219FC` | the read paths, out of `+0x34` |
+| `0x00829BC8` | the DMA transfer setup |
+
+More of `+0x20` than the table above showed: bit 0 start, bit 1 write, bits
+`[3:2]` source (1 = `+0x24`, 2 = FIFO, 3 = both), bits `[9:8]` and `[11:10]`
+the two command-field lengths, bit 17 emit-a-frame (cleared for RAMWR so the
+pixel stream continues), bit 18 hold CS. `+0x14` bit 31 is transfer-complete,
+write-1-to-clear, and bits `[30:29]` are busy.
+
+Transcribed into `cores/sl6806/sl6806_lcdc.c`, polled rather than DMA, with
+195 host tests in `tests/host/test_lcdc.c` against a model of the controller.
+**Not yet run against a panel.**
+
 The command list is built by `0x00827E18` (bootloader, signature
 `(x0, x1, y0, y1)`) / `0x00D3E728` (application). It is a sequence of
 variable-length records terminated by `0xFFFFFFFC`, each shaped
@@ -516,12 +686,24 @@ The tags are structured: `0xCDCD_(0x0A + 8*(type−1))_03` for a transfer up to
 interface type 1–3. Over `0x10000` elements the builder takes a second branch
 emitting a longer list, so that is the per-record limit.
 
-**Still undecoded:** the tag's low byte, the `a`/`b` fields — `b` is a
-descriptor byte shifted left 8 and differs between the two window records,
-which is the shape a command opcode would have, but the offsets it reads
-(`+0x0D`, `+0x0E`) are not where the application's descriptor keeps
-CASET/RASET — and most of the 20-byte config struct. Full map in
-`cores/sl6806/sl6806_lcdc.h`.
+The `a`/`b` fields are the QSPI opcode and `cmd << 8`; see above. **Still
+undecoded:** the tag's low byte (3 for a record carrying a command, 2 for the
+continuation record of a long transfer) and `0xABAB0005` itself.
+
+The 20-byte config struct passed to `HAL_lcdc_module_init` **is** decoded,
+from `0x00827FAC` and the application's `0x00D3E944`, which fill it
+identically except for the colour mode:
+
+| Byte | Value | Register |
+|---|---|---|
+| 0 | 1 | `CTRL` bit 0; bit 3 for type 2 |
+| 1..4 | 9 | `CFG0` `[15:12] [11:8] [7:4] [3:0]` |
+| 5 | descriptor colour mode | `+0x20` `[21:20]` |
+| 6, 7 | 0, 3 | `+0x20` `[15:12]`, `[11:10]` |
+| 8 | 0 | `+0x20` bit 4 |
+| 9, 0x0A, 0x0B, 0x0C, 0x0D | 0, 0, 1, 0, 1 | `CFG1` bits 1, 5, 6, 2, 3 |
+
+Full map in `cores/sl6806/sl6806_lcdc.h`.
 
 ## 12. Next actions (pick up here)
 
@@ -530,12 +712,18 @@ CASET/RASET — and most of the 20-byte config struct. Full map in
 2. ~~Find the LCDC~~ **DONE** — §12b. `0x400D9000`, driver readable in the
    bootloader, descriptor handoff understood.
 3. ~~Finish the FIRM/SD-update header~~ **DONE** — §6.
-4. **Decode the LCDC command-list opcodes** (§12b). This is now the last thing
-   between the framework and a working display: everything above the bus is
-   written and tested (`tests/host/test_panel.c`).
-5. **Dump the mask ROM** (`0x00000000`–`0x0007D000`) in bootloader mode. It is
-   the SDK's shared driver library (§7d) and would hand over GPIO, the LCD
-   writers and the delay routines in one go.
+4. ~~Decode the LCDC command-list opcodes~~ **DONE** — §12b. The panel is a
+   QSPI display; the `a`/`b` fields are the QSPI opcode and the DCS command.
+   The whole byte-level driver turned out to be in the bootloader and is
+   transcribed into `cores/sl6806/sl6806_lcdc.c`.
+5. ~~Dump the mask ROM~~ **DONE** — §7f. It handed over GPIO (the pad
+   controller, via a bank table the earlier scan missed) but not the LCD
+   writers, which are in the bootloader instead.
+5b. **Run the display on hardware.** This is now the top of the list. The
+   stack is complete and tested against a model, and two things in it are
+   still guesses: `+0x20` bits 17 and 18, inferred from where the vendor sets
+   and clears them, and the pixel byte order, which the firmware does not
+   settle because the vendor's framebuffer comes from LVGL. See docs/LCD.md.
 6. ~~**Find the PLL**~~ — largely settled in practice. The clock was
    **measured at 64.000 MHz** (2026-08-06, one P20 Player) by timing the
    device's counter against the host's with `tools/sl6806-calibrate`; the
@@ -547,7 +735,12 @@ CASET/RASET — and most of the 20-byte config struct. Full map in
    the **DWT cycle counter does not run** on this part (its register reads a
    constant), so timekeeping uses the **24-bit SysTick**, which wraps every
    262 ms at 64 MHz.
-7. **Enumerate vtable slots / message-id enum** via the central
+7. **A DMA driver.** The display pushes pixels 16 bytes at a time because
+   that is the FIFO depth. The vendor uses the DMA controller at
+   `0x40070000`: `0x00829768` allocates a channel, `0x008217F0` starts a
+   transfer into the LCDC FIFO, and `0x00827C5C` is the completion handler
+   that chunks a frame. That is the whole path, and it is readable.
+8. **Enumerate vtable slots / message-id enum** via the central
    `__act_on_request` dispatcher (turns `method_20` + siblings into named
    methods across all scenes).
-8. **Build a Unicorn harness** to execute functions from the image.
+9. **Build a Unicorn harness** to execute functions from the image.

@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""
+sl6806-padscan - recover the board's pad map from a firmware dump.
+
+The SL6806 has no pinout, but the stock firmware configures every pad it
+uses, and it does so by passing a single packed id as an immediate. So the
+board's pin assignment is recoverable: find the calls to the pad and GPIO
+routines, read the constant each one is handed, and decode it.
+
+    tools/sl6806-padscan dump.bin              # the whole map
+    tools/sl6806-padscan dump.bin --outputs    # only the plain outputs
+    tools/sl6806-padscan dump.bin --sites      # with call-site addresses
+
+WHY THIS MATTERS FOR BRING-UP
+
+A panel that accepts every command and shows nothing may simply have an
+unpowered rail. Finding which pad to drive used to mean sweeping all 192 of
+them, which on this chip freezes the device - one of them owns something USB
+needs, and when USB dies you do not even learn which one it was. This turns
+that into a list of the five or so pads the firmware itself drives as
+outputs.
+
+    --outputs is the list worth trying, most-interesting first.
+
+THE ENCODING (see cores/sl6806/sl6806_padctl.h)
+
+    bits [19:16]  bank, index into the mask ROM's table at 0x00065004
+    bits [15:11]  pin within the bank
+    bits [10:7]   pad function: 0 input, 1 output, 2+ alternate
+    bit  [6]      initial output level
+    bits [5:4]    drive strength
+    bits [3:0]    pull selector
+
+WHAT IT CANNOT SEE
+
+Ids computed at run time rather than written as immediates, and any pad
+configured by code that is not in the flash image. Both are rare: the vendor
+writes these as constants everywhere.
+"""
+
+import argparse
+import collections
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+import os
+
+FLASH_BASE = 0x00C00000
+FIRM_OFF = 0x010000
+FIRM_SIZE = 0x1B80D0
+
+# The application's thunks into the mask ROM's pad and GPIO driver. Found by
+# following 0x008051F4 -> ROM 0x93C and friends; see sl6806_padctl.h.
+TARGETS = {
+    0x8051F4: 'pad_configure',
+    0x811C7C: 'gpio_write',
+    0x811C90: 'gpio_config',
+    0x811CB4: 'gpio_other',
+}
+
+FUNC_NAME = {0: 'input', 1: 'OUTPUT', 15: 'off'}
+
+
+def disassemble(blob, vma):
+    with tempfile.NamedTemporaryFile(suffix='.bin', delete=False) as f:
+        f.write(blob)
+        path = f.name
+    try:
+        out = subprocess.run(
+            ['arm-none-eabi-objdump', '-D', '-b', 'binary', '-m', 'arm',
+             '-M', 'force-thumb', '--adjust-vma=0x%X' % vma, path],
+            capture_output=True, text=True, check=True).stdout
+    finally:
+        os.unlink(path)
+
+    insn = re.compile(r'^\s*([0-9a-f]+):\t[0-9a-f ]+\t(\S+)\s*(.*)$')
+    rows = []
+    for line in out.splitlines():
+        m = insn.match(line)
+        if m:
+            rows.append((int(m.group(1), 16), m.group(2), m.group(3)))
+    return rows
+
+
+def scan(blob, vma, rows):
+    """Every (pad id -> [(call site, routine)]) the firmware passes."""
+    found = collections.defaultdict(list)
+
+    for i, (addr, op, args) in enumerate(rows):
+        if not op.startswith('bl'):
+            continue
+        m = re.search(r'0x([0-9a-f]+)', args)
+        if not m or int(m.group(1), 16) not in TARGETS:
+            continue
+        routine = TARGETS[int(m.group(1), 16)]
+
+        # Walk back for whatever last set r0, which is the id argument.
+        for j in range(i - 1, max(-1, i - 9), -1):
+            _, op2, args2 = rows[j]
+            if not args2.startswith('r0,'):
+                continue
+            val = None
+            if op2 in ('movw', 'movs', 'mov.w'):
+                m2 = re.search(r'#(\d+)', args2)
+                if m2:
+                    val = int(m2.group(1))
+            elif op2 == 'ldr':
+                m2 = re.search(r'\(0x([0-9a-f]+)\)', args2)
+                if m2:
+                    off = int(m2.group(1), 16) - vma
+                    if 0 <= off < len(blob) - 4:
+                        val = struct.unpack_from('<I', blob, off)[0]
+            if val is not None and 0 < val <= 0x5FFFF:
+                found[val].append((addr, routine))
+            break
+    return found
+
+
+def decode(v):
+    return {
+        'bank': (v >> 16) & 0xF,
+        'pin': (v >> 11) & 0x1F,
+        'func': (v >> 7) & 0xF,
+        'level': (v >> 6) & 1,
+        'drive': (v >> 4) & 3,
+        'pull': v & 0xF,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('dump')
+    ap.add_argument('--outputs', action='store_true',
+                    help='only pads configured as plain outputs')
+    ap.add_argument('--sites', action='store_true',
+                    help='print the call-site addresses')
+    args = ap.parse_args()
+
+    data = open(args.dump, 'rb').read()
+    if len(data) < FIRM_OFF + FIRM_SIZE:
+        sys.exit('%s is too small to hold FIRM' % args.dump)
+
+    blob = data[FIRM_OFF:FIRM_OFF + FIRM_SIZE]
+    vma = FLASH_BASE + FIRM_OFF
+    found = scan(blob, vma, disassemble(blob, vma))
+
+    if not found:
+        sys.exit('no pad ids found - is this an SL6806 dump?')
+
+    rowsout = []
+    for v in sorted(found):
+        d = decode(v)
+        if d['bank'] >= 6:
+            continue
+        if args.outputs and d['func'] != 1:
+            continue
+        rowsout.append((v, d, found[v]))
+
+    print('pad id      bank pin  function      lvl drv pull  used by')
+    for v, d, sites in rowsout:
+        fname = FUNC_NAME.get(d['func'], 'alt %d' % d['func'])
+        kinds = collections.Counter(k for _, k in sites)
+        use = ', '.join('%s x%d' % (k, n) for k, n in sorted(kinds.items()))
+        print('0x%08X  %2d  %3d  %-12s  %d   %d   %2d    %s'
+              % (v, d['bank'], d['pin'], fname, d['level'], d['drive'],
+                 d['pull'], use))
+        if args.sites:
+            for a, k in sites:
+                print('                 %-14s at 0x%08X' % (k, a))
+
+    print('\n%d pad ids, %d shown.' % (len(found), len(rowsout)))
+    if args.outputs:
+        print('These are the pads to try when a rail or a backlight is dark.')
+
+
+if __name__ == '__main__':
+    main()

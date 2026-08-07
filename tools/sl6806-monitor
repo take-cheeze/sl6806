@@ -29,7 +29,7 @@ import time
 import tty
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sl6806_dev import Device as BaseDevice, find_tool     # noqa: E402
+from sl6806_dev import Device as BaseDevice, find_tool, take_lock  # noqa: E402
 
 MAGIC = 0x36384C53          # "SL68"
 VERSION = 2
@@ -199,7 +199,26 @@ def main():
                    help="send TEXT (plus newline) once, then keep monitoring")
     p.add_argument("--no-input", action="store_true",
                    help="do not forward what you type to the sketch")
+    p.add_argument("--duration", type=float, metavar="SECONDS",
+                   help="exit cleanly after SECONDS instead of running until "
+                        "ctrl-c. Use this for scripted runs: killing the "
+                        "monitor with a signal can land in the middle of a "
+                        "USB transaction and desynchronise the endpoint, "
+                        "which wedges the device until it is power cycled.")
+    p.add_argument("--tick", type=float, metavar="SECONDS",
+                   help="send a newline every SECONDS. Lets a sketch be paced "
+                        "from the host instead of from millis(), which on this "
+                        "device is not usable for pacing: loop() runs at the "
+                        "USB poll rate, and that has been measured anywhere "
+                        "from 0.3 to 42 calls per second depending on how "
+                        "recently the board was cold booted.")
+    p.add_argument("--idle-exit", type=float, metavar="SECONDS",
+                   help="exit once the device has produced no output for "
+                        "SECONDS. Handy when a sketch prints a finite report "
+                        "and then goes quiet.")
     args = p.parse_args()
+
+    take_lock()
 
     base = console_addr_from_sym(args.sym)
     dev = Device(find_tool(args.tool), not args.no_sudo)
@@ -221,9 +240,24 @@ def main():
 
     pending_in = b""
     misses = 0
+    started = time.time()
+    last_output = started
+    next_tick = started + (args.tick or 0)
 
     try:
         while True:
+            if args.duration is not None and time.time() - started >= args.duration:
+                break
+            if (args.idle_exit is not None
+                    and time.time() - last_output >= args.idle_exit):
+                print("[no output for %.0f s; exiting]" % args.idle_exit,
+                      file=sys.stderr)
+                break
+
+            if args.tick is not None and time.time() >= next_tick:
+                next_tick = time.time() + args.tick
+                pending_in += b"\n"
+
             got = dev.poll_console()
 
             if got is None:
@@ -248,6 +282,7 @@ def main():
                                  "rate]\n")
 
             if data:
+                last_output = time.time()
                 sys.stdout.write(data.decode("utf-8", errors="replace"))
                 sys.stdout.flush()
 

@@ -12,24 +12,25 @@
  * See tools/sl6806-panelseq, which re-derives all of it from a dump.
  *
  * =====================================================================
- *  WHAT IS STILL MISSING: THE BUS, AND ONLY THE BUS
+ *  THE BUS EXISTS NOW
  * =====================================================================
- * Knowing the commands is not the same as being able to send them. The two
- * routines the stock firmware calls to put a byte on the wire -
+ * This header used to say the byte-level transport was the one missing
+ * piece, because the two routines the stock application calls to put a byte
+ * on the wire live in SRAM and are in no dump. They are still in no dump -
+ * but the HLKJ bootloader has its own copies, in flash, and those
+ * disassemble. cores/sl6806/sl6806_lcdc.c is a transcription of them: the
+ * panel is a QSPI display and the controller at 0x400D9000 is the QSPI
+ * master.
  *
- *     0x0080E842  lcd_write_cmd(last, devid, cmd)
- *     0x0080E8D8  lcd_write_data(last, byte)
+ * On the P20 the bus comes up by itself the first time anything asks for the
+ * panel, so Screen.begin() is all a sketch needs.
  *
- * - live in SRAM and are not present anywhere in the flash image, so they
- * cannot be disassembled from a dump. They belong to the mask ROM's driver
- * set (see docs/sl6806_re_notes.md 7d), which means a ROM dump, not a flash
- * dump, is what unlocks them.
- *
- * So this header defines the seam at exactly that line. Supply an
- * sl6806_lcd_bus_t - three short functions - and the whole stack above it
- * (init sequence, window addressing, framebuffer, Display, text) works
- * unchanged. Until something registers one, sl6806_panel_get() returns NULL
- * and Display::begin() says why rather than silently drawing nowhere.
+ * The seam below is still the seam. Supply an sl6806_lcd_bus_t and the whole
+ * stack above it - init sequence, window addressing, framebuffer, Display,
+ * text - works unchanged, which is how a different board or a bit-banged bus
+ * would plug in. A board with no bus still reports NULL from
+ * sl6806_panel_get(), and Display::begin() says why rather than silently
+ * drawing nowhere.
  */
 #ifndef SL6806_PANEL_H
 #define SL6806_PANEL_H
@@ -44,20 +45,18 @@ extern "C" {
 /* ------------------------------------------------------------------ bus */
 
 /*
- * The byte-level transport to the panel controller. This is the one thing
- * the framework cannot supply for you.
+ * The byte-level transport to the panel controller.
  *
- * A bus can be implemented two ways:
+ * The one this framework ships drives the LCD controller at 0x400D9000; see
+ * sl6806_lcdc.h. A board could equally bit-bang the panel on GPIO, whose
+ * registers are also known now (sl6806_padctl.h), though there is no reason
+ * to on a board that has the controller.
  *
- *   1. Program the LCD controller at 0x400D9000 - see sl6806_lcdc.h. This is
- *      the realistic route.
- *   2. Bit-bang the panel on GPIO, once the GPIO registers are known.
- *
- * A third route - calling the vendor routines above - has been tried and
- * does NOT work: a bootloader-mode memory dump shows uninitialised noise at
- * both addresses, because the application that installs them has never run.
- * See docs/sl6806_re_notes.md 7f. Both routes produce the same three
- * functions.
+ * One route that does NOT work, recorded so it is not tried again: calling
+ * the application's SRAM routines at 0x0080E842 and 0x0080E8D8. A
+ * bootloader-mode memory dump shows uninitialised noise at both addresses,
+ * because the application that installs them has never run. See
+ * docs/sl6806_re_notes.md 7f.
  */
 typedef struct {
     const char *name;      /* shown at startup, e.g. "ROM lcd_write" */
@@ -71,6 +70,16 @@ typedef struct {
      * command() has just issued. Called once per flush() row-block, so it is
      * worth making this a DMA burst rather than a byte loop. */
     void (*pixels)(const sl6806_color_t *src, uint32_t count);
+
+    /* Optional. Called once after the final pixels() of a flush.
+     *
+     * A rectangle whose rows are not contiguous in the source arrives as
+     * several pixels() calls, and a bus that has to decide "this is the last
+     * transfer" *before* starting it - which the LCDC does, because
+     * releasing chip select is a bit set before the transfer, not after -
+     * cannot tell from pixels() alone which call is the last. This is how it
+     * finds out. A bus with no such state leaves it NULL. */
+    void (*pixels_end)(void);
 
     /* Drive the panel's reset pin, 1 = deasserted. NULL if the board wires
      * reset to something the bus handles itself. */
@@ -90,6 +99,18 @@ int sl6806_lcd_bus_register(const sl6806_lcd_bus_t *bus);
 
 /* The registered transport, or NULL. */
 const sl6806_lcd_bus_t *sl6806_lcd_bus(void);
+
+/*
+ * Bring up whatever transport the board has, if none is registered yet.
+ *
+ * Weak, and a no-op by default, so that a variant with a real bus can make
+ * Screen.begin() work with no setup call in the sketch, while a host test -
+ * or a board with no display - links the default and never touches a
+ * peripheral. variants/p20_player/lcdc.c is the reference implementation.
+ *
+ * Returns 0 if a bus is registered on return, -1 otherwise.
+ */
+int sl6806_lcd_bus_autoinit(void);
 
 /* ------------------------------------------------------- command streams */
 

@@ -42,6 +42,7 @@ VARIANT_DIR := variants/$(BOARD)
 CORE_C   := $(CORE_DIR)/wiring_time.c $(CORE_DIR)/wiring_digital.c \
             $(CORE_DIR)/wiring_extra.c \
             $(CORE_DIR)/hal_gpio.c $(CORE_DIR)/sl6806_console.c \
+            $(CORE_DIR)/sl6806_padctl.c $(CORE_DIR)/sl6806_lcdc.c \
             $(CORE_DIR)/syscalls.c \
             $(CORE_DIR)/gfx/Framebuffer.c $(CORE_DIR)/gfx/font5x7.c \
             $(CORE_DIR)/gfx/LcdBus.c
@@ -85,6 +86,15 @@ WARN   := -Wall -Wextra
 OPT    := -Os -ffunction-sections -fdata-sections -fno-common
 INCS   := -I$(CORE_DIR) -I$(VARIANT_DIR)
 DEFS   := -DF_CPU=$(F_CPU)UL -DSL6806=1 $(MODE_DEF)
+
+# examples/PadSweep takes one GPIO bank per build, so a bank that wedges the
+# device cannot take the others with it.
+ifneq ($(SWEEP_BANK),)
+DEFS   += -DSWEEP_BANK=$(SWEEP_BANK)
+endif
+ifneq ($(SWEEP_LEVEL),)
+DEFS   += -DSWEEP_LEVEL=$(SWEEP_LEVEL)
+endif
 
 # Appended to every compile. CI passes -Werror here rather than baking it in,
 # so a warning stops the build there without making local experiments painful.

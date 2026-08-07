@@ -1,15 +1,18 @@
 /*
  * GfxDemo - the display stack, drawing into RAM.
  *
- * WHAT YOU WILL SEE: nothing on the screen. There is no panel driver for any
- * SL6806 board yet - the controller, resolution and bus are all still
- * unknown - so this reports that over Serial and then draws anyway.
+ * WHAT YOU SHOULD SEE: a 160x40 band in the top-left corner of the panel,
+ * with a title bar, some shapes and a running millisecond count.
  *
- * Drawing anyway is the point. The framebuffer and every primitive are
- * finished and unit-tested (tests/host/test_gfx.c), so a UI can be written
- * and checked now, and it will appear the moment someone fills in
- * sl6806_panel_get(). This sketch verifies the drawing worked by reading
- * pixels back and printing a summary.
+ * "Should", because the driver behind it was written from a disassembly of
+ * the stock bootloader and has never been checked against a screen. If the
+ * panel stays dark, or the colours are wrong, docs/LCD.md has the list of
+ * things to try in the order worth trying them.
+ *
+ * Either way the sketch also reads its own pixels back and prints them, so
+ * it says something useful even with the display disconnected: the
+ * framebuffer and every primitive are unit-tested (tests/host/test_gfx.c),
+ * and a UI can be developed against the readback alone.
  *
  * MEMORY: this uses a small static buffer rather than a full screen. In
  * payload mode the entire window is 64 KB, so a 240x135 framebuffer
@@ -53,14 +56,18 @@ void setup()
     Serial.println();
     Serial.println("=== SL6806 gfx demo ===");
 
-    if (!Display::panelAvailable()) {
-        Serial.println("No panel driver: drawing into RAM only.");
-        Serial.println("See docs/LCD.md to add one.");
-    }
-
     /* Returns false without a panel, but the framebuffer is still set up so
-     * every draw call below works. */
-    Screen.begin(band, BAND_W, BAND_H);
+     * every draw call below works. This is also what brings the LCD
+     * controller up on a board that has one. */
+    if (!Screen.begin(band, BAND_W, BAND_H)) {
+        Serial.println("No panel: drawing into RAM only.");
+        Serial.println("See docs/LCD.md.");
+    } else {
+        Serial.print("panel: ");
+        Serial.print(sl6806_panel_get()->name);
+        Serial.print(" over ");
+        Serial.println(sl6806_lcd_bus()->name);
+    }
 
     Serial.print("framebuffer: ");
     Serial.print(Screen.width());

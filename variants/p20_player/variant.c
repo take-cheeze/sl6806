@@ -1,46 +1,32 @@
 /*
  * variant.c - pin tables for the P20 Player.
  *
- * There are two tables here because there are two ways to drive a pin on
- * this chip, and this board knows something about one of them.
+ * There are two tables here because hal_gpio.h offers two ways to reach a
+ * pad. On this chip only one of them is the right shape.
  *
- * 1. sl6806_gpio_ports[] - direct register access. Still empty: the SL6806
- *    pad controller registers have not been found. An empty table is what
- *    makes the register path report instead of silently doing nothing.
+ * 1. sl6806_gpio_ports[] - an Arduino pin number mapped to a port and a bit,
+ *    with a direction register. Deliberately left empty. The SL6806's pad
+ *    controller does not work that way: direction is a four-bit function
+ *    field shared with the alternate-function selector, so a "direction
+ *    register" entry would either be wrong or would have to lie. The
+ *    registers themselves are known - sl6806_padctl.h - this table is simply
+ *    not how to use them.
  *
- * 2. sl6806_vendor_pin_map[] - the packed pin ids the stock firmware passes
- *    to the mask ROM's GPIO routine. These ARE known, for the pins the stock
- *    firmware touches, because they appear as immediates at its call sites.
- *    Install a vendor back end with sl6806_gpio_vendor_register() and every
- *    named pin below starts working without any register map at all.
+ * 2. sl6806_vendor_pin_map[] - the packed pad ids. This is how the stock
+ *    firmware addresses pins and how this board does too. The ids for the
+ *    pins the stock firmware touches are known, because they appear as
+ *    immediates at its call sites.
  *
- * WHEN YOU HAVE THE REGISTERS, table 1 looks like this - a port with atomic
- * set/clear registers at a 4-byte stride, and pins 0..31 mapped straight
- * through:
+ * The back end behind table 2 is sl6806_padctl_vendor(), and on this board
+ * the display bring-up installs it (see lcdc.c) - so once anything has
+ * touched Screen, every named pin below with a real id works. A sketch that
+ * wants pins without a display can install it itself:
  *
- *   #define SL6806_GPIO_CONFIGURED 1
+ *     sl6806_gpio_vendor_register(sl6806_padctl_vendor());
  *
- *   const sl6806_gpio_port_t sl6806_gpio_ports[] = {
- *       {
- *           .base = 0x40010000,      // <- the base you found
- *           .dir  = 0x00,            // <- register offsets
- *           .out  = 0x04,
- *           .in   = 0x08,
- *           .set  = 0x0C,            // or SL6806_REG_NONE if absent
- *           .clr  = 0x10,            // or SL6806_REG_NONE if absent
- *           .pull = SL6806_REG_NONE,
- *           .pull_dir = SL6806_REG_NONE,
- *           .dir_output_is_1 = 1,    // 0 if a set bit means *input*
- *           .npins = 32,
- *       },
- *   };
- *
- *   const sl6806_pin_t sl6806_pin_map[] = {
- *       {0, 0}, {0, 1}, {0, 2}, ...  // Arduino pin -> {port, bit}
- *   };
- *
- * Get dir_output_is_1 wrong and outputs read back correctly but never drive
- * the pin, so check it against a meter early.
+ * WHAT IS STILL MISSING is the board's pinout, not the driver: which pad
+ * each button is wired to. Every SL6806_GPIO_ID_NONE below is a pin nobody
+ * has identified yet.
  */
 
 #include "hal_gpio.h"
@@ -82,7 +68,9 @@ const uint32_t sl6806_vendor_pin_map[] = {
     SL6806_GPIO_ID_NONE,        /* 6  BTN_VOL_DOWN  [?]                   */
 
     /* 7  PIN_LCD_RESET. [V] id, [V] role: the panel reset routine at
-     * 0x00D3E1A4 drives exactly this id high / 10 ms / low / 20 ms / high. */
+     * 0x00D3E1A4 drives exactly this id high / 10 ms / low / 20 ms / high.
+     * Bank 1 pin 7; the display bring-up configures it as an output, so this
+     * is the one entry here that is known to be usable end to end. */
     0x13800u,
 
     /* 8  PIN_EXT_RESET. [V] id, [I] role: driven low / 10 ms / high / 50 ms
