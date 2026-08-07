@@ -39,9 +39,9 @@ so it is worth being precise about which parts are real:
 | Flash image format (HLKJ, CRC16, partitions) | **Works.** Both CRCs verify and round-trip. |
 | Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM. |
 | Panel: geometry, vendor init sequence, windowing, sleep/wake | **Works.** Recovered from the firmware, 53 host-side tests. |
-| Getting those pixels onto the glass | **Not yet.** Needs a 3-function bus — see [docs/LCD.md](docs/LCD.md). |
+| Getting those pixels onto the glass | **Written; does not work yet.** The panel is a QSPI display and the controller at `0x400D9000` has a driver, checked by 195 host-side tests against a model. On hardware it initialises cleanly, completes every transfer and produces no picture — cause still unknown. See [docs/LCD.md](docs/LCD.md) for what has been ruled out. |
 | `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
-| `pinMode` / `digitalWrite` / `digitalRead` | **Not yet.** The GPIO registers are unknown, but two pins have working vendor ids — see below. |
+| `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
@@ -85,33 +85,40 @@ the 24-bit SysTick fallback instead. Two consequences worth knowing:
   spin runs inside the boot ROM's USB handler and takes the device off the bus
   until it is unplugged.
 
-**GPIO has one hole, with two ways to fill it.** The driver is complete;
-what is missing is either the register addresses or a way to reach the
-vendor's own GPIO routine.
+**GPIO's hole is the pinout now, not the registers.** The pad controller was
+found in the mask ROM, not in flash — which is why an earlier round of
+analysis kept missing it. Nothing in the firmware writes a GPIO register
+directly; both the bootloader and the application call thunks into the ROM,
+and the ROM holds a six-entry table of bank bases at `0x00065004`:
 
-The stock firmware never writes a GPIO register — it calls
-`gpio_write(id, value)` at `0x00811C7C` with a packed pin id, from code that
-lives in the mask ROM's driver set. Those ids *are* recovered, including the
-panel reset pin, so a build that can reach that routine gets working
-`digitalWrite()` with no register map at all:
-
-```cpp
-sl6806_gpio_vendor_register(&my_backend);   // one function: write(id, value)
-digitalWrite(PIN_LCD_RESET, HIGH);          // works
+```
+0x40081000  0x40081040  0x400F6080  0x400810C0  0x40081100  0x400F6000
 ```
 
-The other route is the register table. The recipe is in
-[`cores/sl6806/hal_gpio.h`](cores/sl6806/hal_gpio.h), the helper is
-`tools/sl6806-find-mmio`, and the one place to write the answer is
-[`variants/p20_player/variant.c`](variants/p20_player/variant.c). Until one of
-the two exists, a digital call prints:
+The vendor's packed pin id decodes as bank `[19:16]`, pin `[15:11]`, function
+`[10:7]` (0 = input, 1 = output, 2+ = alternate), initial level `[6]`, drive
+`[5:4]`, pull `[3:0]`. The map and the driver are in
+[`cores/sl6806/sl6806_padctl.h`](cores/sl6806/sl6806_padctl.h).
+
+So a pin whose pad id is known works:
+
+```cpp
+digitalWrite(PIN_LCD_RESET, HIGH);   // bank 1 pin 7
+```
+
+On this board that is still only the two reset lines the stock firmware
+drives. Every other name in the variant is a pad nobody has identified, and
+using one prints:
 
 ```
 *** SL6806: GPIO is not configured ***
 ```
 
 That is deliberate. A GPIO API that quietly does nothing costs you an
-afternoon debugging your wiring.
+afternoon debugging your wiring. The recipe for finding an id is in
+[`cores/sl6806/hal_gpio.h`](cores/sl6806/hal_gpio.h), and the place to write
+the answer is
+[`variants/p20_player/variant.c`](variants/p20_player/variant.c).
 
 ### Serial is not a UART
 
@@ -125,32 +132,50 @@ bytes were lost if polling fell behind — those appear as `[lost output]`
 rather than a silently mangled stream. Typing in the monitor feeds
 `Serial.read()`, so sketches can be interactive.
 
-### The display draws, but nothing shows yet
+### The display: written end to end, and not yet seen
 
 `Screen` is a complete graphics stack — framebuffer, primitives, text, and a
 `Print` interface so `Screen.print(x)` works like `Serial.print(x)`. It is
 verified natively (`make -C tests/host`), including clipping and the font.
 
-The panel is no longer a mystery either. It is **240x296 RGB565, drawn at
-controller offset (0, 12)**, behind a standard MIPI DCS command set, and its
-**33-command vendor init sequence** was recovered from the firmware and lives
-in [`variants/p20_player/panel.c`](variants/p20_player/panel.c). Regenerate
-any of it from a dump with `tools/sl6806-panelseq`.
+The panel is **240x296 RGB565, drawn at controller offset (0, 12)**, behind a
+standard MIPI DCS command set, with a **33-command vendor init sequence**
+recovered from the firmware into
+[`variants/p20_player/panel.c`](variants/p20_player/panel.c). Regenerate any
+of it from a dump with `tools/sl6806-panelseq`.
 
-What is missing is one layer below all that: the byte-level bus. The stock
-firmware puts bytes on the wire with two routines in the mask ROM's driver
-set, so they are not in the flash image. Supply three functions —
+The layer that used to be missing — the byte-level bus — now exists.
+**The panel is a QSPI display.** The stock bootloader sends `02 00 <cmd> 00`
+for every DCS command and streams pixels behind a `32` opcode, which is the
+standard QSPI display frame, and once that is recognised the LCD controller at
+`0x400D9000` is straightforwardly a QSPI master. The bootloader's own driver
+for it is in flash and disassembles, so
+[`cores/sl6806/sl6806_lcdc.c`](cores/sl6806/sl6806_lcdc.c) is a transcription
+of it. The bus comes up by itself:
 
-```c
-sl6806_lcd_bus_register(&my_bus);   // command(), pixels(), reset()
-Screen.begin();
+```cpp
+Screen.begin(band, 160, 40);   // brings the controller up
+Screen.fill(SL6806_BLUE);
+Screen.display();
 ```
 
-— and the init sequence, windowing, framebuffer and text all start working
-unchanged. [docs/LCD.md](docs/LCD.md) describes the three ways to write that
-bus. The LCD controller itself has since been located at `0x400D9000`, with
-its driver readable in the bootloader; see
-[`cores/sl6806/sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
+**It has been run against a screen, and the screen stays dark.** The
+controller initialises, accepts all 226 transfers of the panel init with no
+timeouts, and takes a clock-proportional time per transfer — and the panel
+shows nothing, verified by flashing full white against full black under a
+lamp (the backlight is a separate PWM channel nothing here drives, so an
+unlit panel is not by itself evidence). What has been eliminated is in
+[docs/LCD.md](docs/LCD.md); the short version is that every register reads
+back exactly as the vendor programs it, the pads match the stock firmware's
+own configuration, and all eight combinations of the bits that were inferred
+rather than read have been tried.
+
+And one thing to know before concluding anything from a dark panel: **the
+backlight is a separate PWM channel** (`/dev/pwm_ch3`, 48 kHz) that this
+framework does not drive, so a working display driver still shows black.
+`examples/LcdProbe` and [docs/LCD.md](docs/LCD.md) walk through telling the
+failures apart. Payload mode never writes flash, so a failed attempt costs an
+unplug.
 
 ## Testing
 
@@ -272,6 +297,7 @@ declarations are not synthesised — define helpers before you call them.
 | `sl6806-monitor` | Serial monitor; finds the ring buffer by symbol, not by hardcoded address. |
 | `sl6806-find-mmio` | Ranks candidate peripheral base addresses in a dump. |
 | `sl6806-pack` | Builds a flashable image by patching a known-good dump. |
+| `sl6806-padscan` | Decodes every pad id the stock firmware configures into a bank/pin/function map; `--outputs` lists the pads worth driving when a rail is dark. |
 | `sl6806-panelseq` | Recovers the panel descriptor and its DCS command sequences from a dump; `--c` emits the variant tables. |
 | `sl6806-ramcalls` | Lists the SRAM and mask-ROM routines the stock firmware calls, ranked, with the constants passed at each call site. |
 | `sl6806-dumpram` | Reads device memory over USB — the mask ROM is the one worth reading. |
@@ -315,22 +341,29 @@ framework depends on are annotated with their provenance in
 
 In rough order of how much they unlock:
 
-1. **The LCDC command-list opcodes.** The controller is at `0x400D9000`, the
-   register map is written down, and the descriptor handoff is understood.
-   What is left is the meaning of `0xABAB0005` and `0xCDCDxx03`. Everything
-   above that layer is already written and tested, so this is now the single
-   thing between the framework and a picture.
-2. **GPIO registers** — the only route to `digitalWrite`. Start with
-   `tools/sl6806-find-mmio`. Note the mask ROM has been dumped and does *not*
-   contain them.
-3. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+1. **Run the display driver on a real P20 and report what happens.** This is
+   worth more than any further reading of the dump. The whole stack is
+   written and the panel is a QSPI display; what nobody knows is whether the
+   two inferred bits of the transfer register and the guessed pixel byte
+   order are right. [docs/LCD.md](docs/LCD.md) has the checklist. It cannot
+   brick anything in payload mode.
+2. **This board's pinout.** The pad controller is done
+   ([`sl6806_padctl.h`](cores/sl6806/sl6806_padctl.h)); what is missing is
+   which pad each button and LED is on. The ids are immediates at the stock
+   firmware's 54 GPIO call sites, so this is a reading exercise plus a meter.
+3. **A DMA driver.** The display pushes pixels 16 bytes at a time because
+   that is the FIFO depth. The vendor uses the DMA controller at
+   `0x40070000`; its command-list format is decoded at the bottom of
+   [`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
+4. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
    clock, so this no longer blocks anything; finding the PLL registers would
    still give it exactly. They are *not* at the clock unit's base:
    `0x40080000` has dividers but no multiplier.
 
-The mask ROM has since been dumped, which settled two questions in the
-negative: it holds no LCD driver, and the vendor SRAM routines are not
-resident in bootloader mode, so a payload cannot call them. See
+~~**The LCDC command-list opcodes**~~ — decoded; see §12b of the notes. The
+mask ROM dump settled two more in the negative: it holds no LCD driver, and
+the vendor SRAM routines are not resident in bootloader mode, so a payload
+cannot call them. See
 [docs/sl6806_re_notes.md](docs/sl6806_re_notes.md) §7f.
 
 ## Layout
@@ -338,13 +371,15 @@ resident in bootloader mode, so a payload cannot call them. See
 ```
 cores/sl6806/     the core: Arduino.h, Print/Stream/String, timing, GPIO HAL,
                   USB serial, startup for both modes, boot ROM ABI,
-                  peripheral maps (sl6806_cru.h, sl6806_lcdc.h)
+                  the pad controller (sl6806_padctl.*) and the LCD
+                  controller (sl6806_lcdc.*), clock map (sl6806_cru.h)
 cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, MmioProbe, RomProbe, CallbackProbe
-tests/host/       native tests for console, graphics and the panel
+examples/         Hello, Blink, GfxDemo, LcdProbe, MmioProbe, RomProbe,
+                  CallbackProbe
+tests/host/       native tests for console, graphics, the panel and the LCDC
 docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
 3rd/              smartlink_flash submodule
 ```
