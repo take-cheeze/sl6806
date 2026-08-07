@@ -103,12 +103,23 @@ static void reset_log(void)
 void delay(uint32_t ms);
 void delay(uint32_t ms) { log_delay_total += ms; }
 
+/* The real ones live in wiring_time.c. LcdBus.c lifts the cap around panel
+ * waits, so the stubs have to record it faithfully or the test below would
+ * pass for the wrong reason. */
+static uint32_t stub_block_limit;
+uint32_t sl6806_block_limit(void);
+uint32_t sl6806_block_limit(void) { return stub_block_limit; }
+void sl6806_set_block_limit(uint32_t ms);
+void sl6806_set_block_limit(uint32_t ms) { stub_block_limit = ms; }
+
 /* ------------------------------------------------------------------ tests */
 
 static void test_bus_registration(void)
 {
-    static const sl6806_lcd_bus_t no_command = { "bad", 0, rec_pixels, 0, 0 };
-    static const sl6806_lcd_bus_t no_pixels  = { "bad", rec_command, 0, 0, 0 };
+    static const sl6806_lcd_bus_t no_command = { .name = "bad",
+                                                 .pixels = rec_pixels };
+    static const sl6806_lcd_bus_t no_pixels  = { .name = "bad",
+                                                 .command = rec_command };
 
     CHECK(sl6806_lcd_bus_register(&no_command) == -1, "command() is required");
     CHECK(sl6806_lcd_bus_register(&no_pixels) == -1, "pixels() is required");
@@ -336,6 +347,34 @@ static void test_no_bus_is_safe(void)
           "and reports the panel width");
 }
 
+/*
+ * The bug this exists to stop coming back.
+ *
+ * RUN_MODE=poll caps delay() at 50 ms so that a blocking sketch cannot wedge
+ * the USB link. Applied to the panel, that cap silently shortens the 120 ms
+ * after SLPOUT and the 120 ms after reset - and the symptom is a display that
+ * initialises cleanly, reports no error, and stays black. It cost a hardware
+ * session. The panel path must ignore the cap.
+ */
+static void test_panel_delays_ignore_the_block_cap(void)
+{
+    extern const sl6806_dcs_panel_t sl6806_p20_panel;
+
+    sl6806_lcd_bus_register(&rec_bus);
+    reset_log();
+    stub_block_limit = 50;          /* what poll mode sets */
+
+    sl6806_dcs_begin(&sl6806_p20_panel);
+
+    /* reset 10 + 20 + 120, then the sequence's 120 + 50. */
+    CHECK(log_delay_total == 320,
+          "panel bring-up waited %u ms, want 320 - a cap got applied",
+          (unsigned)log_delay_total);
+    CHECK(stub_block_limit == 50, "the cap was not put back");
+
+    stub_block_limit = 0;
+}
+
 int main(void)
 {
     test_bus_registration();
@@ -347,6 +386,8 @@ int main(void)
     test_window_subrect();
     test_window_clipping();
     test_no_bus_is_safe();
+
+    test_panel_delays_ignore_the_block_cap();
 
     printf("test_panel: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

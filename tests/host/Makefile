@@ -10,7 +10,7 @@ VARIANT := ../../variants/p20_player
 CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
-TESTS := test_console test_gfx test_panel
+TESTS := test_console test_gfx test_panel test_lcdc
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -24,6 +24,9 @@ run-test_gfx: test_gfx
 run-test_panel: test_panel
 	./$<
 
+run-test_lcdc: test_lcdc
+	./$<
+
 test_console: test_console.c $(CORE)/sl6806_console.c
 	$(CC) $(CFLAGS) $^ -o $@
 
@@ -34,6 +37,13 @@ test_gfx: test_gfx.c $(CORE)/gfx/Framebuffer.c $(CORE)/gfx/font5x7.c
 # tools/sl6806-panelseq is checked against the assertions rather than trusted.
 test_panel: test_panel.c $(CORE)/gfx/LcdBus.c $(VARIANT)/panel.c
 	$(CC) $(CFLAGS) $^ -o $@
+
+# The LCD controller driver against a model of the controller.
+# SL6806_MMIO_HOOKED replaces the volatile load and store in sl6806_mmio.h
+# with the test's own, so the driver's real register sequence is what runs.
+test_lcdc: test_lcdc.c $(CORE)/sl6806_lcdc.c $(CORE)/sl6806_padctl.c \
+           $(CORE)/gfx/LcdBus.c $(VARIANT)/panel.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:
 	rm -f $(TESTS) *.ppm

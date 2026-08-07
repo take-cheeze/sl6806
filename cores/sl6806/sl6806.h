@@ -56,18 +56,24 @@ extern "C" {
  * being identified. */
 #define SL6806_PERIPH_BASE     0x40000000u  /* [V] */
 
-/* LCD controller. Found by cross-referencing the MMIO candidates against the
- * stock LCD code: these four registers are read-modify-written by functions
- * called from lv_lcd_init's op table. Bit 15 of +0x64 and +0x74 gates the
- * controller (cleared, delayed, then set again on reset); +0x10C carries a
- * field at 0xF10 plus a start bit 0. The DMA descriptor programming lives in
- * RAM-resident code that is not present in the flash image, so the sequence
- * that actually moves pixels is still unknown - see docs/LCD.md. */
-#define SL6806_LCDC_BASE       0x40080000u  /* [V] */
-#define SL6806_LCDC_CTRL0      (SL6806_LCDC_BASE + 0x064u)  /* [V] bit15 enable */
-#define SL6806_LCDC_CTRL1      (SL6806_LCDC_BASE + 0x074u)  /* [V] bit15 enable */
-#define SL6806_LCDC_CFG        (SL6806_LCDC_BASE + 0x10Cu)  /* [V] bit0 start */
-#define SL6806_LCDC_REG120     (SL6806_LCDC_BASE + 0x120u)  /* [V] purpose unknown */
+/*
+ * CORRECTION. This block used to define SL6806_LCDC_BASE as 0x40080000, on
+ * the strength of the stock LCD code read-modify-writing four registers
+ * there. Those registers are real, but the block is the **clock and reset
+ * unit**, and those four accesses are the LCD's clock gating - the LCD path
+ * never moves a pixel through 0x40080000.
+ *
+ * The names are kept, pointing at the same registers with honest ones, so
+ * nothing that used them silently changes meaning:
+ *
+ *   the clock unit  0x40080000  cores/sl6806/sl6806_cru.h
+ *   the LCDC        0x400D9000  cores/sl6806/sl6806_lcdc.h  (and a driver)
+ */
+#define SL6806_CRU_BASE_ADDR   0x40080000u  /* [V] see sl6806_cru.h */
+#define SL6806_LCD_GATE0       (SL6806_CRU_BASE_ADDR + 0x064u)  /* [V] bit15 */
+#define SL6806_LCD_GATE1       (SL6806_CRU_BASE_ADDR + 0x074u)  /* [V] bit15 */
+#define SL6806_LCD_MODCLK      (SL6806_CRU_BASE_ADDR + 0x10Cu)  /* [V] bit0 start */
+#define SL6806_LCD_CRU_120     (SL6806_CRU_BASE_ADDR + 0x120u)  /* [V] unknown */
 
 /* ------------------------------------------------------------------ */
 /* Flash layout (partition table lives at flash offset 0x0000F000)      */

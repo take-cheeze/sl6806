@@ -13,14 +13,14 @@ __attribute__((weak)) void sl6806_panel_unconfigured(void)
     sl6806_debug_print(
         "\r\n"
         "*** SL6806: no LCD bus ***\r\n"
-        "    Drawing works - the framebuffer and all primitives are\r\n"
-        "    implemented and tested - and so does the panel: geometry,\r\n"
-        "    the vendor init sequence and windowing were all recovered\r\n"
-        "    from the stock firmware.\r\n"
-        "    What is missing is the byte-level transport. Supply an\r\n"
+        "    Drawing still works - it goes to RAM and stops there.\r\n"
+        "    On a board with an LCD controller this should not happen:\r\n"
+        "    the bus comes up by itself on the first Screen call. Either\r\n"
+        "    this variant has no display, or sl6806_lcdc_begin() failed -\r\n"
+        "    check for a controller-timeout message just above.\r\n"
+        "    To supply a transport of your own, fill in an\r\n"
         "    sl6806_lcd_bus_t - command(), pixels(), reset() - and call\r\n"
-        "    sl6806_lcd_bus_register() before begin(). See docs/LCD.md,\r\n"
-        "    and examples/RomProbe for the shortest route to one.\r\n\r\n");
+        "    sl6806_lcd_bus_register() before begin(). See docs/LCD.md.\r\n\r\n");
 }
 
 bool Display::begin()
