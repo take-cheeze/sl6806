@@ -1,7 +1,7 @@
 /*
  * Backlight - find the clock that wakes the PWM, then drive it.
  *
- * TWO RUNS SO FAR, both negative, and both narrowed it:
+ * FOUR RUNS SO FAR, each negative and each narrowing it:
  *
  *   2026-08-07 a. Every register zero, including the module gate itself
  *     (modctl 0x0 -> 0x0). The write did not stick, so the gate bit was never
@@ -23,6 +23,13 @@
  *     0x1000007F (bit 28 is the busy flag 0x00811E74 polls), and period/duty
  *     took (48000 << 16) | 28800 exactly. Every register did what it was
  *     told, and the panel still did not light.
+ *
+ *   2026-08-07 d. Gate set, pad muxed to bank 1 pin 0 function 4, every
+ *     register correct - CTRL 0x1000007F, period/duty 0xBB807080, mode 1 -
+ *     and still no light. Reading the block back from the host afterwards
+ *     showed why it cannot be a register-contents problem: the channel is
+ *     programmed exactly right and CTRL bit 28, the busy flag the vendor
+ *     spins on before every write, is stuck set. A counter with no clock.
  *
  * WHICH LEFT THE PAD. A PWM running into a pin that is still muxed to GPIO
  * drives nothing. The vendor's configure op (0x00D45394) calls ROM 0x93C -
@@ -56,9 +63,11 @@
  * a clock on for a block whose reset is still asserted does nothing. Nothing
  * writes flash, so a replug always recovers.
  *
- * Still not written: 0x4008011C, the clock-source select the vendor sets
- * after the PLL locks. If it reparents the core or USB onto the PLL the
- * session ends and takes the log with it.
+ * NOW WRITTEN, after run d showed why it had to be: 0x4008011C. The vendor
+ * sets it to 0x31 right after the PLL locks and to 0x30 on the way down. One
+ * bit apart means bit 0 is an enable, not the clock-source reparent it was
+ * first taken for - and a plain enable cannot take the core or USB with it,
+ * which is what the earlier caution was about.
  */
 
 #include <Arduino.h>
@@ -118,7 +127,7 @@ static bool pwm_responds(void)
     return true;
 }
 
-/* 0x00D9A7FC, minus the clock-source select. Returns true if it locked. */
+/* 0x00D9A7FC in full, now including the clock enable. True if it locked. */
 static bool pll_start(void)
 {
     uint32_t i;
@@ -139,7 +148,33 @@ static bool pll_start(void)
 
     sl6806_mmio_write(SL6806_PLL_CTRL,
                       sl6806_mmio_read(SL6806_PLL_CTRL) | SL6806_PLL_OUT_ENABLE);
+    delay(10);
+
+    /*
+     * The last step of 0x00D9A7FC, and the one this sketch used to leave out.
+     * 0x31 up, 0x30 down - one bit apart, so it is an enable rather than the
+     * reparent it looked like, and a plain enable cannot take USB with it.
+     */
+    sl6806_mmio_write(SL6806_CRU_CLK_ENABLE, SL6806_CRU_CLK_ON);
+    delay(10);
     return true;
+}
+
+/*
+ * Is the counter actually running? Bit 28 is the busy flag the vendor spins on
+ * before every period/duty write (0x00811E74). If it never clears, the vendor's
+ * own driver would hang there - so stuck-set means this channel has no clock,
+ * whatever its other registers say. That is the single most diagnostic bit on
+ * the block and it is worth printing every time.
+ */
+static void show_busy(unsigned ch)
+{
+    uint32_t c = sl6806_mmio_read(SL6806_PWM_CHAN(ch) + SL6806_PWM_CTRL);
+
+    Serial.print("  ctrl 0x");
+    Serial.print(c, HEX);
+    Serial.println((c & SL6806_PWM_CTRL_BUSY) ? "  busy STUCK (no counter clock)"
+                                              : "  busy clear (counter runs)");
 }
 
 /*
@@ -222,9 +257,18 @@ static void configure(unsigned ch)
     sl6806_pwm_enable(ch, 1);
     sl6806_pwm_run(ch, 1);
 
-    show("ctrl", base + SL6806_PWM_CTRL);
     show("p/d ", base + SL6806_PWM_PERIOD_DUTY);
     show("mode", base + SL6806_PWM_MODE);
+
+    /* Pulse the update trigger the vendor's accessors expose (CTRL bit 8,
+     * set by 0x00811E62 and polled clear by 0x00811E6C). Nothing in the
+     * firmware calls it, so it is probably not required - but it costs one
+     * write, and if the counter is stalled waiting to latch it is free. */
+    sl6806_mmio_write(base + SL6806_PWM_CTRL,
+                      sl6806_mmio_read(base + SL6806_PWM_CTRL)
+                      | SL6806_PWM_CTRL_UPDATE);
+    delayMicroseconds(500);
+    show_busy(ch);
 }
 
 void setup()
@@ -272,6 +316,10 @@ void loop()
             return;
         }
         show("pll   ", SL6806_PLL_CTRL);
+        show("clken ", SL6806_CRU_CLK_ENABLE);
+        show("modctl", SL6806_MODCTL_BASE);
+        Serial.println("  (if modctl is non-zero now, the clock enable was");
+        Serial.println("   what that whole region was waiting for)");
 
         /* The gate is known now - measured, not guessed. Set it directly and
          * only fall back to the sweep if this board disagrees. */
@@ -340,6 +388,7 @@ void loop()
         }
         sl6806_pwm_set(BL_CHAN, SL6806_PWM_BL_PERIOD,
                        SL6806_PWM_BL_DUTY(ramp[step]));
+        show_busy(BL_CHAN);
         Serial.print("  duty ");
         Serial.print(ramp[step]);
         Serial.println("%");

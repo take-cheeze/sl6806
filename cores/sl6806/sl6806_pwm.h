@@ -131,15 +131,21 @@
 #define SL6806_PLL_OUT_ENABLE   (1u << 16)  /* [V] set after lock            */
 
 /*
- * [V] Written 49 (0x31) right after the PLL locks, before the first module is
- * enabled. [I] A clock-source select - which would reparent something onto
- * the PLL. NOT WRITTEN by anything in this tree: if it reparents the core or
- * the USB clock it would take the device off the bus mid-sketch, and the
- * whole reason a payload can be debugged at all is that the ROM's USB link
- * keeps running. Try it only when you can afford to lose the session.
+ * [V] Written 0x31 right after the PLL locks and before the first module is
+ * enabled (0x00D9A82A), and 0x30 on the way down (0x00D9A89A). One bit apart,
+ * so **bit 0 is an enable** and 0x30 is a field that stays put - this is a
+ * clock enable, not the clock-source reparent it was first taken for. That
+ * matters, because a reparent could have taken the core or USB with it and a
+ * plain enable cannot.
+ *
+ * It is the last step of the vendor's PLL sequence that nothing here performs,
+ * and it is the leading explanation for two things at once: a PWM whose
+ * registers answer but whose counter never runs, and a 0x400E0000 that reads
+ * zero forever.
  */
-#define SL6806_CRU_CLKSEL_11C   0x4008011Cu
-#define SL6806_CRU_CLKSEL_11C_VALUE 0x31u
+#define SL6806_CRU_CLK_ENABLE   0x4008011Cu
+#define SL6806_CRU_CLK_ON       0x31u
+#define SL6806_CRU_CLK_OFF      0x30u
 
 /* ------------------------------------------------------------------ */
 /* The block                                                           */
