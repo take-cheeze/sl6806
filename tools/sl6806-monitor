@@ -205,6 +205,13 @@ def main():
                         "monitor with a signal can land in the middle of a "
                         "USB transaction and desynchronise the endpoint, "
                         "which wedges the device until it is power cycled.")
+    p.add_argument("--tick", type=float, metavar="SECONDS",
+                   help="send a newline every SECONDS. Lets a sketch be paced "
+                        "from the host instead of from millis(), which on this "
+                        "device is not usable for pacing: loop() runs at the "
+                        "USB poll rate, and that has been measured anywhere "
+                        "from 0.3 to 42 calls per second depending on how "
+                        "recently the board was cold booted.")
     p.add_argument("--idle-exit", type=float, metavar="SECONDS",
                    help="exit once the device has produced no output for "
                         "SECONDS. Handy when a sketch prints a finite report "
@@ -235,6 +242,7 @@ def main():
     misses = 0
     started = time.time()
     last_output = started
+    next_tick = started + (args.tick or 0)
 
     try:
         while True:
@@ -245,6 +253,10 @@ def main():
                 print("[no output for %.0f s; exiting]" % args.idle_exit,
                       file=sys.stderr)
                 break
+
+            if args.tick is not None and time.time() >= next_tick:
+                next_tick = time.time() + args.tick
+                pending_in += b"\n"
 
             got = dev.poll_console()
 

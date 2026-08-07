@@ -50,13 +50,17 @@ typedef struct {
  * have already been tried without success, kept so one pass covers
  * everything.
  */
+/*
+ * ELIMINATED on hardware, held high for ~19 s each and watched, twice:
+ *   0x00017618  bank 1 pin 14  alt 12
+ *   0x00017E18  bank 1 pin 15  alt 12
+ *   0x000512B0  bank 5 pin 2   alt 5
+ *   0x00016F08  bank 1 pin 13  alt 14
+ *   0x00021705  bank 2 pin 2   alt 14
+ *   0x000157B0  bank 1 pin 10  off in firmware
+ * Left out of the list so a cycle over what remains fits in one monitor run.
+ */
 static const cand_t cands[] = {
-    { 0x00017618u, "bank 1 pin 14  alt 12  (pair with pin 15)" },
-    { 0x00017E18u, "bank 1 pin 15  alt 12  (pair with pin 14)" },
-    { 0x000512B0u, "bank 5 pin 2   alt 5   (lone function)" },
-    { 0x00016F08u, "bank 1 pin 13  alt 14" },
-    { 0x00021705u, "bank 2 pin 2   alt 14" },
-    { 0x000157B0u, "bank 1 pin 10  off in firmware" },
     { 0x00030DBBu, "bank 3 pin 1   alt 11" },
     { 0x000315BBu, "bank 3 pin 2   alt 11" },
     { 0x00031DBBu, "bank 3 pin 3   alt 11" },
@@ -88,11 +92,22 @@ static const cand_t cands[] = {
  * because a monitor that outlives the foreground limit gets backgrounded, and
  * a second one started alongside it wedges the device off the bus.
  */
-#define HOLD_POLLS 3u
+/*
+ * PACED BY THE HOST, NOT BY THIS DEVICE.
+ *
+ * Neither clock here can time a candidate. millis() loses SysTick wraps
+ * between polls, and counting polls fails too because the poll rate is not a
+ * constant: measured at roughly 0.3 per second after a long session, and 42
+ * per second right after a cold boot - a factor of a hundred, which turned a
+ * three-second dwell into either 9 seconds or 70 milliseconds.
+ *
+ * So this advances only when a byte arrives on Serial, and the host sends one
+ * every few seconds (sl6806-monitor --tick). The dwell is then exact and the
+ * log still names the pad, whatever the link is doing.
+ */
 
 static int cursor = -1;
 static bool announced;
-static unsigned held;
 static bool white;
 
 static void release(int i)
@@ -126,10 +141,9 @@ void loop()
     Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
     Screen.display();
 
-    if (held < HOLD_POLLS) {
-        held++;
-        return;                 /* still holding the current candidate */
-    }
+    /* Advance only when the host says so. */
+    if (Serial.read() < 0)
+        return;
 
     if (!announced) {
         int next = (cursor + 1) % NCANDS;
@@ -150,6 +164,5 @@ void loop()
     /* Function 1 is output; keep the pad's own drive and pull settings. */
     sl6806_pad_configure((cands[cursor].id & ~0x00000780u) | (1u << 7) | (1u << 6));
 
-    held = 0;
     announced = false;
 }
