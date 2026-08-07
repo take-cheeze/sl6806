@@ -44,7 +44,7 @@ so it is worth being precise about which parts are real:
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | Keys — the two volume buttons | **Works.** They are an ADC resistor ladder, not GPIO; driver in [`cores/sl6806/sl6806_adc.c`](cores/sl6806/sl6806_adc.c), board map in the variant, 97 host tests. Verified on hardware. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
-| Backlight | **Works.** `sl6806_backlight_begin(100)`. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
+| Backlight | **On/off works; dimming does not.** `sl6806_backlight_begin(100)` lights the panel from cold or warm. The PWM counter does not run, so duty has no effect yet. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 

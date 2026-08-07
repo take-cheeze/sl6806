@@ -1262,14 +1262,20 @@ squarely at the pair-register write, because a reader checking this driver
 against the disassembly would find no vendor code for it and reasonably
 conclude it was spurious.
 
-**Two follow-ups from the first working run.**
+**It lights, and it does not dim — the counter is not running.** Duty 0 and
+duty 100 are indistinguishable, CTRL bit 8 (the commit the vendor's own
+accessors pulse) never self-clears once set, and CTRL bit 28 is permanently
+set. So bit 8 of the pair register is driving the pad to a **static level**,
+not making a waveform. This is an on/off backlight until the counter's clock is
+found, which is enough to unblock the display and not enough to dim it.
 
-*Brightness did not change.* Period and duty land in the register and the
-output keeps the old value, which is a shadow register wanting a commit. The
-vendor exposes exactly that: `0x00811E62` sets **CTRL bit 8** and `0x00811E6C`
-polls it clear. `sl6806_backlight_set` now pulses it after every write.
-**Unconfirmed** — the symptom fits and the accessors exist, but it has not been
-seen to dim yet.
+> ⚠ **Every sweep in this section that used CTRL bit 28 as its success test is
+> void** — including the walk over all 128 module ids, which is otherwise the
+> most thorough negative here. They were interrogating a bit that never
+> answers. A valid test is `sl6806_pwm_counter_ticking()`: read the channel
+> block twice and see whether anything moved. A running counter ticks; a
+> stopped one does not. `examples/Backlight` will redo the walk with it if you
+> press `h`.
 
 *Bring-up failed on the second upload* with "the module clock refused", on a
 board that was visibly working. That was a bug in the driver, not the chip:

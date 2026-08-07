@@ -27,11 +27,23 @@
  * running perfectly. Three separate "the counter never starts" conclusions
  * came from testing it. The panel is the only detector that was ever right.
  *
+ * WHAT IT STILL CANNOT DO IS DIM. The counter does not run: duty 0 and duty
+ * 100 are indistinguishable, and both of the block's plausible status bits -
+ * CTRL bit 8 and bit 28 - are stuck. Bit 8 of the pair register is driving
+ * the pad to a level, not making a waveform.
+ *
+ * PRESS 'h' IN THE MONITOR to hunt for the counter's clock. It walks all 128
+ * module ids and tests each one by asking whether any word in the channel
+ * block changes between two reads, which is the detector the earlier walks
+ * should have used - they tested CTRL bit 28, which never answers, so their
+ * negatives mean nothing. Anything is only ever switched on, never off.
+ *
  *     make SKETCH=examples/Backlight RUN_MODE=poll run
  */
 
 #include <Arduino.h>
 #include "sl6806_pwm.h"
+#include "sl6806_module.h"
 #include "sl6806_lcdc.h"
 
 static sl6806_color_t band[240 * 8];
@@ -41,6 +53,7 @@ static const uint8_t ramp[] = { 0, 10, 25, 50, 75, 100, 75, 50, 25, 10 };
 
 static int  step;
 static bool white;
+static int  hunt_id = -1;      /* -1 = not hunting */
 
 void setup()
 {
@@ -69,8 +82,46 @@ void loop()
     Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
     Screen.display();
 
-    if (Serial.read() < 0)
+    {
+        int c = Serial.read();
+
+        if (c < 0)
+            return;
+        if (c == 'h' && hunt_id < 0) {
+            hunt_id = 0;
+            Serial.println();
+            Serial.println("hunting the counter clock; 8 module ids per tick");
+        }
+    }
+
+    if (hunt_id >= 0) {
+        int end = hunt_id + 8, id;
+
+        if (hunt_id >= 128) {
+            Serial.println("  no module id started the counter (valid test");
+            Serial.println("  this time: the block never ticked)");
+            hunt_id = -1;
+            return;
+        }
+        Serial.print("  ids ");
+        Serial.print(hunt_id);
+        Serial.print("..");
+        Serial.print(end - 1);
+        Serial.print(": ");
+        for (id = hunt_id; id < end && id < 128; id++) {
+            sl6806_module_enable((unsigned)id);
+            if (sl6806_pwm_counter_ticking(3)) {
+                Serial.print("id ");
+                Serial.print(id);
+                Serial.println(" TICKS - the counter is running");
+                hunt_id = -1;
+                return;
+            }
+        }
+        Serial.println("no tick");
+        hunt_id = end;
         return;
+    }
 
     sl6806_backlight_set(ramp[step]);
     Serial.print("  brightness ");

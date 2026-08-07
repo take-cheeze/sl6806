@@ -2,10 +2,24 @@
  * sl6806_pwm.h - the SL6806 PWM at 0x40084000, and the panel backlight.
  *
  * =====================================================================
- *  THIS WORKS. THE PANEL LIGHTS.
+ *  THE PANEL LIGHTS. IT DOES NOT DIM.
  * =====================================================================
- * Verified on a P20 Player, 2026-08-07, after twelve hardware runs that did
- * not. Everything below is measured unless marked otherwise.
+ * Verified on a P20 Player, 2026-08-07. sl6806_backlight_begin() turns the
+ * backlight on, reliably, from cold or warm. What it does NOT do is vary the
+ * brightness, and the reason matters:
+ *
+ * [M] The counter is not running. Duty 0 and duty 100 look identical, CTRL
+ * bit 8 (the update/commit bit) never self-clears once set, and CTRL bit 28
+ * is permanently set. All three say the same thing: bit 8 of the pair
+ * register is driving the output pad to a static level, not producing a
+ * waveform, and this is an on/off backlight until the counter's clock is
+ * found.
+ *
+ * [!] CONSEQUENCE FOR ANYONE READING THE OLD NOTES: every sweep in §14a that
+ * used CTRL bit 28 as its success test is void, including the walk over all
+ * 128 module ids. They were asking a bit that never answers. A valid test is
+ * whether any word in the block changes between two reads - a running counter
+ * ticks, a stopped one does not.
  *
  * THE RECIPE, in order, because every step of it cost something:
  *
@@ -283,8 +297,26 @@ extern "C" {
  */
 int sl6806_backlight_begin(unsigned percent);
 
-/* Set brightness, 0..100. Clamped, exactly as 0x00D102F4 clamps it. */
+/*
+ * Set brightness, 0..100. Clamped exactly as 0x00D102F4 clamps it, writes the
+ * duty the vendor would write, and pulses the commit bit.
+ *
+ * [M] AND HAS NO VISIBLE EFFECT YET, because the counter does not run - see
+ * the top of this file. It is kept because the register values are right and
+ * because the day the counter starts, this is already correct.
+ */
 void sl6806_backlight_set(unsigned percent);
+
+/*
+ * Is the block's counter actually running? Reads the channel block twice and
+ * reports whether anything ticked.
+ *
+ * This exists because the obvious status bits lie: CTRL bit 28 looks like a
+ * busy flag and is permanently set, CTRL bit 8 looks like a commit and never
+ * clears. Several confident negatives in the notes came from trusting them.
+ * A counter that runs changes something; one that does not, does not.
+ */
+int sl6806_pwm_counter_ticking(unsigned ch);
 
 #ifdef __cplusplus
 }

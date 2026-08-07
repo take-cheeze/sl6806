@@ -61,6 +61,23 @@ static int pwm_writable(void)
     return ok;
 }
 
+int sl6806_pwm_counter_ticking(unsigned ch)
+{
+    uint32_t base = SL6806_PWM_CHAN(ch);
+    uint32_t first[8];
+    unsigned i, k;
+
+    for (i = 0; i < 8; i++)
+        first[i] = sl6806_mmio_read(base + i * 4);
+
+    /* Give a counter time to move without blocking the USB handler. */
+    for (k = 0; k < 4; k++)
+        for (i = 0; i < 8; i++)
+            if (sl6806_mmio_read(base + i * 4) != first[i])
+                return 1;
+    return 0;
+}
+
 int sl6806_backlight_begin(unsigned percent)
 {
     uint32_t base = SL6806_PWM_CHAN(BL_CHAN);
