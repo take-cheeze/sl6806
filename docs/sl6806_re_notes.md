@@ -1407,6 +1407,24 @@ routine. It is transcribed rather than called because the ROM's poll is
 unbounded: an id nothing implements would spin forever inside the boot ROM's
 USB handler and take the device off the bus.
 
+**IT WORKS. The ADC is module id 84** (2026-08-07) — the third pair, CRU
+`+0x68` gate / `+0x78` shadow, **bit 20**. With it enabled the block takes
+writes and holds them: `+0x00` reads back `0x80180000` and `+0x04` reads
+`0x0002A800`, exactly what `adc_init` wrote.
+
+Read that against §15's negative, which tried *that very bit* and failed. The
+difference is entirely the order — the old sweep set gate and shadow together
+and moved on, where the ROM sets the shadow, then the gate, then waits for the
+gate to read the bit back. **Shadow first, then gate, then poll: the order is
+the operation**, and a sweep that skips the acknowledgement will report a
+working bit as dead.
+
+The walk also has to be paced. The first attempt ran all 128 ids inside
+`setup()` with a 100000-iteration poll each, spent over a second in the boot
+ROM's USB handler, and took the device off the bus — with no log, because the
+console is a ring in the device's own RAM read over the link that died. Four
+ids per `loop()` call and a 200-iteration poll fixes both halves.
+
 **This is worth re-running for the PWM too.** The backlight's functional clock
 was hunted across three register pairs with the wrong write order and without
 the fourth pair, so §14a's negative is not as complete as it reads.

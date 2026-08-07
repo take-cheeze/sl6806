@@ -82,6 +82,17 @@
 #define KEY_LEVEL_B     0x0E60u
 #define KEY_ID_B        0x40
 
+/*
+ * [V, MEASURED] The ADC's module id, found by walking 0..127 (2026-08-07).
+ * 84 lands in the third pair: CRU +0x68 gate, +0x78 shadow, bit 20.
+ *
+ * An earlier sweep tried that exact bit and failed, which is the lesson worth
+ * keeping: it wrote gate and shadow together and never waited for the
+ * acknowledgement. Shadow first, then gate, then poll - the order is the
+ * operation.
+ */
+#define ADC_MODULE_ID   84
+
 #define CRU_BASE        0x40080000u
 #define MOD_BASE_HI     0x400F1000u   /* [V] ids 96..127 live here */
 #define NMODULES        128
@@ -89,6 +100,24 @@
 
 static uint32_t last[NWORDS];
 static bool     have_last;
+static int      last_gpio = -1;
+
+/*
+ * The two /dev/key_io pads. They do not move on a button press, but the
+ * firmware also has pwm_is_jack_exist and pwm_is_sd_exist, so a headphone or
+ * a card may well move them - and watching them costs two reads. The previous
+ * build dropped these, which is why a jack test against it measured nothing.
+ */
+#define KEYIO_PIN_A 12
+#define KEYIO_PIN_B 17
+
+static int gpio_state(void)
+{
+    int a = sl6806_pad_read(SL6806_PAD_ID(1, KEYIO_PIN_A, SL6806_PAD_FUNC_INPUT));
+    int b = sl6806_pad_read(SL6806_PAD_ID(1, KEYIO_PIN_B, SL6806_PAD_FUNC_INPUT));
+
+    return ((a > 0) ? 1 : 0) | ((b > 0) ? 2 : 0);
+}
 static int      opened_by = -1;
 
 /*
@@ -138,6 +167,20 @@ static bool adc_writable(void)
     ok = (sl6806_mmio_read(reg) == 0x0002A800u);
     sl6806_mmio_write(reg, saved);
     return ok;
+}
+
+/*
+ * Turn a channel on. adc_init zeroes +0x00's low bits and +0x0C, and nothing
+ * else ever sets them, which is why the block came up configured but idle.
+ *   0x00D994BC: [base+0x00] bit ch  - channel enable
+ *   0x00D9948C: [base+0x0C] bit ch
+ */
+static void adc_start(unsigned ch)
+{
+    sl6806_mmio_write(ADC_BASE + 0x00,
+                      sl6806_mmio_read(ADC_BASE + 0x00) | (1u << ch));
+    sl6806_mmio_write(ADC_BASE + 0x0C,
+                      sl6806_mmio_read(ADC_BASE + 0x0C) | (1u << ch));
 }
 
 /* 0x00D994EC, transcribed. */
@@ -227,10 +270,20 @@ void setup()
     Serial.print(" (bank 1 pin 9 fn 15, analog) -> ");
     Serial.println(sl6806_pad_configure(ADC_KEY_PAD) == 0 ? "ok" : "REFUSED");
 
+    /* The two key_io pads, as pulled-up inputs, so jack/SD insertion shows. */
+    sl6806_pad_configure(SL6806_PAD_ID(1, KEYIO_PIN_A, SL6806_PAD_FUNC_INPUT) | 8u);
+    sl6806_pad_configure(SL6806_PAD_ID(1, KEYIO_PIN_B, SL6806_PAD_FUNC_INPUT) | 8u);
+
     dump("before:");
 
+    /* The id is known now; only fall back to walking if this board differs. */
+    module_enable(ADC_MODULE_ID);
+    Serial.print("module id ");
+    Serial.print(ADC_MODULE_ID);
+    Serial.print(" (CRU +0x68 bit 20) -> ADC writable: ");
+    Serial.println(adc_writable() ? "yes" : "no");
+
     if (adc_writable()) {
-        Serial.println("ADC already accepts writes.");
         next_id = NMODULES;
         opened_by = -2;              /* nothing to hunt */
     } else {
@@ -255,6 +308,7 @@ void loop()
         if (r == 1) {
             opened_by = 1;
             adc_init();
+            adc_start(ADC_KEY_CHAN);
             dump("after: ");
             Serial.print("writable now: ");
             Serial.println(adc_writable() ? "yes" : "no");
@@ -267,8 +321,11 @@ void loop()
     if (opened_by == -2) {
         opened_by = -3;
         adc_init();
+        adc_start(ADC_KEY_CHAN);
         dump("after: ");
-        Serial.println("Press and HOLD a button.");
+        Serial.print("chan0 enable bit set; +0x00 = 0x");
+        Serial.println(sl6806_mmio_read(ADC_BASE + 0x00), HEX);
+        Serial.println("Press and HOLD a button. Jack/SD also watched.");
         return;
     }
 
@@ -298,6 +355,22 @@ void loop()
     if (changes) {
         Serial.println();
         return;
+    }
+
+    {
+        int g = gpio_state();
+
+        if (last_gpio >= 0 && g != last_gpio) {
+            Serial.print("gpio:   pin ");
+            Serial.print(KEYIO_PIN_A);
+            Serial.print("=");
+            Serial.print(g & 1);
+            Serial.print("  pin ");
+            Serial.print(KEYIO_PIN_B);
+            Serial.print("=");
+            Serial.println((g >> 1) & 1);
+        }
+        last_gpio = g;
     }
 
     if (Serial.read() >= 0) {
