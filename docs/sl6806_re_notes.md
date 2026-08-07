@@ -39,7 +39,13 @@ Working log for the `dump.bin` analysis. Everything here was verified against th
 
 - **Flash is memory-mapped (XIP) at `0x00C00000`.** File offset `O` → CPU address
   `0x00C00000 + O`. Confirmed: 11,725 / 13,114 string pointers resolve at this base.
-- **SRAM:** ~`0x00800000`–`0x0083FFFF`.
+- **SRAM: `0x00800000`–`0x008FFFFF`, one megabyte.** Measured on hardware in
+  bootloader mode (2026-08-07): `0x008FFF80` returns data, `0x00900000` and
+  everything above it returns zeros, no address below `0x00900000` aliases any
+  other, and re-reading an address returns the same bytes. The old figure of
+  256 KB was the size of the first `tools/sl6806-dumpram` run, not a measurement.
+  The stock firmware relies on this: its LVGL framebuffer is at `0x0087B800`
+  (§13).
 - Ghidra import: Raw Binary, language **`ARM:LE:32:Cortex`**, base **`0x00C00000`**.
 
 ## 4. HLKJ bootloader header (file 0x0) — FULLY DECODED
@@ -327,7 +333,17 @@ are legible where FIRM's are buried.
 | `0x400D9000` | **LCD controller** | the bootloader logs `HAL_lcdc_module_init` from the routine that caches this base; see §12b and `cores/sl6806/sl6806_lcdc.h` |
 | `0x400F7000` | storage host (SD/MMC + SPI flash) | `+0x100`/`+0x104` command registers with a bit-31 start/busy, `+0x108` argument, `+0x10C`/`+0x110` response, `sdio(e):rx error` strings nearby |
 
-## 7d. RAM-resident code — explained: it belongs to the mask ROM
+## 7d. RAM-resident code — ~~explained: it belongs to the mask ROM~~ SUPERSEDED
+
+> **This section's conclusion is wrong; see §13.** The SRAM-resident code *is*
+> in the flash image, at file `0x03B430`, and the application's first-stage
+> loader reads it in. The routines below (`0x0080E842`, `0x00811C7C` and the
+> rest) all disassemble out of `dump.bin` today —
+> `tools/sl6806-sram dump.bin 0x0080E842 --dis 160`. What survives from this
+> section is the *enumeration* method and the call-site tables, which are
+> still correct and still useful; what does not survive is "these belong to
+> the mask ROM" and the three "ruled out" searches, which failed because the
+> copy is a flash *read call*, not a memcpy.
 
 Several drivers live in SRAM and are **not** in the flash image at any linear
 offset. Enumerating every `BL`/`BLX` in FIRM whose target lands in
@@ -470,15 +486,22 @@ nothing has installed its drivers.
 
 **So the "call the ROM routines" route is dead for payloads.** Anything that
 jumps to those SRAM addresses from a payload is jumping into uninitialised
-memory.
+memory. That part still holds — and §13 explains why the memory was empty:
+those addresses are filled by the *application's* loader, which never runs in
+bootloader mode. The difference §13 makes is that the code can now be read out
+of flash and transcribed, exactly as the bootloader's LCD driver was.
 
 ### SETTLED, NEGATIVE: the driver blob is not in the ROM either
 
 Same delta search as §7d.2/7d.3, now over the ROM: 251 known entry points
 against 2117 prologue sites. Best delta scores 15/251 against a noise floor of
-13–14. Nothing. The SRAM drivers are not stored verbatim in the mask ROM any
-more than they are in flash, so they are assembled, decompressed or fetched at
-runtime by the application — still unexplained.
+13–14. Nothing.
+
+That result is correct — the drivers are not in the ROM. The inference drawn
+from it, "so they are assembled, decompressed or fetched at runtime — still
+unexplained", is the part §13 closes: they are **fetched at runtime, verbatim,
+from flash**. The same delta search *over flash* did find them; it was
+dismissed as a false positive. See §13 for why that dismissal was wrong.
 
 ### What the ROM does contain
 
@@ -549,18 +572,30 @@ is the display, because it has no display driver.
 - Widgets compiled in: btnmatrix, canvas, dropdown, img, label, roller, textarea;
   plus flex layout and chart. (No btn/bar/slider/table.)
 - **Two code clusters:**
-  - Core/widgets: `0x00D1F9A4` .. `0x00D3E34C` (71 fns)
-  - Refresh/render: `0x00C3D7AC` .. `0x00C40AD4` (4 fns) — lines up with the
-    `_cpu1_lcd_notify` / dual-core LCD split **(inferred)**.
+  - Core/widgets: `0x00D1F9A4` .. `0x00D3E34C` (71 fns), running XIP.
+  - Refresh/render: `0x00C3D7AC` .. `0x00C40AD4` — **not a dual-core split.**
+    This is `lv_refr.c` + `lv_draw_label.c` *stored* in flash and *run* from
+    SRAM: it is inside the blob §13 describes, and its run addresses are
+    `0x00807F7C`..`0x0080B2A4`. Subtract `0x435830` from any address in this
+    cluster to get the address the rest of the firmware calls it by.
 - **Key addresses:**
   - `lv_init`            `0x00D21C20`
   - `lv_timer_handler`   `0x00D31F88`
   - `lv_label_set_text`  `0x00D380AC`
   - `lv_disp_get_scr_act``0x00D1F9A4`
-  - `lv_refr_area`       `0x00C3D908` (also `_lv_disp_refr_timer`)
-  - **`lv_lcd_init`      `0x00D3E34C`  ← vendor display porting layer (highest-value target)**
+  - `lv_disp_drv_register` `0x00D2F578`
+  - `lv_disp_drv_init`   `0x00D2F52C`
+  - `lv_disp_draw_buf_init` `0x00D2F55C`
+  - `lv_disp_flush_ready` `0x00D2F7EC`
+  - `_lv_disp_refr_timer` **SRAM `0x008080D8`** (stored at flash `0x00C3D908`)
+  - `lv_lcd_init`        `0x00D3E34C`  ← vendor display porting layer
+  - `lv_port_disp_init`  `0x00D3B928`  ← where the driver is actually filled in
+  - LVGL flush_cb        **SRAM `0x0080B21C`** (stored at flash `0x00C40A4C`)
 - Labeling works 100%: `lv_*` `__func__` strings resolve to function starts (75 fns,
   no collisions after alternate-name handling). xframe handlers: 16 fns.
+
+**How the display is configured — see §13** for the whole path, the draw
+buffer, the colour format and the byte order.
 
 ## 9. Other components
 
@@ -744,3 +779,232 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
    `__act_on_request` dispatcher (turns `method_20` + siblings into named
    methods across all scenes).
 9. **Build a Unicorn harness** to execute functions from the image.
+10. **Re-run every "not in the image" search against the blob** (§13). The
+   backlight PWM driver is the one that matters; §13 has the lead.
+
+## 13. The SRAM-resident half of the application is in flash — and LVGL
+
+Everything in this section came from `dump.bin` alone, except the memory-size
+measurement, which was taken on hardware in bootloader mode.
+
+### 13a. The blob: where the "missing" drivers live
+
+`tools/sl6806-sram` prints the mapping and re-derives it from the image:
+
+```
+loader pool at file 0x010F30
+  reads flash file 0x03B430 .. 0x052EF4  (0x17AC4 bytes)
+  into SRAM       0x00805C00 .. 0x0081D6C4
+  sram addr  = file offset + 0x7CA7D0
+  flash addr = sram addr   + 0x435830
+```
+
+The boot ROM loads only the first-stage from the FIRM header (file `0x10030`
+→ `0x00804800`; the reset handler is at `0x00804C00`, which is why the header
+names that address). The first stage then calls the flash reader at
+`0x00805A30` with those four literals — destination `0x00805C00`, length
+`end - dst`, source `0x00010030 + 0x0002B400` — and the remaining 94 KB of the
+application lands in SRAM. Then it zeroes `.bss` from `0x0081D6C4` up to the
+stack at `0x0082D63C` and calls `0x00805240`.
+
+**Why three previous searches missed it.** §7d looked for a *memcpy*: a copy
+loop, or an aligned linker-style copy table. There is neither — the transfer is
+a flash read call, the same one the file system uses, and its arguments are
+four ordinary words in a literal pool. §7d.3 *did* find the right answer as its
+best delta ("RAM `0x00800000` to file `0x035830`", 91/251 entry points against
+a noise floor of 25) and rejected it on the grounds that the matched region
+begins exactly where the 157 KB zero run ends. That is not evidence of a false
+positive — a loaded image obviously starts where the padding stops, and a 3.6×
+margin over the noise floor was the signal, not the artefact.
+
+**Four independent confirmations**, any one of which is sufficient:
+
+| # | Check |
+|---|---|
+| 1 | The loader call itself: literals `0x00010030`, `0x00805C00`, `0x0081D6C4`, `0x0002B400` at file `0x010F30`, consumed by the call at SRAM `0x008056B2`. |
+| 2 | `_lv_disp_refr_timer` is registered with `lv_timer_create` at SRAM `0x008080D8`; the `__func__` string `"_lv_disp_refr_timer"` is loaded at flash `0x00C3D956`. Difference: `0x435830`, to the byte. |
+| 3 | The panel descriptor. §7b already recorded "in flash at `0x00C519FC`, copied to SRAM `0x0081C1CC`" — difference `0x435830`. It was never a special-case copy; it is one datum inside the blob. `lv_lcd_init` stores `0x0081C1CC` into its ops table. |
+| 4 | Semantics. `0x0080E842` now disassembles, and it is a structural twin of the bootloader's `lcd_write_cmd` at `0x00821BB2` — same busy poll on `+0x14 & 0x60000000`, same clearing of `+0x08` bit 4, same `+0x20` bit 18 for CS, and the same `cmp #0x2C` special case that clears bit 17 for RAMWR. |
+| 5 | The GPIO entry points land on a table of one-instruction branches into the mask ROM, at exactly the addresses §7f named by number: `0x00811C78 → 0x97C` (read level), `0x00811C7C → 0x99E` (set level), `0x00811C90 → 0xAAE` (set function). Two independently-derived address spaces agreeing to the byte is not a coincidence a shifted base can manufacture. |
+
+That fifth check is worth a second look, because it settles something else.
+The application's GPIO layer is **nothing but thunks into the ROM pad
+controller** — `0x00811C98` and `0x00811CB4` call ROM `0x902` to split the
+packed pin id and then ROM `0x76A` (drive) and `0x736` (pull), the latter
+indexing the 12-entry table from 4 exactly as §7f describes. So §7e's
+tentative pin-id bit assignment is superseded by §7f's for good: the firmware
+and `cores/sl6806/sl6806_padctl.h` are decoding the same field layout.
+
+**What this unlocks.** Every address in §7d's "RAM-resident code" table is now
+readable, including `0x00811C7C`/`0x00811C90` (GPIO), `0x0080E842`/`0x0080E8D8`
+(the LCD writers), `0x0080E5C0` (the FIFO writer) and `0x0080B21C` (LVGL's
+flush). §7f's "the vendor routines are not resident in bootloader mode" is
+still true and still means a payload cannot *call* them — but it can now
+transcribe them, exactly as `sl6806_lcdc.c` transcribes the bootloader's copy.
+
+**One loose end.** The FIRM header declares `0x5862` bytes for the first stage,
+which reaches `0x0080A062` and so overlaps the blob's destination. The loader's
+own code sits below `0x00805C00` and survives, so the overlap is harmless, but
+whether the ROM really transfers all `0x5862` bytes or stops earlier is
+untested.
+
+### 13b. LVGL: version and configuration
+
+Version is **v8, pre-8.2**. Beyond the `gui8\lvgl` build path and the v8/v9
+discriminators in §8, the struct layout dates it: `lv_disp_drv_init`
+(`0x00D2F52C`) memsets `0x44` = 68 bytes, and `lv_disp_drv_register`
+(`0x00D2F578`) tests **bit 0** of the bitfield at `+0x08` for `full_refresh`
+and clears it with `bfc r3,#0,#1`. In 8.2 and later `direct_mode` occupies bit
+0 and `full_refresh` moves to bit 1. Assert/log line numbers in
+`lv_hal_disp.c`, useful for matching an exact tag against upstream: 103 and 116
+(`LV_ASSERT_MALLOC`), 124 (the `full_refresh requires at least screen sized
+draw buffer(s)` warning).
+
+`lv_disp_drv_t` fields recovered from the code that writes them:
+
+| Off | Field | Value here |
+|---|---|---|
+| `+0x00` | `hor_res` (u16) | 240 |
+| `+0x02` | `ver_res` (u16) | 296 |
+| `+0x04` | `draw_buf` | inside the config struct, `0x00827B64` |
+| `+0x08` | bitfield | bit 0 `full_refresh`, bit 1 `sw_rotate`, bit 2 `antialiasing`, bits [4:3] `rotated`, bit 5 `screen_transp`, bits [15:6] `dpi` |
+| `+0x0C` | `flush_cb` | `0x0080B21C` |
+| `+0x24` | a callback slot | `0x0080B1EC`, installed only in mode 1 |
+| `+0x3C` | `color_chroma_key` | `0x07E0` |
+| `+0x40` | `user_data` | |
+
+`lv_disp_drv_init`'s defaults are the stock ones — `hor_res`/`ver_res`
+320×240, `antialiasing` set, `screen_transp` clear — with `dpi` = **60**
+(upstream default is 130) and `sizeof(lv_disp_t)` = `0x158` = 344.
+
+**`LV_COLOR_DEPTH` is 16 and `LV_COLOR_16_SWAP` is 0.** The chroma key settles
+it: upstream defines `LV_COLOR_CHROMA_KEY` as `lv_color_hex(0x00FF00)`, which
+is `0x07E0` with no swap and `0xE007` with swap. The firmware stores `0x07E0`.
+So the framebuffer holds RGB565 as native little-endian `uint16_t` — low byte
+first in memory. **This closes the gap §12.5b named** — "the pixel byte order,
+which the firmware does not settle because the vendor's framebuffer comes from
+LVGL". It comes from LVGL, and now we know what LVGL put there; §13d shows what
+the driver does with it. docs/LCD.md had already reached the same conclusion
+from the bootloader's single-pixel write; this is the independent confirmation
+from the application side.
+
+The driver is registered from **`lv_port_disp_init` at `0x00D3B928`**, called
+once from the display bring-up at `0x00D08ED4` after `lv_init`. It takes a
+config struct at SRAM `0x00827B60`:
+
+| Off | Meaning | Value |
+|---|---|---|
+| `+0x00` | mode | **1** |
+| `+0x04` | the `lv_disp_draw_buf_t` it fills in | |
+| `+0x28` | `buf1` | **`0x0087B800`** |
+| `+0x2C` | `buf2` | 0 — single buffered |
+| `+0x30` | `hor_res` (u16) | 240 |
+| `+0x32` | `ver_res` (u16) | 296 |
+| `+0x34` | buffer height in lines | 296 |
+
+So the draw buffer is `hor_res × 296` = 71,040 pixels = **138.75 KB at
+`0x0087B800`**, one full screen, single buffered. Mode 1 installs the `+0x24`
+callback; mode 3 would set `full_refresh`; mode 2 skips the whole thing.
+
+A *second* draw-buffer object at `0x00827B3C` is re-initialised at runtime with
+three geometries, under a `tbb` switch at `0x00D08D88` — 240×80 (19,200 px) and
+80×296 (23,680 px) both at `0x0086B800`, and 240×296 (71,040 px) at
+`0x0087B800`. Same panel, three orientations: this is the firmware's rotation
+mechanism, and it is where to look if we ever want rotated output.
+
+**The framebuffer address is why §3 had to be re-measured.** `0x0087B800` is
+outside the 256 KB the notes assumed; the part has 1 MiB.
+
+### 13c. The path a pixel takes
+
+```
+lv_timer_handler            0x00D31F88   XIP; its call site is 0x00D08E74
+  _lv_disp_refr_timer       0x008080D8   SRAM (flash 0x00C3D908)
+    ... render into 0x0087B800 ...
+    flush_cb                0x0080B21C   SRAM (flash 0x00C40A4C)
+      -> op dispatch        0x00D3E440   -> ops[+0x18] at 0x008298B8
+        lcd_blit            0x00D3E2E4
+          window write      0x00D3EBD4   (x, y, w, h, buf, flag)
+            set window      0x00D3E518   CASET/RASET
+            begin           0x00D3E5A4   RAMWR
+            DMA             0x00D9982C   bulk path
+            FIFO            0x0080E5C0   remainder path
+      lv_disp_flush_ready   0x00D2F7EC
+```
+
+`flush_cb` is thin. It first dereferences a global pointer at `0x00829820` and,
+if it is non-NULL and its byte at `+0x03` is set, calls `lv_disp_flush_ready`
+and returns without drawing — a "suppress output" path. Otherwise
+it packs the `lv_area_t` into a 36-byte request — `{u8 type=4, u16 x1, u16 y1,
+u16 w, u16 h, ... u8 flag=1}`, computing `w`/`h` in a way that tolerates
+reversed coordinates — and hands it to the op dispatcher. Then, and this is
+the interesting part: **if `drv->[+0x24]` is set it does not call
+`lv_disp_flush_ready`**. The callback at `0x0080B1EC` does, after issuing a
+type-5 (wait) request that blocks until the transfer has drained. So the flush
+is asynchronous, and the acknowledgement is deferred to whenever LVGL next
+calls that slot. The slot is at offset 36 in `lv_disp_drv_t`, which in the v8
+layout is one of `clean_dcache_cb` / `wait_cb` depending on the exact tag —
+**not pinned down**, and it needs the vendor's `lv_hal_disp.h` to settle.
+
+`lv_lcd_init` (`0x00D3E34C`) fills a table at `0x008298B8` — the panel
+descriptor in the first word, then eight function slots:
+
+| Off | Function | Role |
+|---|---|---|
+| `+0x00` | `0x0081C1CC` | the panel descriptor (data, not code) |
+| `+0x04` | `0x00D3E2A4` | LCDC bring-up — the routine §12b transcribed |
+| `+0x08` | `0x00D3E18C` | teardown |
+| `+0x0C` | `0x00D3E1A4` | panel reset — the GPIO pulse in §7g |
+| `+0x10` | `0x00D3E21C` | called as `(10, 0x00D3B840)` from `lv_port_disp_init` |
+| `+0x14` | `0x00D3E188` | |
+| `+0x18` | `0x00D3E2E4` | **blit** — what `flush_cb` reaches |
+| `+0x1C` | `0x00D3E1FC` | |
+| `+0x20` | `0x00D3E1DC` | |
+
+It refuses to run twice: if `+0x04` is already set it logs (line 236 of its
+source file) and returns 1. On success it calls `0x00D3E2A4` (the LCDC
+bring-up) and then an optional hook at panel-descriptor `+0x28` — which is
+**0 on this board**, so nothing runs there. That extends §7b's descriptor map
+by three words: `+0x28 = 0`, `+0x2C = 4`, `+0x30 = 0x0081C1FC`.
+
+### 13d. Byte order on the wire — settled
+
+The window writer at `0x00D3EBD4` has two paths, chosen by whether the
+remaining byte count is a multiple of 8 (RGB565) or 24 (RGB888):
+
+- **bulk**: hand the buffer to the DMA at `0x00D9982C` with the QSPI quad
+  opcode `0x32` and the DCS command RAMWR, both read out of the panel
+  descriptor at `+0x0C` and `+0x0F`.
+- **remainder**: read each pixel with `ldrh`, **`rev16`**, and push it out
+  through the FIFO writer.
+
+`rev16` is the answer. LVGL keeps RGB565 little-endian in the framebuffer
+(13b), and the driver byte-swaps on the way out, so the panel receives
+**high byte first** — which is what MIPI DCS wants. Any driver we write that
+feeds `0x400D9000` from an LVGL-style RGB565 buffer must do the same swap, in
+software or by whatever descriptor bit the DMA path uses. The bulk path's swap
+has not been located; it is presumably a mode bit in the DMA or LCDC setup, and
+that is worth finding before trusting the fast path.
+
+Also worth noting from the same routine: the transfer is refused outright while
+a previous one is in flight (`state->[+0x04] == 2`), and the colour mode comes
+from panel descriptor `+0x08` — 1 for RGB565 (2 bytes/pixel), 2 for RGB888
+(3 bytes/pixel).
+
+### 13e. The backlight, re-opened
+
+§7b concluded that the PWM driver "is not recoverable from these dumps". It is
+worth re-running that search now that 94 KB more of the application is
+readable. Two concrete leads:
+
+- A device record at flash `0x00C7DE88`: `{0x00D452A1, 0x00030000,
+  ptr-to-"/dev/pwm_ch3", 00 01 02 03 04 05}`. `0x00D452A0` is code; `0x00030000`
+  decodes as bank 3 pin 0 under §7f's pin-id encoding, which §7g already lists
+  as an output driven high at `0x00D46432`.
+- The open at `0x00D10354` logs `-pwm open /dev/timer failed except!` on
+  failure, so the backlight PWM is built on the **timer block at
+  `0x40009000`** (§7c), not on a dedicated PWM peripheral. That is a much
+  narrower target than "find the PWM registers", and the timer block's layout
+  is already partly known.
+
+Neither has been followed through.

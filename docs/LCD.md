@@ -403,6 +403,15 @@ colour << 8` — which settles the question in favour of most-significant-byte
 first. But it is one bit and reds looking blue is the symptom, so it is cheap
 to rule out.
 
+The *application* now says the same thing twice over, which is worth knowing
+because it is the half that used to be missing (§12.5b of the RE notes called
+the byte order unsettled "because the vendor's framebuffer comes from LVGL").
+LVGL is built with `LV_COLOR_16_SWAP = 0`, so the framebuffer at `0x0087B800`
+is little-endian RGB565 — and the window writer at `0x00D3EBD4` does an
+explicit `rev16` on every pixel it pushes through the FIFO. Framebuffer
+low-byte-first, wire high-byte-first, swap in the driver. See
+docs/sl6806_re_notes.md §13.
+
 **6. Is the picture shifted?**
 
 That is the panel's `(0, 12)` offset, and it is applied in
