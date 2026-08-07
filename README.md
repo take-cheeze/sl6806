@@ -42,7 +42,8 @@ so it is worth being precise about which parts are real:
 | Getting those pixels onto the glass | **Written; does not work yet.** The panel is a QSPI display and the controller at `0x400D9000` has a driver, checked by 195 host-side tests against a model. On hardware it initialises cleanly, completes every transfer and produces no picture — cause still unknown. See [docs/LCD.md](docs/LCD.md) for what has been ruled out. |
 | `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
-| `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
+| Keys — the two volume buttons | **Works.** They are an ADC resistor ladder, not GPIO; driver in [`cores/sl6806/sl6806_adc.c`](cores/sl6806/sl6806_adc.c), board map in the variant, 97 host tests. Verified on hardware. |
+| `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 

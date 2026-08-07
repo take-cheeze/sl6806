@@ -89,4 +89,45 @@
  *   - FM tuner
  */
 
+/* ------------------------------------------------------------------ */
+/* Keys                                                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * [M] The two volume buttons, measured on hardware 2026-08-07.
+ *
+ * They are not GPIO. Both sit on a resistor ladder into ADC channel 0, on
+ * bank 1 pin 9 with the pad in function 15 (analog). The vendor's key map at
+ * 0x0081C02C is a list of ascending thresholds, and the plateaus this board
+ * actually produces land where it predicts:
+ *
+ *     nothing pressed   ~0xFEA
+ *     volume up         ~0xD58   (key id 0x40)
+ *     volume down       ~0x23    (key id 0x42)
+ *
+ * Which id is which was settled by pressing them; the ids themselves come
+ * from the firmware. See docs/sl6806_re_notes.md 15 for the bring-up order,
+ * which is five steps and unforgiving about all of them.
+ */
+#define SL6806_KEY_ADC_CHANNEL   0
+#define SL6806_KEY_ADC_PAD       0x00014F80u  /* [V] bank 1 pin 9, function 15 */
+
+#define SL6806_KEY_NONE          (-1)
+#define SL6806_KEY_VOL_UP        0x40         /* [M] */
+#define SL6806_KEY_VOL_DOWN      0x42         /* [M] */
+
+/* [V] Thresholds from the vendor's map, ascending. */
+#define SL6806_KEY_LEVEL_DOWN    0x0200u      /* below this: VOL_DOWN */
+#define SL6806_KEY_LEVEL_UP      0x0E60u      /* below this: VOL_UP   */
+
+/* Decode a conversion into a key id, or SL6806_KEY_NONE. */
+static inline int sl6806_key_decode(unsigned long adc)
+{
+    if (adc < SL6806_KEY_LEVEL_DOWN)
+        return SL6806_KEY_VOL_DOWN;
+    if (adc < SL6806_KEY_LEVEL_UP)
+        return SL6806_KEY_VOL_UP;
+    return SL6806_KEY_NONE;
+}
+
 #endif /* SL6806_VARIANT_H */

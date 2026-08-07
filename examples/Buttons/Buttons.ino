@@ -8,8 +8,13 @@
  *   /dev/key_io   0x0081C044   bank 1 pin 17 -> key 0x3E, pin 12 -> key 0x3C
  *   /dev/kadc_ch0 0x0081C02C   level 0x0200 -> key 0x42, 0x0E60 -> key 0x40
  *
- * Measured: neither GPIO key moves on a press, and pin 17 sits at a steady 0,
- * so those two are detects of some sort. The buttons are the ladder pair.
+ * MEASURED, and now a driver: cores/sl6806/sl6806_adc.c and the key map in
+ * variants/p20_player/variant.h. Volume up is key 0x40 at about 0xD58, volume
+ * down is key 0x42 at about 0x23, and nothing pressed sits near 0xFEA.
+ *
+ * The GPIO pair does not move on a button press, and pin 17 sits at a steady
+ * 0. A headphone jack does not move them either, so pwm_is_jack_exist is not
+ * these two - still unidentified.
  *
  * THE ADC is at 0x40096000 (the only MMIO literal in its HAL, 0x00D994F8),
  * channels 0x10 apart from +0x20, key channel 0 on bank 1 pin 9 function 15.
@@ -63,81 +68,20 @@
  */
 
 #include <Arduino.h>
+#include "sl6806_adc.h"
 #include "sl6806_padctl.h"
-#include "sl6806_mmio.h"
-
-/* [V] 0x00D994F8, the only MMIO literal in the ADC HAL. */
-#define ADC_BASE        0x40096000u
-#define ADC_CTRL        0x00        /* [V] init writes 0x80180000 */
-#define ADC_CFG         0x04        /* [V] init writes 0x0002A800 */
-#define ADC_CHAN(ch)    (0x20u + (uint32_t)(ch) * 0x10u)   /* [V] 0x00D993A0 */
+#include "variant.h"
 
 /*
- * [V, MEASURED] +0x04 within a channel block is the conversion result, so
- * channel 0's is 0x40096024. Measured 2026-08-07, three clean plateaus:
- *
- *     ~0xFE9..0xFEE   idle          (jitters about 5 LSB)
- *     ~0xD54..0xD5B   one button
- *     ~0x1B ..0x2C    the other
- *
- * which decode against the vendor's map read as ascending thresholds:
- * below 0x0200 is key 0x42, below 0x0E60 is key 0x40, anything higher is
- * nothing pressed. The map is at 0x0081C02C in ascending order, and all three
- * measured plateaus land where that predicts.
- */
-#define ADC_RESULT(ch)  (ADC_CHAN(ch) + 0x04u)
-
-/* [V] kadc constructor 0x00D3DB50: channel 0 is pad 0x00014800, value 0x780. */
-#define ADC_KEY_PAD     (0x00014800u | 0x780u)
-#define ADC_KEY_CHAN    0
-
-/* [V] The map at 0x0081C02C. */
-#define KEY_LEVEL_A     0x0200u
-#define KEY_ID_A        0x42
-#define KEY_LEVEL_B     0x0E60u
-#define KEY_ID_B        0x40
-
-/*
- * [V, MEASURED] The ADC's module id, found by walking 0..127 (2026-08-07).
- * 84 lands in the third pair: CRU +0x68 gate, +0x78 shadow, bit 20.
- *
- * An earlier sweep tried that exact bit and failed, which is the lesson worth
- * keeping: it wrote gate and shadow together and never waited for the
- * acknowledgement. Shadow first, then gate, then poll - the order is the
- * operation.
- */
-#define ADC_MODULE_ID   84
-
-#define CRU_BASE        0x40080000u
-#define MOD_BASE_HI     0x400F1000u   /* [V] ids 96..127 live here */
-#define NMODULES        128
-#define NWORDS          16            /* 0x40096000..0x4009603F */
-
-static int      last_gpio = -1;
-static int      last_key = -2;
-
-/*
- * Which key, if any, a conversion means. Thresholds rather than equality: the
- * reading jitters a few LSB and the vendor's own map is a list of bounds.
- * Returns the key id, or -1 for nothing pressed.
- */
-static int decode_key(uint32_t v)
-{
-    if (v < KEY_LEVEL_A)
-        return KEY_ID_A;
-    if (v < KEY_LEVEL_B)
-        return KEY_ID_B;
-    return -1;
-}
-
-/*
- * The two /dev/key_io pads. They do not move on a button press, but the
- * firmware also has pwm_is_jack_exist and pwm_is_sd_exist, so a headphone or
- * a card may well move them - and watching them costs two reads. The previous
- * build dropped these, which is why a jack test against it measured nothing.
+ * The two /dev/key_io pads. They are not the buttons and not the jack, but
+ * they are the only two inputs the firmware names, so watching them costs two
+ * reads and might yet catch an SD card.
  */
 #define KEYIO_PIN_A 12
 #define KEYIO_PIN_B 17
+
+static int last_key = -2;
+static int last_gpio = -1;
 
 static int gpio_state(void)
 {
@@ -146,255 +90,84 @@ static int gpio_state(void)
 
     return ((a > 0) ? 1 : 0) | ((b > 0) ? 2 : 0);
 }
-static int      opened_by = -1;
 
-/*
- * 0x00001C5C, transcribed with a bounded poll. Returns true if the gate
- * acknowledged.
- */
-static bool module_enable(unsigned id)
+static const char *key_name(int key)
 {
-    uint32_t base, gate, shadow, bit;
-    uint32_t i;
-
-    if (id < 32)        { base = CRU_BASE;    gate = 0x60; shadow = 0x70; }
-    else if (id < 64)   { base = CRU_BASE;    gate = 0x64; shadow = 0x74; id -= 32; }
-    else if (id < 96)   { base = CRU_BASE;    gate = 0x68; shadow = 0x78; id -= 64; }
-    else                { base = MOD_BASE_HI; gate = 0x20; shadow = 0x30; id -= 96; }
-
-    bit = 1u << id;
-
-    sl6806_mmio_write(base + shadow, sl6806_mmio_read(base + shadow) | bit);
-    sl6806_mmio_write(base + gate,   sl6806_mmio_read(base + gate)   | bit);
-
-    /*
-     * SHORT on purpose. An acknowledgement is a few cycles of hardware; a
-     * long poll only costs time when the id is one nothing implements, and
-     * every one of those is paid 128 times over. The first version polled
-     * 100000 times and spent over a second inside the boot ROM's USB handler,
-     * which is precisely how you take the device off the bus.
-     */
-    for (i = 0; i < 200u; i++)
-        if (sl6806_mmio_read(base + gate) & bit)
-            return true;
-    return false;
-}
-
-/*
- * Write and read back. A register that reads zero because it is gated and one
- * that reads zero because it is idle are the same thing from here - that
- * mistake cost four runs across two peripherals.
- */
-static bool adc_writable(void)
-{
-    uint32_t reg = ADC_BASE + ADC_CFG;
-    uint32_t saved = sl6806_mmio_read(reg);
-    bool ok;
-
-    sl6806_mmio_write(reg, 0x0002A800u);
-    ok = (sl6806_mmio_read(reg) == 0x0002A800u);
-    sl6806_mmio_write(reg, saved);
-    return ok;
-}
-
-/*
- * Turn a channel on. adc_init zeroes +0x00's low bits and +0x0C, and nothing
- * else ever sets them, which is why the block came up configured but idle.
- *   0x00D994BC: [base+0x00] bit ch  - channel enable
- *   0x00D9948C: [base+0x0C] bit ch
- */
-static void adc_start(unsigned ch)
-{
-    sl6806_mmio_write(ADC_BASE + 0x00,
-                      sl6806_mmio_read(ADC_BASE + 0x00) | (1u << ch));
-    sl6806_mmio_write(ADC_BASE + 0x0C,
-                      sl6806_mmio_read(ADC_BASE + 0x0C) | (1u << ch));
-}
-
-/* 0x00D994EC, transcribed. */
-static void adc_init(void)
-{
-    sl6806_mmio_write(ADC_BASE + 0x10, 0);
-    sl6806_mmio_write(ADC_BASE + 0x18, 0);
-    sl6806_mmio_write(ADC_BASE + 0x0C, 0);
-    sl6806_mmio_write(ADC_BASE + ADC_CFG,  0x0002A800u);
-    sl6806_mmio_write(ADC_BASE + ADC_CTRL, 0x80180000u);
-}
-
-static void dump(const char *tag)
-{
-    int i;
-
-    Serial.print(tag);
-    for (i = 0; i < NWORDS; i++) {
-        Serial.print(" ");
-        Serial.print(sl6806_mmio_read(ADC_BASE + (uint32_t)i * 4), HEX);
-    }
-    Serial.println();
-}
-
-/*
- * One window of module ids per loop() call, not the whole walk in setup().
- *
- * Two reasons, both learned by wedging the device. The USB handler must get
- * control back promptly, and a walk that runs to completion inside setup()
- * does not give it back. And the log has to reach the host *as it goes*: the
- * console is a ring in this device's RAM, read over the very link that dies,
- * so anything printed in the same breath as the fatal write is lost. Printing
- * a window, returning, and printing the next means a wedge is bracketed by
- * what already arrived.
- */
-#define WINDOW 4
-static unsigned next_id;
-
-/* Returns 1 when the ADC opens, -1 when the walk is done, 0 while running. */
-static int hunt_step(void)
-{
-    unsigned end = next_id + WINDOW;
-    unsigned id;
-
-    if (next_id >= NMODULES)
-        return -1;
-    if (end > NMODULES)
-        end = NMODULES;
-
-    Serial.print("  ids ");
-    Serial.print(next_id);
-    Serial.print("..");
-    Serial.print(end - 1);
-    Serial.print(": ");
-
-    for (id = next_id; id < end; id++) {
-        module_enable(id);
-        if (adc_writable()) {
-            Serial.print("id ");
-            Serial.print(id);
-            Serial.println(" OPENS THE ADC");
-            next_id = NMODULES;
-            return 1;
-        }
-    }
-    Serial.println("no");
-    next_id = end;
-    return 0;
+    if (key == SL6806_KEY_VOL_UP)   return "VOL_UP";
+    if (key == SL6806_KEY_VOL_DOWN) return "VOL_DOWN";
+    return "none";
 }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 buttons: the ADC ladder ===");
-    Serial.print("key levels 0x");
-    Serial.print(KEY_LEVEL_A, HEX);
-    Serial.print(" -> 0x");
-    Serial.print(KEY_ID_A, HEX);
-    Serial.print(", 0x");
-    Serial.print(KEY_LEVEL_B, HEX);
-    Serial.print(" -> 0x");
-    Serial.println(KEY_ID_B, HEX);
+    Serial.println("=== SL6806 keys ===");
 
     Serial.print("pad 0x");
-    Serial.print(ADC_KEY_PAD, HEX);
-    Serial.print(" (bank 1 pin 9 fn 15, analog) -> ");
-    Serial.println(sl6806_pad_configure(ADC_KEY_PAD) == 0 ? "ok" : "REFUSED");
+    Serial.print(SL6806_KEY_ADC_PAD, HEX);
+    Serial.print(" (bank 1 pin 9, analog) -> ");
+    Serial.println(sl6806_pad_configure(SL6806_KEY_ADC_PAD) == 0 ? "ok" : "REFUSED");
 
-    /* The two key_io pads, as pulled-up inputs, so jack/SD insertion shows. */
     sl6806_pad_configure(SL6806_PAD_ID(1, KEYIO_PIN_A, SL6806_PAD_FUNC_INPUT) | 8u);
     sl6806_pad_configure(SL6806_PAD_ID(1, KEYIO_PIN_B, SL6806_PAD_FUNC_INPUT) | 8u);
 
-    dump("before:");
-
-    /* The id is known now; only fall back to walking if this board differs. */
-    module_enable(ADC_MODULE_ID);
-    Serial.print("module id ");
-    Serial.print(ADC_MODULE_ID);
-    Serial.print(" (CRU +0x68 bit 20) -> ADC writable: ");
-    Serial.println(adc_writable() ? "yes" : "no");
-
-    if (adc_writable()) {
-        next_id = NMODULES;
-        opened_by = -2;              /* nothing to hunt */
-    } else {
-        Serial.println("ADC ignores writes. Enabling module clocks the way the");
-        Serial.println("mask ROM does (0x00001C5C), ids 0..127, a few per poll.");
-        Serial.println("If the log stops, the last range printed is where it");
-        Serial.println("died - that is the whole point of printing as we go.");
+    if (!sl6806_adc_begin()) {
+        Serial.println("ADC did not come up - module clock refused.");
+        Serial.println("See docs/sl6806_re_notes.md 15b; the write order to");
+        Serial.println("the gate pair is the thing that usually goes wrong.");
+        return;
     }
+    sl6806_adc_channel(SL6806_KEY_ADC_CHANNEL, 1);
+
+    Serial.print("ADC up on module ");
+    Serial.print(SL6806_ADC_MODULE_ID);
+    Serial.print(", channel ");
+    Serial.print(SL6806_KEY_ADC_CHANNEL);
+    Serial.print(", idle reading 0x");
+    Serial.println(sl6806_adc_read(SL6806_KEY_ADC_CHANNEL), HEX);
+    Serial.println();
+    Serial.println("Press the volume buttons.");
     Serial.println();
 }
 
 void loop()
 {
-    uint32_t raw;
-    int key;
-
-    /* Walk the module ids first if the known one did not take, then settle
-     * into reading. */
-    if (next_id < NMODULES) {
-        int r = hunt_step();
-
-        if (r == 1) {
-            opened_by = 1;
-            adc_init();
-            adc_start(ADC_KEY_CHAN);
-            dump("after: ");
-        } else if (r == -1) {
-            Serial.println("no module id opened it.");
-        }
-        return;
-    }
-    if (opened_by == -2) {
-        opened_by = -3;
-        adc_init();
-        adc_start(ADC_KEY_CHAN);
-        dump("after: ");
-        Serial.print("chan0 enable bit set; +0x00 = 0x");
-        Serial.println(sl6806_mmio_read(ADC_BASE + 0x00), HEX);
-        Serial.println();
-        Serial.println("Press and HOLD each button. Jack/SD also watched.");
-        Serial.println();
-        return;
-    }
-
-    raw = sl6806_mmio_read(ADC_BASE + ADC_RESULT(ADC_KEY_CHAN));
-    key = decode_key(raw);
+    uint32_t raw = sl6806_adc_read(SL6806_KEY_ADC_CHANNEL);
+    int key = sl6806_key_decode(raw);
+    int g;
 
     if (key != last_key) {
-        if (key < 0) {
-            Serial.print("released           (adc 0x");
+        if (key == SL6806_KEY_NONE) {
+            Serial.print("released          ");
         } else {
-            Serial.print("KEY 0x");
+            Serial.print(key_name(key));
+            Serial.print(" (0x");
             Serial.print(key, HEX);
-            Serial.print(" pressed      (adc 0x");
+            Serial.print(") pressed ");
         }
-        Serial.print(raw, HEX);
-        Serial.println(")");
+        Serial.print("  adc 0x");
+        Serial.println(raw, HEX);
         last_key = key;
     }
 
-    {
-        int g = gpio_state();
-
-        if (last_gpio >= 0 && g != last_gpio) {
-            Serial.print("gpio:   pin ");
-            Serial.print(KEYIO_PIN_A);
-            Serial.print("=");
-            Serial.print(g & 1);
-            Serial.print("  pin ");
-            Serial.print(KEYIO_PIN_B);
-            Serial.print("=");
-            Serial.println((g >> 1) & 1);
-        }
-        last_gpio = g;
+    g = gpio_state();
+    if (last_gpio >= 0 && g != last_gpio) {
+        Serial.print("gpio:   pin ");
+        Serial.print(KEYIO_PIN_A);
+        Serial.print("=");
+        Serial.print(g & 1);
+        Serial.print("  pin ");
+        Serial.print(KEYIO_PIN_B);
+        Serial.print("=");
+        Serial.println((g >> 1) & 1);
     }
+    last_gpio = g;
 
     if (Serial.read() >= 0) {
         Serial.print("idle: adc 0x");
         Serial.print(raw, HEX);
         Serial.print("  key ");
-        if (key < 0)
-            Serial.println("none");
-        else
-            Serial.println(key, HEX);
+        Serial.println(key_name(key));
     }
 }
