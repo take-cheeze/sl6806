@@ -1277,6 +1277,16 @@ found, which is enough to unblock the display and not enough to dim it.
 > stopped one does not. `examples/Backlight` will redo the walk with it if you
 > press `h`.
 
+**The walk was redone with that detector and came back empty** — all 128 ids,
+twice, nothing ticked. That is the first negative in this section reached with
+a test that can answer, so it stands. One caveat worth stating: the detector
+watches `+0x00`..`+0x1C`, so strictly it shows no register visibly moves rather
+than that the counter is stopped. Taken with duty having no effect, the
+conclusion holds.
+
+**So the backlight is on/off and that is where it rests.** It is enough to
+unblock the display, which is what it was blocking.
+
 *Bring-up failed on the second upload* with "the module clock refused", on a
 board that was visibly working. That was a bug in the driver, not the chip:
 it wrote `CTRL = 0x40` and compared the read-back for equality, and CTRL

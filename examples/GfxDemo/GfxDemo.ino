@@ -5,9 +5,16 @@
  * with a title bar, some shapes and a running millisecond count.
  *
  * "Should", because the driver behind it was written from a disassembly of
- * the stock bootloader and has never been checked against a screen. If the
- * panel stays dark, or the colours are wrong, docs/LCD.md has the list of
- * things to try in the order worth trying them.
+ * the stock bootloader and has never been checked against a screen.
+ *
+ * WHAT IS DIFFERENT NOW: the backlight works, and this sketch turns it on. So
+ * for the first time a dark panel is a statement about the bus driver rather
+ * than about the lamp. Every previous "no picture" result on this board was
+ * taken with the backlight off and means nothing.
+ *
+ * If it stays dark, docs/LCD.md has the list of things to try in the order
+ * worth trying them - and section 5 of that list, the byte order, is now
+ * settled from two directions, so start further down.
  *
  * Either way the sketch also reads its own pixels back and prints them, so
  * it says something useful even with the display disconnected: the
@@ -22,6 +29,7 @@
  */
 
 #include <Arduino.h>
+#include "sl6806_pwm.h"
 
 /* 160 x 40 x 2 bytes = 12.8 KB - comfortable inside the payload heap. */
 static const int16_t BAND_W = 160;
@@ -53,6 +61,12 @@ static void drawScene()
 void setup()
 {
     Serial.begin(115200);
+
+    /* The lamp first, so a dark screen means the driver and not the light. */
+    if (sl6806_backlight_begin(100))
+        Serial.println("backlight on");
+    else
+        Serial.println("backlight did NOT come up - a dark panel proves nothing");
     Serial.println();
     Serial.println("=== SL6806 gfx demo ===");
 
