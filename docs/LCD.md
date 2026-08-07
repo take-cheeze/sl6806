@@ -315,6 +315,41 @@ divergence. It is not - writing those bits back does not clear them, so they
 are level status rather than latched flags, and `+0x14` reads `0x08020000`
 either way. `e` in the probe still toggles it, and it changes nothing.
 
+### The backlight: every pad on the chip, eliminated
+
+Run on hardware with `examples/PadSweep`, one pad at a time, host-paced, each
+announced before it was driven so a wedge would name itself:
+
+| set | pads | result |
+|---|---|---|
+| named by `sl6806-padscan` | 17 | nothing |
+| bank 0 | 32 | nothing |
+| bank 1 (unnamed) | 8 | nothing |
+| bank 2 | 31 | nothing |
+| bank 3 | 25 | nothing |
+| bank 4 | 16 | nothing |
+| bank 5 | 30 | nothing |
+
+**Every pad on the part has been driven high individually and none lights the
+panel**, while the stock firmware lights it brightly. So the backlight enable
+is not a GPIO that a static high turns on. What that leaves:
+
+- an **active-low** enable, or one with an external pull-up. Only half the
+  search was done - `SWEEP_LEVEL=0` drives low instead, and is the one cheap
+  thing still untried.
+- a backlight driver that wants a **pulse train** rather than a level. Some
+  one-wire LED drivers latch a brightness from counted pulses and ignore a
+  static input, which would fit: the vendor drives this from PWM.
+- the **PMU**. `/dev/pmu` is another SRAM-resident driver, and `enable coreldo`
+  in FIRM suggests rail control that no pad can reach.
+
+Two incidental findings from the sweep, both worth keeping: most pads read
+function 0 with nothing configuring them and are almost certainly unbonded;
+and the handful that sit on a real function without any flash call site
+setting them - bank 0 pins 0-3 (function 2, probably the XIP flash bus), bank
+1 pin 9 (function 3), bank 2 pins 0-1 (function 2) - are configured by
+something that is not in the flash image.
+
 ### What is left, and it is not more software
 
 Everything observable from software is consistent with a working controller,

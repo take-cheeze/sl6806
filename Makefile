@@ -92,6 +92,9 @@ DEFS   := -DF_CPU=$(F_CPU)UL -DSL6806=1 $(MODE_DEF)
 ifneq ($(SWEEP_BANK),)
 DEFS   += -DSWEEP_BANK=$(SWEEP_BANK)
 endif
+ifneq ($(SWEEP_LEVEL),)
+DEFS   += -DSWEEP_LEVEL=$(SWEEP_LEVEL)
+endif
 
 # Appended to every compile. CI passes -Werror here rather than baking it in,
 # so a warning stops the build there without making local experiments painful.

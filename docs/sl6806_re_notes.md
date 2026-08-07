@@ -208,8 +208,13 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
   is no bootloader copy: the HLKJ image contains no PWM code or strings at
   all. The mask ROM has none either.
 
-  The practical route is therefore a GPIO, not PWM: a backlight enable pin
-  driven high is full brightness.
+  The practical route looked like a GPIO rather than PWM - a backlight enable
+  driven high is usually full brightness. **That has now been tested
+  exhaustively and it is not one.** Every pad on the part, all six banks, was
+  driven high individually on hardware (`examples/PadSweep`); none lights the
+  panel, while the stock firmware lights it brightly. Either the enable is
+  active low (untested), or the driver wants a pulse train rather than a
+  level, or it hangs off the PMU rather than a pad.
 
 ### 7g. The board's pad map, recovered from the call sites
 

@@ -46,6 +46,16 @@
 #define SWEEP_BANK 3
 #endif
 
+/*
+ * Which way to drive. The first pass over all six banks drove every pad HIGH
+ * and found nothing - but that is only half the search: an enable that is
+ * active low, or one with an external pull-up holding it high already, is
+ * untouched by driving it high. SWEEP_LEVEL=0 covers the other half.
+ */
+#ifndef SWEEP_LEVEL
+#define SWEEP_LEVEL 1
+#endif
+
 static sl6806_color_t band[240 * 8];
 
 /*
@@ -87,6 +97,8 @@ void setup()
     Serial.println("=== SL6806 pad sweep ===");
     Serial.print("bank ");
     Serial.print(SWEEP_BANK);
+    Serial.print(", driving ");
+    Serial.print(SWEEP_LEVEL ? "HIGH" : "LOW");
     Serial.println(", pads the stock firmware does not configure.");
     Serial.println("Each is named, then driven high on the next tick, then");
     Serial.println("restored. Watch the panel; the last name printed is it.");
@@ -104,8 +116,17 @@ void loop()
     Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
     Screen.display();
 
-    if (Serial.read() < 0)
-        return;                       /* wait for the host's tick */
+    /*
+     * Advance on the host's tick - but drain the whole backlog, not one byte.
+     * Reading a single byte per loop() call ties the step rate to the poll
+     * rate, and when that drops (it varies by 100x on this device) the ticks
+     * queue up faster than they are consumed and the sweep crawls: one run
+     * managed two pads in 55 seconds.
+     */
+    if (!Serial.available())
+        return;
+    while (Serial.available())
+        Serial.read();
 
     if (!announced) {
         int next = pin;
@@ -126,7 +147,9 @@ void loop()
         Serial.print(next);
         Serial.print(" (was function ");
         Serial.print(funcOf((unsigned)next));
-        Serial.println(") -> driving high next tick");
+        Serial.print(") -> driving ");
+        Serial.print(SWEEP_LEVEL ? "HIGH" : "LOW");
+        Serial.println(" next tick");
         announced = true;
         return;                       /* the host has this line before we act */
     }
@@ -144,7 +167,7 @@ void loop()
 
     savedFunc = funcOf((unsigned)pin);
     sl6806_pad_configure(SL6806_PAD_ID(SWEEP_BANK, pin, SL6806_PAD_FUNC_OUTPUT)
-                         | (1u << 6));
+                         | (SWEEP_LEVEL ? (1u << 6) : 0u));
     holding = true;
     announced = false;
 }
