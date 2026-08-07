@@ -139,72 +139,38 @@ counts how many polls each transfer takes, and lets you flip the guessed
 values from the monitor without rebuilding. Everything below is a real
 possibility, not a formality.
 
-**0. Is the backlight on?**
+**0. Is the backlight on?** — *solved; turn it on and move to step 1.*
 
-**The backlight is not part of the LCD path.** In the stock firmware it is a
-PWM channel — the image contains `/dev/pwm_ch3`, `brightness percent %d`, a
-48000 Hz period and a `pwmTask` that owns it — driven by a separate task that
-this framework does not implement. Nothing in the display driver turns it on.
-
-So a perfectly working driver still shows a black screen, and "the LCD won't
-show" does not yet distinguish a broken driver from a dark lamp.
-
-Settle it before debugging anything else: shine a bright light at the panel at
-an angle and switch the probe between `w` (fill white) and `k` (fill black). A
-transmissive LCD read by reflection is dim but legible, and full white against
-full black is as big a change as there is. If the panel visibly changes, the
-driver works and the remaining job is the backlight.
-
-**The PWM registers are not recoverable the way the LCD's were.** The
-`/dev/pwm_ch0`..`ch5` name strings are in the image at `0x00C7DE9A`, and the
-consumer at `0x00D10354` opens `ch3` and sets 60% at 48 kHz — but *nothing in
-the image references those name strings*, so the driver that registers them
-lives in SRAM, like the LCD writers used to. Unlike the LCD writers, the HLKJ
-bootloader has no copy: it never touches PWM. So there is no second source to
-disassemble.
-
-That is survivable, because a backlight almost never needs PWM to be *on*.
-These boards put the backlight behind an enable pin and use PWM only to dim
-it, so driving that pin high is full brightness — and the GPIO driver is
-complete.
-
-**Do not sweep the pads to find it.** Driving all 192 freezes the device: one
-of them owns something the USB link needs, and when USB dies the serial ring
-is never polled, so you do not even learn which pad did it. It was tried; it
-cost a reboot and produced no information.
-
-There is no need to guess, because the stock firmware configures every pad it
-uses and the ids are immediates at its call sites:
-
-```sh
-tools/sl6806-padscan dump.bin --outputs --sites
+```c
+#include "sl6806_pwm.h"
+sl6806_backlight_begin(100);      /* examples/GfxDemo already does this */
 ```
 
-Of the 78 pads the firmware touches, exactly seven are plain outputs, and one
-of those is the panel reset line we already know — which is a useful check
-that the scan is reading the right thing. The rest are the candidates:
+It is PWM channel 3 of the block at `0x40084000`, module id 68, output on bank
+1 pin 0 in alternate function 4. On/off only: the counter does not run, so duty
+has no effect, which does not matter here. §14a of the RE notes has the
+bring-up order and the list of things that were wrong on the way.
 
-| pad id | bank/pin | what the firmware calls it |
-|---|---|---|
-| `0x0001A0D0` | 1/20 | **`vcomo`** — named by the console handler at `0x00D0AEE0` |
-| `0x000508C0` | 5/1 | toggled in the display's suspend/resume pair, `0x00D3C9DC`–`0x00D3CC3C` |
-| `0x000300C0` | 3/0 | output, firmware sets it high (`0x00D46432`) |
-| `0x00047080` | 4/14 | power sequencing, `0x00D44AB8` |
-| `0x00047880` | 4/15 | power sequencing, `0x00D44AB8` |
+**This changes what every other step below means.** Until now a dark panel was
+consistent with a perfect driver, so none of the "no picture" results on this
+board distinguished anything. Re-run before believing any of them.
 
-`vcomo` is the one to try first, and it may matter more than the backlight:
-VCOM is an LCD panel supply, so with that rail off the controller accepts
-every command over QSPI and the glass stays blank — exactly the symptom.
+The old advice here — shine a light at the panel at an angle and flip between
+white and black to read it by reflection — is still a decent trick if you ever
+suspect the lamp again, and `examples/LcdProbe`'s `w` and `k` keys still do it.
 
-The probe drives these and nothing else:
+**Still worth trying while you are here: `vcomo`.** VCOM is an LCD panel
+supply, and with that rail off the controller would accept every command over
+QSPI while the glass stayed blank — exactly the symptom this document exists
+for, and unaffected by the backlight. `tools/sl6806-padscan dump.bin --outputs
+--sites` lists the seven plain outputs the firmware drives; the console handler
+at `0x00D0AEE0` names `0x0001A0D0` (bank 1 pin 20) `vcomo`, and `0x000508C0`
+(bank 5 pin 1) is toggled in the display's suspend/resume pair.
 
-    A    all five candidates on - the fast yes/no
-    Z    all five off
-    l    arm the next candidate and name it
-    y/u  drive the armed candidate on / off
-
-`l` announces before `y` drives, deliberately: if the device does freeze, the
-line naming the pad has already reached you.
+`examples/LcdProbe` drives those candidates: `A` turns them all on, `Z` all
+off, `l` arms the next one and names it, `y`/`u` drive the armed one. `l`
+announces before `y` drives, deliberately — if the device freezes, the line
+naming the pad has already reached you.
 
 **1. Is `delay()` being clamped?**
 
