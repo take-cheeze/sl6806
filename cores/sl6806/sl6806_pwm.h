@@ -57,12 +57,64 @@
  * and then delays 10 ms; 0x00D9A74C(n) clears it. 0x00D9A768(n) pulses bit n
  * of +0x08 low for 10 ms as a reset.
  *
- * [V] PWM is bit 2: the PWM teardown at 0x00D99C14 calls 0x00D9A74C(2).
+ * ---------------------------------------------------------------------
+ * MEASURED: THIS WHOLE BLOCK IS DEAD UNTIL THE PLL IS UP.
+ *
+ * 0x400E0000 reads as zero and ignores writes - from a payload (the run of
+ * examples/Backlight on 2026-08-07) and from the host over the vendor read
+ * command in bootloader mode, which rules out anything payload-specific.
+ * 0x400E2000 is the same. Meanwhile the CRU at 0x40080000 and the LCDC at
+ * 0x400D9000 both read live values in exactly the same conditions, so MMIO
+ * itself is fine and the region is simply unclocked.
+ *
+ * The firmware agrees: 0x00D9A7FC brings the PLL up and only then makes the
+ * first call into 0x400E0000. See SL6806_PLL_* below.
+ * ---------------------------------------------------------------------
  */
 #define SL6806_MODCTL_BASE      0x400E0000u
 #define SL6806_MODCTL_ENABLE    0x00       /* [V] 1 = module clocked        */
 #define SL6806_MODCTL_RESET     0x08       /* [V] 0 = held in reset         */
-#define SL6806_MODCTL_BIT_PWM   2          /* [V] from the teardown path    */
+
+/*
+ * [?] WHICH BIT THE PWM IS, is not known.
+ *
+ * This used to say bit 2, "[V] from the teardown path". That was wrong: the
+ * teardown it was read from (0x00D99C14) belongs to the module that ends at
+ * 0x00D99C0C, not to the PWM channel init that happens to start 0x20 later.
+ * Of the eleven call sites of 0x00D9A734 the numbers used are 0, 1, 2, 3, 4
+ * and 6, and none of them has been tied to the PWM. Find it by experiment
+ * once the block answers at all - examples/Backlight sweeps the bits and
+ * watches whether 0x40084000 starts responding.
+ */
+
+/* ------------------------------------------------------------------ */
+/* The PLL, which everything above depends on                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * [V] From 0x00D9A7FC, which is the first thing the vendor's module bring-up
+ * does. Write CONFIG, spin until LOCK, then set bit 16.
+ *
+ * This also answers 12.6, which recorded that the PLL had not been found and
+ * "is not at the CRU base: 0x40080000 has dividers but no multiplier". It is
+ * at the CRU base, at +0x08. In bootloader mode it reads 0x00000801 with the
+ * lock bit clear, i.e. stopped.
+ */
+#define SL6806_PLL_CTRL         0x40080008u
+#define SL6806_PLL_CONFIG       0xC0000C04u /* [V] the vendor's word         */
+#define SL6806_PLL_LOCK         (1u << 28)  /* [V] polled until set          */
+#define SL6806_PLL_OUT_ENABLE   (1u << 16)  /* [V] set after lock            */
+
+/*
+ * [V] Written 49 (0x31) right after the PLL locks, before the first module is
+ * enabled. [I] A clock-source select - which would reparent something onto
+ * the PLL. NOT WRITTEN by anything in this tree: if it reparents the core or
+ * the USB clock it would take the device off the bus mid-sketch, and the
+ * whole reason a payload can be debugged at all is that the ROM's USB link
+ * keeps running. Try it only when you can afford to lose the session.
+ */
+#define SL6806_CRU_CLKSEL_11C   0x4008011Cu
+#define SL6806_CRU_CLKSEL_11C_VALUE 0x31u
 
 /* ------------------------------------------------------------------ */
 /* The block                                                           */
@@ -121,13 +173,19 @@
 /* The little that can be called a driver                              */
 /* ------------------------------------------------------------------ */
 
-/* Ungate the PWM block. The vendor waits 10 ms after this; the caller must,
- * because this header has no delay of its own. */
-static inline void sl6806_pwm_module_enable(void)
+/*
+ * Ungate one module. Which bit the PWM is remains unknown - see the note
+ * above - so this takes the bit rather than pretending to know it. The vendor
+ * waits 10 ms after this and the caller must too; this header has no delay of
+ * its own.
+ *
+ * Pointless until the PLL is up: the register ignores writes before that.
+ */
+static inline void sl6806_module_enable(unsigned bit)
 {
     uint32_t r = sl6806_mmio_read(SL6806_MODCTL_BASE + SL6806_MODCTL_ENABLE);
     sl6806_mmio_write(SL6806_MODCTL_BASE + SL6806_MODCTL_ENABLE,
-                      r | (1u << SL6806_MODCTL_BIT_PWM));
+                      r | (1u << bit));
 }
 
 /*

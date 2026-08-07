@@ -1,44 +1,50 @@
 /*
- * Backlight - drive the PWM the way the stock firmware does, and see.
+ * Backlight - wake the clock domain the PWM lives in, then drive it.
  *
- * This supersedes examples/BacklightHunt, which was written when the PWM
- * driver was believed unrecoverable and so went looking for a GPIO enable
- * instead. It found nothing, across every pad on the part. The premise was
- * wrong: the registers were in the dump the whole time. See
- * docs/sl6806_re_notes.md 14a and cores/sl6806/sl6806_pwm.h.
+ * FIRST RUN, 2026-08-07: every register read back zero, including the module
+ * gate itself (modctl 0x0 -> 0x0). The gate bit was never the problem - the
+ * write did not stick, so nothing downstream of it could.
  *
- * WHAT IT DOES. Ungates the PWM block, programs channel 3 with the vendor's
- * own control word and period, and steps the duty from 0 to 100% and back so
- * a panel that lights is unmistakable rather than something you have to
- * squint at. Then it tries the other five channels, in case this board wires
- * the backlight somewhere else.
+ * WHAT THAT TURNED OUT TO MEAN. Reading the same addresses from the host over
+ * the vendor read command, in the same bootloader mode, gives the same
+ * answer: 0x400E0000 and 0x400E2000 are zeros, while the CRU at 0x40080000
+ * and the LCDC at 0x400D9000 read live values. So MMIO is fine and that whole
+ * region is simply unclocked - not a payload problem, and not a wrong address.
  *
- * At every step it prints what it wrote and reads the register back.
- * THE READBACK IS THE REAL RESULT, and it is worth more than the screen:
+ * And the firmware says why. 0x00D9A7FC, the first thing the vendor's module
+ * bring-up does, starts a PLL at 0x40080008 and spins on a lock bit before it
+ * ever touches 0x400E0000. In bootloader mode that register reads 0x00000801
+ * with the lock bit clear: the PLL is stopped, so the domain is dark.
  *
- *   - CTRL reads back what was written  ->  0x40084000 is a live peripheral.
- *     If the panel is still dark, the map is addressable and the pad mux is
- *     the next suspect, not this file.
- *   - Everything reads back zero        ->  the block is still gated, or not
- *     there at all. Doubt SL6806_MODCTL_BIT_PWM first.
+ * SO THIS SKETCH DOES THREE THINGS, one per host tick, and prints a readback
+ * after every one:
  *
- * WHILE IT RUNS the display flashes white/black, so a backlight that comes on
- * says something about the LCD driver too: a flashing picture means both
- * halves work, a uniform glow means the backlight is found and the bus driver
- * still has a bug.
+ *   1. Bring the PLL up the way 0x00D9A7FC does, and report whether it locks.
+ *   2. If the module-gate register comes alive, find the PWM's bit by
+ *      experiment - set each bit in turn and see whether 0x40084000 starts
+ *      answering. Nobody knows which bit it is; the previous claim of bit 2
+ *      was misread from a neighbouring module's teardown.
+ *   3. Once a bit works, program channel 3 with the vendor's period and ramp
+ *      the duty, flashing the panel so a backlight coming on is unmistakable.
+ *
+ * If step 1 does not lock, stop and report - everything after it is moot, and
+ * the PLL config word is then the thing to doubt.
  *
  *     make SKETCH=examples/Backlight RUN_MODE=poll upload
  *     tools/sl6806-monitor --tick 3 build/Backlight.sym
  *
  * PACED BY THE HOST. Same lesson BacklightHunt records at length: neither
- * clock on this device can time a dwell. millis() loses SysTick wraps between
- * polls, and counting loop() calls fails because the poll rate has been
- * measured anywhere from 0.3/s to 42/s. So this advances one step per byte
- * from the host, and --tick makes the dwell exact.
+ * clock on this device can time a dwell, because the USB poll rate has been
+ * measured anywhere from 0.3/s to 42/s. One step per byte from the host.
  *
- * SAFETY. Nothing here writes flash, and the block being poked is not one USB
- * needs, so the worst case is a wedged device that a replug recovers. That is
- * not true of pad sweeps, which is the other reason to try this first.
+ * RISK. This writes a PLL control register, which is a bigger thing than the
+ * rest of the tree does - a clock tree can be misconfigured into stopping the
+ * core. It is the vendor's own constant, and the lock poll is bounded so a
+ * PLL that never comes up cannot hang the USB handler. Nothing writes flash,
+ * so a replug always recovers. What this deliberately does NOT do is write
+ * 0x4008011C, the clock-source select the vendor sets next: if that reparents
+ * the core or USB onto the PLL it would end the session, and the ROM's USB
+ * link is the only way to see anything here.
  */
 
 #include <Arduino.h>
@@ -47,19 +53,20 @@
 
 static sl6806_color_t band[240 * 8];
 
-/* Channel 3 first, because that is the one the firmware opens. */
-static const uint8_t order[] = { 3, 0, 1, 2, 4, 5 };
-#define NCHAN ((int)(sizeof order))
-
-/* 0 -> 100 -> 0. A ramp rather than a flash, because a backlight that is on
- * but very dim is easy to miss against a dark panel. */
+/* 0 -> 100 -> 0, so a backlight that is on but dim is still obvious. */
 static const uint8_t ramp[] = { 0, 20, 40, 60, 80, 100, 80, 60, 40, 20 };
 #define NRAMP ((int)(sizeof ramp))
 
-static int  idx = -1;      /* index into order[]; -1 = nothing set up yet */
-static int  step;          /* index into ramp[]                          */
-static bool white;
-static bool done;
+/* The channel the firmware opens for the backlight. */
+#define BL_CHAN 3
+
+enum { ST_PLL, ST_SWEEP, ST_DRIVE, ST_DONE };
+
+static uint8_t state = ST_PLL;
+static int     bit;            /* gate bit under test        */
+static int     found = -1;     /* the bit that woke the PWM  */
+static int     step;           /* index into ramp[]          */
+static bool    white;
 
 static void show(const char *what, uint32_t addr)
 {
@@ -71,7 +78,46 @@ static void show(const char *what, uint32_t addr)
     Serial.println(sl6806_mmio_read(addr), HEX);
 }
 
-/* Program one channel exactly as 0x00D99C34 and 0x00D102F4 do. */
+/*
+ * Does the PWM block answer? A register that only ever reads zero is
+ * indistinguishable from one that is not there, so write a pattern and read
+ * it back rather than trusting a bare read. Channel 3's period/duty is
+ * harmless to scribble on: the channel is not running yet.
+ */
+static bool pwm_responds(void)
+{
+    uint32_t reg = SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_PERIOD_DUTY;
+
+    sl6806_mmio_write(reg, 0x12345678u);
+    if (sl6806_mmio_read(reg) == 0)
+        return false;
+    sl6806_mmio_write(reg, 0);
+    return true;
+}
+
+/* 0x00D9A7FC, minus the clock-source select. Returns true if it locked. */
+static bool pll_start(void)
+{
+    uint32_t i;
+
+    sl6806_mmio_write(SL6806_PLL_CTRL, SL6806_PLL_CONFIG);
+
+    /* Bounded. The vendor spins forever; we cannot, because this runs inside
+     * the boot ROM's USB handler and a spin here takes the device off the
+     * bus until it is unplugged. A few hundred thousand reads is milliseconds
+     * at any plausible core clock. */
+    for (i = 0; i < 400000u; i++)
+        if (sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)
+            break;
+
+    if (!(sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK))
+        return false;
+
+    sl6806_mmio_write(SL6806_PLL_CTRL,
+                      sl6806_mmio_read(SL6806_PLL_CTRL) | SL6806_PLL_OUT_ENABLE);
+    return true;
+}
+
 static void configure(unsigned ch)
 {
     uint32_t base = SL6806_PWM_CHAN(ch);
@@ -90,37 +136,18 @@ static void configure(unsigned ch)
     show("mode", base + SL6806_PWM_MODE);
 }
 
-static void quiet(unsigned ch)
-{
-    sl6806_pwm_run(ch, 0);
-    sl6806_pwm_enable(ch, 0);
-    sl6806_pwm_set(ch, SL6806_PWM_BL_PERIOD, 0);
-}
-
 void setup()
 {
-    uint32_t before, after;
-
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 backlight: PWM at 0x40084000 ===");
+    Serial.println("=== SL6806 backlight: PLL, then gate, then PWM ===");
 
-    before = sl6806_mmio_read(SL6806_MODCTL_BASE);
-    sl6806_pwm_module_enable();
-    delay(10);
-    after = sl6806_mmio_read(SL6806_MODCTL_BASE);
-
-    Serial.print("modctl 0x");
-    Serial.print(before, HEX);
-    Serial.print(" -> 0x");
-    Serial.println(after, HEX);
-    if (before == after)
-        Serial.println("WARNING: the gate did not change. Either it is already");
-    if (before == after)
-        Serial.println("on, or 0x400E0000 bit 2 is not the PWM's gate.");
+    show("pll   ", SL6806_PLL_CTRL);
+    show("modctl", SL6806_MODCTL_BASE);
+    show("pwm3  ", SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL);
+    Serial.println("(all three are expected to be dead before the PLL runs)");
     Serial.println();
 
-    /* Bring the panel up too, so a backlight that lights shows a picture. */
     if (!Screen.begin(band, 240, 8))
         Serial.println("no panel - the flash below will do nothing");
     else
@@ -132,51 +159,87 @@ void setup()
 
 void loop()
 {
-    unsigned ch;
-
-    /* Flip every poll, not every tick, so the picture is lively even while
-     * we are waiting for the host. */
+    /* Flip every poll, not every tick, so the picture stays lively while we
+     * wait on the host. */
     white = !white;
     Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
     Screen.display();
 
-    if (done)
+    if (state == ST_DONE)
         return;
 
-    /* Advance only when the host says so. */
     if (Serial.read() < 0)
         return;
 
-    /* Start of a channel: announce, configure, and let the host drain it
-     * before anything else happens. */
-    if (idx < 0 || step >= NRAMP) {
-        if (idx >= 0)
-            quiet(order[idx]);
+    switch (state) {
 
-        if (++idx >= NCHAN) {
-            done = true;
-            Serial.println();
-            Serial.println("=== all six channels tried ===");
-            Serial.println("If the panel never lit, the ctrl readbacks above");
-            Serial.println("are the finding: non-zero means the block is live");
-            Serial.println("and the pad mux is next; zero means the gate is.");
+    case ST_PLL:
+        Serial.println("starting the PLL (0x40080008 <- 0xC0000C04)");
+        if (!pll_start()) {
+            show("pll   ", SL6806_PLL_CTRL);
+            Serial.println("NO LOCK. Everything after this is moot - report");
+            Serial.println("that readback; the config word is what to doubt.");
+            state = ST_DONE;
             return;
         }
+        show("pll   ", SL6806_PLL_CTRL);
+        show("modctl", SL6806_MODCTL_BASE);
+        Serial.println("PLL locked. Sweeping the module gate next.");
+        Serial.println();
+        bit = 0;
+        state = ST_SWEEP;
+        return;
 
-        ch = order[idx];
-        Serial.print("channel ");
-        Serial.print(ch);
-        Serial.print(" at 0x");
-        Serial.println(SL6806_PWM_CHAN(ch), HEX);
-        configure(ch);
-        step = 0;
+    case ST_SWEEP: {
+        uint32_t before = sl6806_mmio_read(SL6806_MODCTL_BASE);
+
+        sl6806_mmio_write(SL6806_MODCTL_BASE, before | (1u << bit));
+        delay(10);
+
+        Serial.print("  gate bit ");
+        Serial.print(bit);
+        Serial.print(": modctl 0x");
+        Serial.print(sl6806_mmio_read(SL6806_MODCTL_BASE), HEX);
+
+        if (pwm_responds()) {
+            found = bit;
+            Serial.println("  <- PWM ANSWERS");
+            Serial.println();
+            step = 0;
+            state = ST_DRIVE;
+            configure(BL_CHAN);
+            return;
+        }
+        Serial.println();
+
+        if (++bit >= 32) {
+            Serial.println();
+            Serial.println("No bit woke 0x40084000.");
+            if (sl6806_mmio_read(SL6806_MODCTL_BASE) == 0)
+                Serial.println("modctl still reads 0 - the gate register is");
+            else
+                Serial.println("modctl took the writes, so the gate is live");
+            Serial.println("and the PWM base or its reset is the next suspect.");
+            state = ST_DONE;
+        }
         return;
     }
 
-    ch = order[idx];
-    sl6806_pwm_set(ch, SL6806_PWM_BL_PERIOD, SL6806_PWM_BL_DUTY(ramp[step]));
-    Serial.print("  duty ");
-    Serial.print(ramp[step]);
-    Serial.println("%");
-    step++;
+    case ST_DRIVE:
+        if (step >= NRAMP) {
+            Serial.println();
+            Serial.print("=== done; gate bit ");
+            Serial.print(found);
+            Serial.println(" is the one ===");
+            state = ST_DONE;
+            return;
+        }
+        sl6806_pwm_set(BL_CHAN, SL6806_PWM_BL_PERIOD,
+                       SL6806_PWM_BL_DUTY(ramp[step]));
+        Serial.print("  duty ");
+        Serial.print(ramp[step]);
+        Serial.println("%");
+        step++;
+        return;
+    }
 }

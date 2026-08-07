@@ -769,9 +769,19 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
 6. ~~**Find the PLL**~~ — largely settled in practice. The clock was
    **measured at 64.000 MHz** (2026-08-06, one P20 Player) by timing the
    device's counter against the host's with `tools/sl6806-calibrate`; the
-   bracket was ±0.06% and contained exactly one whole MHz. Finding the PLL
-   would still give it exactly and for any unit, and it is *not* at the CRU
-   base: `0x40080000` has dividers but no multiplier.
+   bracket was ±0.06% and contained exactly one whole MHz.
+
+   **FOUND, and the "not at the CRU base" claim was wrong.** It is at
+   `0x40080008`. `0x00D9A7FC` writes `0xC0000C04`, spins until bit 28 (lock)
+   is set, then sets bit 16, and only afterwards enables the first module.
+   In bootloader mode the register reads `0x00000801` — stopped — which is
+   why the whole `0x400E****` domain is dark there (§14a). The vendor writes
+   `0x4008011C = 0x31` next; that looks like a clock-source select and has
+   deliberately not been tried, because reparenting the core or USB onto a
+   fresh PLL from a payload would end the session.
+
+   What this does *not* yet give is the multiplier arithmetic, so the 64 MHz
+   figure is still the measured one, not a derived one.
 
    Two hardware facts fell out of that measurement and are worth recording:
    the **DWT cycle counter does not run** on this part (its register reads a
@@ -1092,17 +1102,44 @@ of `0x00D3D094`, so `0x00030000` may be something else entirely. It also sits
 badly with §7b's result that driving every pad high lights nothing — although
 a backlight that wants a pulse train rather than a level would explain both.
 
-**Not confirmed on hardware.** In bootloader mode `0x40084000`,
-`0x40084020` and `0x40084080` all read as zeros. That is inconclusive: the
-CRU at `0x40080000` reads live structured data in the same mode, but
-unmapped space (`0x00900000`) also reads as zeros, so a gated-off block and a
-non-existent one look identical from here. `0x40084000` being `0x4000` above
-the CRU is at least the right neighbourhood.
+**TRIED ON HARDWARE, 2026-08-07 — no light, and the reason is upstream.**
+`examples/Backlight` ran all six channels. Every register read back zero,
+*including the module gate itself*: `modctl 0x0 -> 0x0`. The write did not
+stick, so nothing downstream of it could, and the gate bit was never the
+question.
 
-**The experiment this enables.** Gate the block on, write
-`+0x04 = (48000 << 16) | 28800`, set `+0x10` bit 0 and `+0x00` bit 4, and see
-whether the panel lights. That is a far smaller thing to try than another pad
-sweep, and unlike a pad sweep it does not wedge USB.
+Reading the same addresses from the host, over the vendor read command, in
+the same bootloader mode, says the same thing and settles what it means:
+
+| Block | Reads |
+|---|---|
+| `0x40080000` CRU | live — `020801d0 00000000 01080000 …` |
+| `0x400D9000` LCDC | live — `99990000 48000000 01000000 …` |
+| `0x400E0000` | all zeros |
+| `0x400E2000` | all zeros |
+| `0x40084000` | all zeros |
+
+So MMIO is fine, the addresses are not obviously wrong, and the whole
+`0x400E****` region is simply **unclocked** — for the host as much as for a
+payload, which rules out anything payload-specific.
+
+**And the firmware says why: the PLL is off.** `0x00D9A7FC`, the first thing
+the vendor's module bring-up does, starts a PLL and spins on a lock bit
+*before* the first call into `0x400E0000`. That register reads `0x00000801`
+in bootloader mode, lock bit clear. See §12.6, which this also answers.
+
+**The bit-2 claim is retracted.** It was read off `0x00D99C14` calling
+`0x00D9A74C(2)` — but that teardown belongs to the module whose init ends at
+`0x00D99C0C`, not to the PWM channel init that happens to start `0x20` later.
+Across the eleven call sites of `0x00D9A734` the numbers used are 0, 1, 2, 3,
+4 and 6, and none is tied to the PWM. It is now a thing to find by experiment.
+
+**The next experiment**, which `examples/Backlight` now runs: bring the PLL up
+as `0x00D9A7FC` does, then set each gate bit in turn and probe whether
+`0x40084000` starts answering a write-then-read. Deliberately *not* included
+is the `0x4008011C = 0x31` the vendor writes next — if that reparents the core
+or USB onto the PLL it ends the session, and the ROM's USB link is the only
+way to see anything from a payload.
 
 ### 14b. DMA — the channel registers are at `0x40001000`
 
