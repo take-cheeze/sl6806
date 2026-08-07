@@ -1134,12 +1134,38 @@ in bootloader mode, lock bit clear. See §12.6, which this also answers.
 Across the eleven call sites of `0x00D9A734` the numbers used are 0, 1, 2, 3,
 4 and 6, and none is tied to the PWM. It is now a thing to find by experiment.
 
-**The next experiment**, which `examples/Backlight` now runs: bring the PLL up
-as `0x00D9A7FC` does, then set each gate bit in turn and probe whether
-`0x40084000` starts answering a write-then-read. Deliberately *not* included
-is the `0x4008011C = 0x31` the vendor writes next — if that reparents the core
-or USB onto the PLL it ends the session, and the ROM's USB link is the only
-way to see anything from a payload.
+**Then the gate was found by sweeping: CRU `0x40080068` / `0x40080078`, bit 4.**
+With it set the block answers — CTRL took `0x7F` and read back `0x1000007F`,
+period/duty took `(48000 << 16) | 28800` exactly. So §14a's register map is
+right and every write lands.
+
+**And the panel still does not light, because the counter has no clock.** Read
+back from the host afterwards, channel 3 holds its period and duty exactly,
+and **CTRL bit 28 is stuck set** — the busy flag `0x00811E74` spins on before
+every write. In a working system that must clear or the vendor's own setter
+would hang. Programmed is not running. The pair registers at `0x40084010` are
+zero, but nothing in flash or in the blob ever writes them, so they are not it.
+
+**The pad was a real missing step and was not enough on its own.** The vendor's
+configure op calls ROM `0x93C` with the id its constructor stores at `dev+0x48`
+— `0x00010200`, bank 1 pin 0 function 4. Muxing it changed nothing while the
+counter was stopped, but it is required and no earlier work had it: this is why
+`examples/BacklightHunt` could not have succeeded, since it drove candidates as
+function 1 and skipped bank 1's low pins as the panel's bus (true of pins 1–8,
+not pin 0).
+
+**Open: `0x4008011C`.** The vendor writes `0x31` after the PLL locks and `0x30`
+on the way down — one bit apart, so bit 0 is an *enable*, not the clock-source
+reparent it was first taken for, and an enable cannot carry the core or USB off
+with it. It is the last unwritten step of `0x00D9A7FC` and the leading
+explanation for both a stalled counter and a permanently dead `0x400E0000`.
+
+> ⚠ **CRU state survives a payload upload.** Uploading does not reset the clock
+> tree, so a PLL left locked by one run is still locked for the next. One run
+> was lost to a sketch that returned early on "already locked" and thereby
+> skipped the step it existed to test. **Probes must write every step
+> unconditionally**, and print a before/after readback, or a stale device looks
+> like a negative result.
 
 ### 14b. DMA — the channel registers are at `0x40001000`
 

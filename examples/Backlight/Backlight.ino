@@ -132,28 +132,40 @@ static bool pll_start(void)
 {
     uint32_t i;
 
-    if (sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)
-        return true;                         /* already up */
+    /*
+     * THE DEVICE KEEPS CRU STATE ACROSS PAYLOAD UPLOADS. Uploading does not
+     * reset the clock tree, so a PLL left locked by the previous run is still
+     * locked when the next one starts. Run e was lost to exactly that: this
+     * function used to return early on "already locked", which skipped the
+     * clock enable below - the one thing that run existed to test. The log
+     * said so plainly (clken @0x4008011C = 0x0) and cost a whole cycle.
+     *
+     * So: skip the *bring-up* when it is already up, but never skip a step
+     * that has to be true afterwards. Every stage below this line is written
+     * unconditionally, and that is the rule for anything driving this board.
+     */
+    if (!(sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)) {
+        sl6806_mmio_write(SL6806_PLL_CTRL, SL6806_PLL_CONFIG);
 
-    sl6806_mmio_write(SL6806_PLL_CTRL, SL6806_PLL_CONFIG);
+        /* Bounded: this runs inside the boot ROM's USB handler, and a spin
+         * here takes the device off the bus until it is unplugged. */
+        for (i = 0; i < 400000u; i++)
+            if (sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)
+                break;
 
-    /* Bounded: this runs inside the boot ROM's USB handler, and a spin here
-     * takes the device off the bus until it is unplugged. */
-    for (i = 0; i < 400000u; i++)
-        if (sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK)
-            break;
+        if (!(sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK))
+            return false;
 
-    if (!(sl6806_mmio_read(SL6806_PLL_CTRL) & SL6806_PLL_LOCK))
-        return false;
-
-    sl6806_mmio_write(SL6806_PLL_CTRL,
-                      sl6806_mmio_read(SL6806_PLL_CTRL) | SL6806_PLL_OUT_ENABLE);
-    delay(10);
+        sl6806_mmio_write(SL6806_PLL_CTRL,
+                          sl6806_mmio_read(SL6806_PLL_CTRL)
+                          | SL6806_PLL_OUT_ENABLE);
+        delay(10);
+    }
 
     /*
-     * The last step of 0x00D9A7FC, and the one this sketch used to leave out.
-     * 0x31 up, 0x30 down - one bit apart, so it is an enable rather than the
-     * reparent it looked like, and a plain enable cannot take USB with it.
+     * The last step of 0x00D9A7FC. 0x31 up, 0x30 down - one bit apart, so it
+     * is an enable rather than the reparent it looked like, and a plain
+     * enable cannot take USB with it.
      */
     sl6806_mmio_write(SL6806_CRU_CLK_ENABLE, SL6806_CRU_CLK_ON);
     delay(10);
@@ -309,6 +321,7 @@ void loop()
 
     case ST_PLL:
         Serial.println("PLL:");
+        show("clken before", SL6806_CRU_CLK_ENABLE);
         if (!pll_start()) {
             show("pll   ", SL6806_PLL_CTRL);
             Serial.println("  NO LOCK - doubt the config word before anything else");
@@ -316,10 +329,11 @@ void loop()
             return;
         }
         show("pll   ", SL6806_PLL_CTRL);
-        show("clken ", SL6806_CRU_CLK_ENABLE);
+        show("clken after ", SL6806_CRU_CLK_ENABLE);
         show("modctl", SL6806_MODCTL_BASE);
-        Serial.println("  (if modctl is non-zero now, the clock enable was");
-        Serial.println("   what that whole region was waiting for)");
+        Serial.println("  (clken must read 0x31 now. If it reads 0 the write");
+        Serial.println("   was dropped and that register is gated too. If");
+        Serial.println("   modctl went non-zero, this was what it waited for.)");
 
         /* The gate is known now - measured, not guessed. Set it directly and
          * only fall back to the sweep if this board disagrees. */
