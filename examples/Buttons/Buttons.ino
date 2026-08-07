@@ -1,66 +1,63 @@
 /*
- * Buttons - the keys are on an ADC ladder, so watch the ADC.
+ * Buttons - enable the ADC the way the mask ROM does, then read the keys.
  *
- * FIRST RUN SETTLED THE EASY HALF. The two GPIO keys from /dev/key_io do not
- * move when a button is pressed: bank 1 pin 12 sits at 1 and pin 17 sits at a
- * steady 0, which matches 7g's note that pin 17 is externally driven. Nor did
- * any of 7g's "likely button group" (pins 22-27, 30, 31) move. So the user
- * buttons are the other two keys - the ones on the resistor ladder.
+ * THE KEYS, from the dump. The key manager (0x00D1DA20) opens two devices and
+ * hands each a map; both maps are in the SRAM blob, so they read straight out
+ * of dump.bin (docs/sl6806_re_notes.md 13):
  *
- * WHAT THE FIRMWARE SAYS. The key manager (0x00D1DA20) opens two key devices,
- * each with a map, and both maps are in the SRAM blob so they read straight
- * out of dump.bin (docs/sl6806_re_notes.md 13):
+ *   /dev/key_io   0x0081C044   bank 1 pin 17 -> key 0x3E, pin 12 -> key 0x3C
+ *   /dev/kadc_ch0 0x0081C02C   level 0x0200 -> key 0x42, 0x0E60 -> key 0x40
  *
- *   /dev/key_io   0x0081C044  {pad_id, 0, key_id, 0x101}
- *       bank 1 pin 17 -> key 0x3E,  bank 1 pin 12 -> key 0x3C     (not buttons)
- *   /dev/kadc_ch0 0x0081C02C  {adc_level, key_id, 0}
- *       level 0x0200 -> key 0x42,  level 0x0E60 -> key 0x40       (these)
+ * Measured: neither GPIO key moves on a press, and pin 17 sits at a steady 0,
+ * so those two are detects of some sort. The buttons are the ladder pair.
  *
- * Two levels, two keys. On a player whose UI is a touchscreen, two physical
- * buttons either side of power is exactly what you would expect, so these are
- * the volume pair unless the log says otherwise.
+ * THE ADC is at 0x40096000 (the only MMIO literal in its HAL, 0x00D994F8),
+ * channels 0x10 apart from +0x20, key channel 0 on bank 1 pin 9 function 15.
+ * It reads structured values and ignores every write.
  *
- * THE ADC IS AT 0x40096000, found from the only literal in its HAL
- * (0x00D994F8), and - unlike the PWM that ate the last seven runs - **it is
- * already alive**. In bootloader mode, with nothing set up, it reads
- * structured non-zero values: +0x00 = 0x00100000, +0x04 = 0x00000800,
- * +0x08 = 0x000001E0, +0x20 = 0x10, +0x30 = 0x10. No clock hunt required.
+ * WHAT FOUR RUNS OF SWEEPING MISSED. The mask ROM has the answer, as a
+ * function: 0x00001C5C is module_clock_enable(id), and it says the module
+ * space is 128 ids across *four* register pairs, not three:
  *
- * Channels are 0x10 apart starting at +0x20 (0x00D993A0 dispatches ten of them
- * that way), and this board's key channel is 0, on bank 1 pin 9 - the kadc
- * constructor stores pad id 0x00014800 with pad value 0x780, which is function
- * 15, the analog setting.
+ *     id  0.. 31   CRU +0x60 gate, +0x70 shadow
+ *     id 32.. 63   CRU +0x64 gate, +0x74 shadow
+ *     id 64.. 95   CRU +0x68 gate, +0x78 shadow
+ *     id 96..127   0x400F1000 +0x20 gate, +0x30 shadow
  *
- * WHICH REGISTER HOLDS THE CONVERSION is not established, so this does not
- * guess: it dumps the whole block every poll and prints any word that changed.
- * Press a button and the log names the register and the value. That is both
- * the measurement and the identification, and it cannot be wrong the way
- * picking a likely-looking offset can.
+ * Two things were wrong with every sweep before this. The fourth block was
+ * never touched at all - 0x400F1000 is filed in 7c as a storage controller -
+ * so 32 module ids were out of reach. And the order matters: the ROM writes
+ * the *shadow* first, then the gate, then spins until the gate reads the bit
+ * back. Setting both at once and moving on is not the same operation.
+ *
+ * This reimplements that rather than calling it, for one reason: the ROM's
+ * poll is unbounded, and a module id that nothing implements would spin
+ * forever inside the boot ROM's USB handler and take the device off the bus.
+ * Same algorithm, same order, with a timeout.
  *
  *     make SKETCH=examples/Buttons RUN_MODE=poll upload
  *     tools/sl6806-monitor --tick 5 build/Buttons.sym
  *
- * HOLD EACH BUTTON for a few seconds. loop() runs at the USB poll rate, which
- * has been measured between 0.3 and 42 times a second, so a tap can fall
- * between two samples.
+ * HOLD EACH BUTTON for a few seconds - loop() runs at the USB poll rate,
+ * measured between 0.3 and 42 times a second.
  *
- * SAFETY. The only writes are the ADC's own init sequence, transcribed from
- * 0x00D994EC, and one pad put into the analog function the vendor picks for
- * it. Nothing drives a pin. Nothing writes flash.
+ * SAFETY. Clocks are only ever turned on, never off, and the ROM's own
+ * disable (0x00001CE8) is deliberately not used - switching a clock off under
+ * a running peripheral is how you lose USB. Progress is printed every eight
+ * ids, so if one of them does wedge the device the log names the range.
  */
 
 #include <Arduino.h>
 #include "sl6806_padctl.h"
 #include "sl6806_mmio.h"
 
-/* [V] From the only MMIO literal in the ADC HAL, at 0x00D994F8. */
+/* [V] 0x00D994F8, the only MMIO literal in the ADC HAL. */
 #define ADC_BASE        0x40096000u
-#define ADC_CTRL        0x00        /* [V] init writes 0x80180000  */
-#define ADC_CFG         0x04        /* [V] init writes 0x0002A800  */
+#define ADC_CTRL        0x00        /* [V] init writes 0x80180000 */
+#define ADC_CFG         0x04        /* [V] init writes 0x0002A800 */
 #define ADC_CHAN(ch)    (0x20u + (uint32_t)(ch) * 0x10u)   /* [V] 0x00D993A0 */
 
-/* [V] kadc constructor 0x00D3DB50: channel 0 is pad 0x00014800 with pad value
- * 0x780, i.e. bank 1 pin 9 on function 15. */
+/* [V] kadc constructor 0x00D3DB50: channel 0 is pad 0x00014800, value 0x780. */
 #define ADC_KEY_PAD     (0x00014800u | 0x780u)
 #define ADC_KEY_CHAN    0
 
@@ -70,26 +67,44 @@
 #define KEY_LEVEL_B     0x0E60u
 #define KEY_ID_B        0x40
 
-#define NWORDS 16                   /* 0x40096000..0x4009603F */
+#define CRU_BASE        0x40080000u
+#define MOD_BASE_HI     0x400F1000u   /* [V] ids 96..127 live here */
+#define NMODULES        128
+#define NWORDS          16            /* 0x40096000..0x4009603F */
+
+static uint32_t last[NWORDS];
+static bool     have_last;
+static int      opened_by = -1;
 
 /*
- * CRU registers that hold gate-shaped values in a cold chip. 0x60..0x78 are
- * the pairs the backlight hunt used; the rest were found by dumping the whole
- * CRU and are new. Sweeping is how the PWM's gate turned up (14a), and it is
- * cheaper than reasoning about a block with no datasheet.
+ * 0x00001C5C, transcribed with a bounded poll. Returns true if the gate
+ * acknowledged.
  */
-#define CRU_BASE 0x40080000u
-static const uint16_t cru_gates[] = {
-    0x60, 0x64, 0x68, 0x70, 0x74, 0x78,
-    0xA0, 0xB0, 0xDC, 0xEC, 0xFC,
-};
-#define NCRU ((int)(sizeof cru_gates / sizeof cru_gates[0]))
+static bool module_enable(unsigned id)
+{
+    uint32_t base, gate, shadow, bit;
+    uint32_t i;
+
+    if (id < 32)        { base = CRU_BASE;    gate = 0x60; shadow = 0x70; }
+    else if (id < 64)   { base = CRU_BASE;    gate = 0x64; shadow = 0x74; id -= 32; }
+    else if (id < 96)   { base = CRU_BASE;    gate = 0x68; shadow = 0x78; id -= 64; }
+    else                { base = MOD_BASE_HI; gate = 0x20; shadow = 0x30; id -= 96; }
+
+    bit = 1u << id;
+
+    sl6806_mmio_write(base + shadow, sl6806_mmio_read(base + shadow) | bit);
+    sl6806_mmio_write(base + gate,   sl6806_mmio_read(base + gate)   | bit);
+
+    for (i = 0; i < 100000u; i++)
+        if (sl6806_mmio_read(base + gate) & bit)
+            return true;
+    return false;
+}
 
 /*
- * Does the ADC take a write? +0x04 is the config register the vendor's init
- * writes; it reads 0x800 in a cold chip. A bare read cannot tell a gated
- * block from an idle one - that mistake cost three runs on the PWM - so this
- * writes and reads back, then puts it right again.
+ * Write and read back. A register that reads zero because it is gated and one
+ * that reads zero because it is idle are the same thing from here - that
+ * mistake cost four runs across two peripherals.
  */
 static bool adc_writable(void)
 {
@@ -103,94 +118,15 @@ static bool adc_writable(void)
     return ok;
 }
 
-/*
- * The other register class, and the one every sweep so far has missed.
- *
- * The LCDC needs two things to work from a payload, not one: a gate bit
- * (0x64/0x74 bit 15) *and* a module clock at 0x4008010C, which its driver
- * sets to 0x911. 0x00D44690 shows the shape of those registers plainly -
- * it builds [7:4] from one argument and [11:8] from another, stores, then
- * ORs in bit 0:
- *
- *     bit 0 = enable,  [7:4] = source,  [11:8] = divider
- *
- * and 0x4008011C's 0x31 fits it too: enabled, source 3. In a cold chip
- * +0x104 and +0x110..+0x13C all read 0, which under that reading is a row of
- * *disabled module clocks*. A gate without a module clock is exactly what
- * the PWM looked like in 14a - registers writable, counter stopped - so this
- * is the likeliest thing wrong with both peripherals.
- */
-#define CRU_MODCLK_LO 0x100
-#define CRU_MODCLK_HI 0x13C
-
-static int hunt_module_clock(void)
+/* 0x00D994EC, transcribed. */
+static void adc_init(void)
 {
-    /* Enable, with each plausible source, then a couple with a divider. */
-    static const uint32_t vals[] = {
-        0x001, 0x011, 0x021, 0x031, 0x041, 0x051, 0x061, 0x071,
-        0x111, 0x911,
-    };
-    const int nvals = (int)(sizeof vals / sizeof vals[0]);
-    uint16_t off;
-    int v;
-
-    for (off = CRU_MODCLK_LO; off <= CRU_MODCLK_HI; off += 4) {
-        uint32_t r = CRU_BASE + off;
-        uint32_t base = sl6806_mmio_read(r);
-
-        if (base & 1u)
-            continue;                 /* already enabled; leave it alone */
-
-        for (v = 0; v < nvals; v++) {
-            sl6806_mmio_write(r, vals[v]);
-            delayMicroseconds(200);
-            if (adc_writable()) {
-                Serial.print("    +0x");
-                Serial.print(off, HEX);
-                Serial.print(" <- 0x");
-                Serial.print(vals[v], HEX);
-                Serial.println(" OPENS THE ADC - left on");
-                return 1;
-            }
-        }
-        sl6806_mmio_write(r, base);
-    }
-    return 0;
+    sl6806_mmio_write(ADC_BASE + 0x10, 0);
+    sl6806_mmio_write(ADC_BASE + 0x18, 0);
+    sl6806_mmio_write(ADC_BASE + 0x0C, 0);
+    sl6806_mmio_write(ADC_BASE + ADC_CFG,  0x0002A800u);
+    sl6806_mmio_write(ADC_BASE + ADC_CTRL, 0x80180000u);
 }
-
-/* Set each bit of each candidate in turn; restore unless it worked. */
-static int hunt_adc_gate(void)
-{
-    int i, bit;
-
-    for (i = 0; i < NCRU; i++) {
-        uint32_t r = CRU_BASE + cru_gates[i];
-        uint32_t base = sl6806_mmio_read(r);
-
-        Serial.print("  +0x");
-        Serial.print(cru_gates[i], HEX);
-        Serial.print(" = 0x");
-        Serial.println(base, HEX);
-
-        for (bit = 0; bit < 32; bit++) {
-            if (base & (1u << bit))
-                continue;
-            sl6806_mmio_write(r, base | (1u << bit));
-            delayMicroseconds(200);
-            if (adc_writable()) {
-                Serial.print("    bit ");
-                Serial.print(bit);
-                Serial.println(" OPENS THE ADC - left on");
-                return 1;
-            }
-            sl6806_mmio_write(r, base);
-        }
-    }
-    return 0;
-}
-
-static uint32_t last[NWORDS];
-static bool     have_last;
 
 static void dump(const char *tag)
 {
@@ -204,15 +140,29 @@ static void dump(const char *tag)
     Serial.println();
 }
 
-/* 0x00D994EC, transcribed. The vendor guards it with a "already inited"
- * pointer; there is nothing to guard here, and re-running it is harmless. */
-static void adc_init(void)
+/* Turn on every module id in turn until the ADC answers a write. */
+static int hunt_module(void)
 {
-    sl6806_mmio_write(ADC_BASE + 0x10, 0);
-    sl6806_mmio_write(ADC_BASE + 0x18, 0);
-    sl6806_mmio_write(ADC_BASE + 0x0C, 0);
-    sl6806_mmio_write(ADC_BASE + ADC_CFG,  0x0002A800u);
-    sl6806_mmio_write(ADC_BASE + ADC_CTRL, 0x80180000u);
+    unsigned id;
+
+    for (id = 0; id < NMODULES; id++) {
+        if ((id & 7) == 0) {
+            Serial.print("  ids ");
+            Serial.print(id);
+            Serial.print("..");
+            Serial.print(id + 7);
+            Serial.println(" ...");
+        }
+        module_enable(id);
+        delayMicroseconds(200);
+        if (adc_writable()) {
+            Serial.print("  module id ");
+            Serial.print(id);
+            Serial.println(" OPENS THE ADC");
+            return (int)id;
+        }
+    }
+    return -1;
 }
 
 void setup()
@@ -220,17 +170,14 @@ void setup()
     Serial.begin(115200);
     Serial.println();
     Serial.println("=== SL6806 buttons: the ADC ladder ===");
-    Serial.println("The GPIO keys do not move on a press, so the buttons are");
-    Serial.println("the two on /dev/kadc_ch0. Levels from the vendor's map:");
-    Serial.print("  0x");
+    Serial.print("key levels 0x");
     Serial.print(KEY_LEVEL_A, HEX);
-    Serial.print(" -> key 0x");
+    Serial.print(" -> 0x");
     Serial.print(KEY_ID_A, HEX);
-    Serial.print("    0x");
+    Serial.print(", 0x");
     Serial.print(KEY_LEVEL_B, HEX);
-    Serial.print(" -> key 0x");
+    Serial.print(" -> 0x");
     Serial.println(KEY_ID_B, HEX);
-    Serial.println();
 
     Serial.print("pad 0x");
     Serial.print(ADC_KEY_PAD, HEX);
@@ -238,19 +185,17 @@ void setup()
     Serial.println(sl6806_pad_configure(ADC_KEY_PAD) == 0 ? "ok" : "REFUSED");
 
     dump("before:");
+
     if (adc_writable()) {
         Serial.println("ADC already accepts writes.");
     } else {
-        Serial.println("ADC ignores writes - hunting a CRU gate:");
-        if (!hunt_adc_gate()) {
-            Serial.println("  no gate bit did it; trying module clocks");
-            Serial.println("  (CRU +0x100..+0x13C, bit 0 = enable):");
-            if (!hunt_module_clock()) {
-                Serial.println("  nothing opened it. The ADC is readable but");
-                Serial.println("  not writable, same shape as the PWM in 14a.");
-            }
-        }
+        Serial.println("ADC ignores writes; enabling module clocks the way");
+        Serial.println("the mask ROM does (0x00001C5C), ids 0..127:");
+        opened_by = hunt_module();
+        if (opened_by < 0)
+            Serial.println("  no module id opened it.");
     }
+
     adc_init();
     delay(10);
     dump("after: ");
@@ -259,7 +204,7 @@ void setup()
 
     Serial.println();
     Serial.println("Words are 0x40096000 +0,4,8,... Press and HOLD a button;");
-    Serial.println("any word that changes is printed with its index.");
+    Serial.println("any word that changes is printed with its offset.");
     Serial.println();
 }
 
@@ -296,14 +241,8 @@ void loop()
         return;
     }
 
-    /* Quiet. Print the channel word only when the host ticks, so a still log
-     * does not scroll at the poll rate. */
     if (Serial.read() >= 0) {
-        Serial.print("steady: chan");
-        Serial.print(ADC_KEY_CHAN);
-        Serial.print(" @+0x");
-        Serial.print(ADC_CHAN(ADC_KEY_CHAN), HEX);
-        Serial.print(" = 0x");
+        Serial.print("steady: chan0 = 0x");
         Serial.print(sl6806_mmio_read(ADC_BASE + ADC_CHAN(ADC_KEY_CHAN)), HEX);
         Serial.print("   +0x08 = 0x");
         Serial.println(sl6806_mmio_read(ADC_BASE + 0x08), HEX);

@@ -1372,3 +1372,41 @@ which fits both known values: the LCD's `+0x10C` = `0x911` (enabled, source 1,
 divider 9) and `+0x11C` = `0x31` (enabled, source 3). A peripheral needs *both*
 a gate bit and a module clock — the LCD driver sets both, and every sweep
 before this one only ever touched gates.
+
+### 15b. The mask ROM has a module_clock_enable, and it changes the map
+
+`0x00001C5C` is `module_clock_enable(id)` and `0x00001CE8` is its disable.
+They settle what the gate registers actually are, and they are not what §14a
+and §15 assumed:
+
+| Module id | Gate | Shadow |
+|---|---|---|
+| 0–31 | CRU `+0x60` | CRU `+0x70` |
+| 32–63 | CRU `+0x64` | CRU `+0x74` |
+| 64–95 | CRU `+0x68` | CRU `+0x78` |
+| **96–127** | **`0x400F1000 +0x20`** | **`0x400F1000 +0x30`** |
+
+Three things follow, and each invalidates part of an earlier sweep.
+
+**There is a fourth register pair, at `0x400F1000`.** §7c files that base as a
+storage controller — it is that as well, but `+0x20`/`+0x30` are module gates
+for ids 96–127. No sweep in this repository has ever touched them, so a
+quarter of the module space was unreachable, and "all 96 CRU gate bits" in
+§14a was 96 of 128.
+
+**The `0x60`/`0x64`/`0x68` registers are the gates and `0x70`/`0x74`/`0x78`
+are their shadows** — not two independent banks, which is how the backlight
+hunt treated them.
+
+**The order is part of the operation.** The ROM writes the shadow, then the
+gate, then spins until the gate reads the bit back. Every sweep here wrote
+both at once and moved on without waiting for the acknowledgement.
+
+`examples/Buttons` now walks ids 0–127 through a transcription of that
+routine. It is transcribed rather than called because the ROM's poll is
+unbounded: an id nothing implements would spin forever inside the boot ROM's
+USB handler and take the device off the bus.
+
+**This is worth re-running for the PWM too.** The backlight's functional clock
+was hunted across three register pairs with the wrong write order and without
+the fourth pair, so §14a's negative is not as complete as it reads.
