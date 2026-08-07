@@ -18,16 +18,28 @@
  * ten acknowledge bits back, so that handshake is already done before we
  * arrive.
  *
- * WHAT IS LEFT is the CRU's own peripheral gates. 0x40080064 and 0x40080074
- * read 0x00008008: bit 15 is the LCDC (which is why the LCD answers at all)
- * and bit 3 is something else, and every other peripheral on the chip is
- * gated off. Those registers demonstrably take writes - starting the PLL at
- * 0x40080008 proved that much. So this sweeps them.
+ *   2026-08-07 c. The sweep found it: CRU 0x40080068 / 0x40080078 bit 4.
+ *     With that set the block answers - CTRL took 0x7F and read back
+ *     0x1000007F (bit 28 is the busy flag 0x00811E74 polls), and period/duty
+ *     took (48000 << 16) | 28800 exactly. Every register did what it was
+ *     told, and the panel still did not light.
  *
- * HOW IT SWEEPS. A clock gate takes effect in a few cycles, and there is
- * nothing to look at while it happens, so the whole 32-bit sweep runs inside
- * one loop() call rather than one bit per host tick. That keeps it well
- * inside a single foreground monitor run, which a 32-tick sweep would not be.
+ * WHICH LEFT THE PAD. A PWM running into a pin that is still muxed to GPIO
+ * drives nothing. The vendor's configure op (0x00D45394) calls ROM 0x93C -
+ * pad configure from a packed id - with the id its constructor put at
+ * dev+0x48, and that id is 0x00010200: bank 1, pin 0, alternate function 4.
+ * This sketch now does that first, and that is the one thing every previous
+ * run was missing.
+ *
+ * It is also the thing BacklightHunt could not have found: it drove pads as
+ * function 1, plain output, which is not what function 4 does, and its
+ * candidate list skipped bank 1's low pins as the panel's bus - true of pins
+ * 1-8, not of pin 0.
+ *
+ * THE SWEEP IS STILL HERE as a fallback, in case another board disagrees
+ * about the gate. It runs inside one loop() call rather than one bit per
+ * tick: a clock gate settles in cycles, there is nothing to watch, and 32
+ * ticks would outlive the monitor's foreground limit.
  *
  * THE PROBE IS A WRITE AND A READ BACK, not a bare read: a register that
  * reads zero because it is dead and one that reads zero because it is idle
@@ -52,6 +64,7 @@
 #include <Arduino.h>
 #include "sl6806_pwm.h"
 #include "sl6806_cru.h"
+#include "sl6806_padctl.h"
 #include "sl6806_lcdc.h"
 
 static sl6806_color_t band[240 * 8];
@@ -182,6 +195,24 @@ static int sweep_pair(const gatepair_t *g)
 static void configure(unsigned ch)
 {
     uint32_t base = SL6806_PWM_CHAN(ch);
+    int rc;
+
+    /*
+     * Mux the pin first. A PWM that runs into a pad still selected for GPIO
+     * drives nothing, which is the most likely reason the previous run
+     * programmed every register correctly and changed nothing on the panel.
+     */
+    rc = sl6806_pad_configure(SL6806_PWM_BL_PAD);
+    Serial.print("  pad 0x");
+    Serial.print(SL6806_PWM_BL_PAD, HEX);
+    Serial.print(" (bank ");
+    Serial.print(SL6806_PAD_BANK(SL6806_PWM_BL_PAD));
+    Serial.print(" pin ");
+    Serial.print(SL6806_PAD_PIN(SL6806_PWM_BL_PAD));
+    Serial.print(" fn ");
+    Serial.print(SL6806_PAD_FUNC(SL6806_PWM_BL_PAD));
+    Serial.print(") -> ");
+    Serial.println(rc == 0 ? "ok" : "REFUSED");
 
     sl6806_mmio_write(base + SL6806_PWM_CTRL, SL6806_PWM_CTRL_INIT);
     sl6806_mmio_write(base + SL6806_PWM_CTRL,
@@ -241,14 +272,27 @@ void loop()
             return;
         }
         show("pll   ", SL6806_PLL_CTRL);
+
+        /* The gate is known now - measured, not guessed. Set it directly and
+         * only fall back to the sweep if this board disagrees. */
+        sl6806_mmio_write(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE0,
+                          sl6806_mmio_read(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE0)
+                          | SL6806_PWM_CRU_GATE_BIT);
+        sl6806_mmio_write(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE1,
+                          sl6806_mmio_read(SL6806_CRU_BASE + SL6806_PWM_CRU_GATE1)
+                          | SL6806_PWM_CRU_GATE_BIT);
+        delayMicroseconds(200);
+        show("gate0 ", SL6806_CRU_BASE + SL6806_PWM_CRU_GATE0);
+
         if (pwm_responds()) {
-            Serial.println("  ...and that alone woke the PWM");
+            Serial.println("  PWM answers.");
+            Serial.println();
             state = ST_DRIVE;
             step = 0;
             configure(BL_CHAN);
             return;
         }
-        Serial.println("  locked; PWM still dead. Sweeping the CRU gates.");
+        Serial.println("  PWM still dead - falling back to the full sweep.");
         Serial.println();
         gi = 0;
         state = ST_SWEEP;

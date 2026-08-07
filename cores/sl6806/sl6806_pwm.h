@@ -76,16 +76,41 @@
 #define SL6806_MODCTL_RESET     0x08       /* [V] 0 = held in reset         */
 
 /*
- * [?] WHICH BIT THE PWM IS, is not known.
+ * [?] WHICH BIT OF 0x400E0000 THE PWM IS, is still not known, and no longer
+ * matters: that register takes no writes from a payload at all, and the PWM
+ * turns out not to need it.
  *
- * This used to say bit 2, "[V] from the teardown path". That was wrong: the
- * teardown it was read from (0x00D99C14) belongs to the module that ends at
- * 0x00D99C0C, not to the PWM channel init that happens to start 0x20 later.
- * Of the eleven call sites of 0x00D9A734 the numbers used are 0, 1, 2, 3, 4
- * and 6, and none of them has been tied to the PWM. Find it by experiment
- * once the block answers at all - examples/Backlight sweeps the bits and
- * watches whether 0x40084000 starts responding.
+ * (It used to say bit 2, "[V] from the teardown path". That was wrong - the
+ * teardown it was read from belongs to the module ending at 0x00D99C0C, not
+ * to the PWM channel init that starts 0x20 later.)
  */
+
+/*
+ * [V, MEASURED ON HARDWARE] What the PWM actually needs is a CRU gate:
+ * bit 4 of 0x40080068 and 0x40080078.
+ *
+ * Found by sweeping (examples/Backlight, 2026-08-07). With that bit set the
+ * block answers a write and reads it back - CTRL took 0x7F and read
+ * 0x1000007F, and period/duty took (48000 << 16) | 28800 exactly. Before it,
+ * every register reads zero and ignores writes.
+ *
+ * Bit 28 of CTRL appearing on its own is the busy flag that 0x00811E74 polls.
+ */
+#define SL6806_PWM_CRU_GATE0    0x68       /* [V] offsets from the CRU base */
+#define SL6806_PWM_CRU_GATE1    0x78
+#define SL6806_PWM_CRU_GATE_BIT (1u << 4)  /* [V] measured                  */
+
+/*
+ * [V] The pad. The PWM's configure op (0x00D45394) calls ROM 0x93C - pad
+ * configure from a packed id - with the id its constructor stored at
+ * dev+0x48, and that id is 0x00010200: bank 1, pin 0, alternate function 4.
+ *
+ * This is the part examples/BacklightHunt could never have found. It drove
+ * pads as function 1, plain output, and muxing a pin to function 4 is a
+ * different thing entirely; its candidate list also skipped bank 1's low
+ * pins as "the panel's own bus", which pins 1-8 are - but pin 0 is not.
+ */
+#define SL6806_PWM_BL_PAD       0x00010200u
 
 /* ------------------------------------------------------------------ */
 /* The PLL, which everything above depends on                          */
