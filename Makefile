@@ -87,6 +87,12 @@ OPT    := -Os -ffunction-sections -fdata-sections -fno-common
 INCS   := -I$(CORE_DIR) -I$(VARIANT_DIR)
 DEFS   := -DF_CPU=$(F_CPU)UL -DSL6806=1 $(MODE_DEF)
 
+# examples/PadSweep takes one GPIO bank per build, so a bank that wedges the
+# device cannot take the others with it.
+ifneq ($(SWEEP_BANK),)
+DEFS   += -DSWEEP_BANK=$(SWEEP_BANK)
+endif
+
 # Appended to every compile. CI passes -Werror here rather than baking it in,
 # so a warning stops the build there without making local experiments painful.
 EXTRA_FLAGS ?=
