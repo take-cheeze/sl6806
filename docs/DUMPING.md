@@ -89,8 +89,11 @@ tools/sl6806-dumpram --start 0x800000 --size 0x40000 --out sram.bin
 [`sl6806_re_notes.md`](sl6806_re_notes.md) §7f.** In short:
 
 - The ROM dump is genuine — 93% of its branches resolve internally — but it
-  contains no LCD driver, does not hold the application's SRAM driver blob,
-  and does not reveal the GPIO registers.
+  contains no LCD driver and does not hold the application's SRAM driver blob.
+- It *does* contain the pad controller, which is what unblocked GPIO. The
+  reason an early scan missed it: the ROM does not address GPIO as base plus
+  offset from a literal, it looks the bank base up in a table at
+  `0x00065004`. See §7f and `cores/sl6806/sl6806_padctl.h`.
 - Nothing is resident at `0x0080E842` or `0x00811C7C` in bootloader mode. The
   SRAM dump is faithful there (its relocated vector table and the ROM's own
   stack both read back correctly), so this is a real absence rather than a

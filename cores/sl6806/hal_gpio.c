@@ -109,12 +109,12 @@ void sl6806_gpio_set_dir(uint8_t pin, int output)
     uint32_t id = vendor_id(pin);
 
     if (id != SL6806_GPIO_ID_NONE) {
-        /* The vendor routine takes a packed configuration word rather than a
-         * direction bit, and which field selects the direction is not known.
-         * Doing nothing is the honest choice: the pad was configured by
-         * whatever ran before us, and guessing a field would reconfigure it
-         * into something arbitrary. */
-        (void)output;
+        /* A back end that can change the direction on its own does so. One
+         * that cannot leaves the pad as whatever configured it, which is the
+         * honest choice - guessing a field of the vendor configuration word
+         * would reconfigure the pad into something arbitrary. */
+        if (g_vendor->set_dir)
+            g_vendor->set_dir(id, output);
         return;
     }
 

@@ -4,42 +4,45 @@
  * =====================================================================
  *  READ THIS BEFORE EXPECTING digitalWrite() TO DO ANYTHING
  * =====================================================================
- * The SL6806 GPIO registers are NOT known. There is no public datasheet,
- * no register map in any dump analysed so far, and no published reverse
- * engineering of the pad controller. Nothing in this framework can invent
- * them.
+ * The registers ARE known now - see cores/sl6806/sl6806_padctl.h, which is
+ * the pad controller read out of the mask ROM. What is still missing on this
+ * board is not the registers but the *pinout*: which pad each button and LED
+ * is wired to. A pin whose pad id nobody knows is still a pin you cannot
+ * drive, so most of the names in the variant still report rather than
+ * pretend.
  *
- * So GPIO here is a complete, working driver with exactly one hole in it,
- * and there are two ways to fill it:
+ * There are two ways to reach a pad, and a board can use both at once:
  *
- *   - the register table below: fill it in once, in your variant, and every
- *     Arduino digital call starts working; or
- *   - the vendor back end further down. The stock firmware does not touch
- *     GPIO registers either - it calls a routine in the mask ROM's driver
- *     set with a packed pin id - so if you can reach that routine you get
- *     working pins without knowing a single register address.
+ *   - the vendor back end: a packed pad id and a driver behind it. This is
+ *     how the stock firmware works, it is how the panel reset line is
+ *     driven, and sl6806_padctl_vendor() is a ready-made implementation:
  *
- * Until one of the two exists, calls report an error over Serial instead of
+ *         sl6806_gpio_vendor_register(sl6806_padctl_vendor());
+ *
+ *     On the P20 that already happens when the display comes up.
+ *
+ *   - the register table below: an Arduino pin number mapped to a port and
+ *     a bit. Note that this model does not fit the SL6806 well - direction
+ *     here is a four-bit function field, not a bit in a direction register -
+ *     so the vendor path is the one to prefer on this chip. The table stays
+ *     for boards where it does fit.
+ *
+ * When neither can reach a pin, calls report an error over Serial instead of
  * silently doing nothing, because a silent no-op on a GPIO API is how you
  * spend an afternoon debugging your wiring for no reason.
  *
- * HOW TO FIND THE REGISTERS
- * -------------------------
- * 1. Get a good 4 MiB dump (see docs/DUMPING.md).
- * 2. Run  tools/sl6806-find-mmio.py dump.bin  - it scans the FIRM image for
- *    literal-pool constants that look like peripheral bases and ranks them
- *    by how they are used (read-modify-write on a bit index = GPIO-shaped).
- * 3. Load FIRM in Ghidra at 0x00C10000 and look at the code around the
- *    top-ranked bases. A GPIO port is recognisable: three or four registers
- *    at a fixed stride, one written with (1 << pin), one read back.
- * 4. Confirm on hardware with examples/MmioProbe, which toggles a candidate
- *    register and lets you watch a pin with a meter or LED.
- * 5. Write what you found into the port table in your variant and define
- *    SL6806_GPIO_CONFIGURED.
+ * HOW TO FIND A PIN'S PAD ID
+ * --------------------------
+ * The ids are immediates at the stock firmware's call sites, so:
  *
- * The struct below covers both common layouts (set/clear registers, or a
- * single read-modify-write output register), so you should not need to
- * change any code - only data.
+ * 1. Get a good 4 MiB dump (see docs/DUMPING.md).
+ * 2. Find the calls to the vendor GPIO routines - 0x00811C7C and its
+ *    siblings - and read the first argument at each. There are 54 of them.
+ * 3. Decode the id with the macros in sl6806_padctl.h to see which bank and
+ *    pin it names, and read the code around the call to guess its job.
+ * 4. Confirm on hardware: drive it and watch with a meter, or configure it
+ *    as an input and press the button you think it is.
+ * 5. Add it to sl6806_vendor_pin_map[] in your variant.
  */
 #ifndef SL6806_HAL_GPIO_H
 #define SL6806_HAL_GPIO_H
@@ -86,7 +89,7 @@ extern const uint8_t            sl6806_npins;
 /* =====================================================================
  *  THE VENDOR BACK END
  * =====================================================================
- * The stock firmware never writes a GPIO register. It calls
+ * The stock firmware never writes a GPIO register directly. It calls
  *
  *     0x00811C7C  gpio_write(id, value)      13 call sites
  *     0x00811C90  gpio_config(id, value)     23 call sites
@@ -97,48 +100,59 @@ extern const uint8_t            sl6806_npins;
  *
  * BE WARNED: those routines are NOT resident in bootloader mode. A dump of
  * SRAM taken there shows uninitialised noise at 0x00811C7C, because the
- * application that installs them has never run (7f). So a payload cannot
- * simply call them, and this back end has no working implementation yet. It
- * is still the right shape for one - a variant that finds another way to
- * reach the vendor driver, or reimplements it once the registers are known,
- * plugs in here and every named pin below starts working.
+ * application that installs them has never run (7f). So calling *them* is
+ * out - but they are thunks into the mask ROM, and the ROM is resident, so
+ * reimplementing what they do is not. cores/sl6806/sl6806_padctl.c does
+ * exactly that, and sl6806_padctl_vendor() returns it in this shape.
  *
- * The id encoding, read off the 54 call sites:
+ * The id encoding, decoded from ROM 0x902 and ROM 0x93C rather than guessed
+ * from call sites. See sl6806_padctl.h for the full version:
  *
- *     bits [10:7]   configuration nibble; 0x0 or 0xF in everything observed
- *     bits [16:11]  pin selector, values 3, 14, 15, 39, 48, 54..59, 62, 63
- *     bits [18:17]  a second selector; 0 for the display pins, 2 for one
- *                   other group. Whether this is a bank number or more pin
- *                   bits cannot be told apart from call sites alone.
+ *     bits [19:16]  bank
+ *     bits [15:11]  pin within the bank
+ *     bits [10:7]   pad function: 0 input, 1 output, 2+ alternate
+ *     bit  [6]      initial output level
+ *     bits [5:4]    drive strength
+ *     bits [3:0]    pull selector
  *
- * SL6806_GPIO_ID() builds the common case. Known ids are named in the
- * variant.
- *
- * The value argument is 0/1 in the reset paths but 0/0x40 in one other, so
- * it is more likely a pad-register value than a plain logic level. Check
- * against hardware before trusting a level other than 0 or 1.
+ * SL6806_GPIO_ID() builds the common case - bank 0 and no configuration -
+ * which is enough to address a pad for a read or a write, because neither
+ * looks at the configuration fields. Known ids are named in the variant.
  */
-#define SL6806_GPIO_ID(pin)          (((uint32_t)(pin) & 0x3Fu) << 11)
-#define SL6806_GPIO_ID_CFG(pin, cfg) (SL6806_GPIO_ID(pin) | \
-                                      (((uint32_t)(cfg) & 0xFu) << 7))
-#define SL6806_GPIO_ID_PIN(id)       (((uint32_t)(id) >> 11) & 0x3Fu)
+/* Address a pad for a read or a write: bank and pin, no configuration. The
+ * same as SL6806_PAD_ID(bank, pin, 0); duplicated so this header stays
+ * usable on its own. */
+#define SL6806_GPIO_ID(bank, pin)    ((((uint32_t)(bank) & 0x0Fu) << 16) | \
+                                      (((uint32_t)(pin)  & 0x1Fu) << 11))
+#define SL6806_GPIO_ID_BANK(id)      (((uint32_t)(id) >> 16) & 0x0Fu)
+#define SL6806_GPIO_ID_PIN(id)       (((uint32_t)(id) >> 11) & 0x1Fu)
 
 /* Not a real pin id: marks an entry in the variant's vendor map as unknown,
  * so that pin reports instead of driving whatever id 0 turns out to be. */
 #define SL6806_GPIO_ID_NONE          0xFFFFFFFFu
 
-typedef struct {
+typedef struct sl6806_gpio_vendor {
     /* Required. Mirrors the vendor gpio_write(id, value). */
     void     (*write)(uint32_t id, uint32_t value);
     /* Optional; without it digitalRead() reports instead of guessing. */
     uint32_t (*read)(uint32_t id);
     /* Optional; mirrors the vendor gpio_config(id, value). Not called by
-     * pinMode(): which field of the vendor configuration word selects the
-     * direction, and which the pull, is not known, so pinMode() leaves a
-     * vendor-mapped pad exactly as whatever ran before us configured it.
-     * Guessing a field would silently reconfigure the pad into something
-     * arbitrary. Call this yourself if you know the value you want. */
+     * pinMode() - it is the whole configuration word, and a back end that
+     * does not know which field is which would be guessing. Call it yourself
+     * if you know the value you want. */
     void     (*config)(uint32_t id, uint32_t value);
+    /*
+     * Optional. Set the pad's direction and nothing else.
+     *
+     * This is what pinMode() calls. It exists separately from config()
+     * because on this chip direction turned out to be one field of the pad's
+     * function nibble (sl6806_padctl.h), so it can be changed on its own
+     * without disturbing drive strength or pull. A back end that cannot
+     * separate the two leaves this NULL, and pinMode() then leaves the pad
+     * as whatever configured it - which is still better than writing a
+     * guessed word into it.
+     */
+    void     (*set_dir)(uint32_t id, int output);
 } sl6806_gpio_vendor_t;
 
 /*

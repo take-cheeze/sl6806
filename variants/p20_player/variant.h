@@ -7,23 +7,20 @@
  * ===================================================================
  *  MOST PIN NUMBERS ARE STILL UNKNOWN
  * ===================================================================
- * There is no pinout for this board and no GPIO register map for this SoC,
- * so most of the names below are placeholders and using them reports that
- * GPIO is unconfigured instead of pretending to work.
+ * The GPIO driver is done - cores/sl6806/sl6806_padctl.c, registers read out
+ * of the mask ROM - but there is no pinout for this board, so most of the
+ * names below are placeholders and using them reports that the pin is
+ * unconfigured instead of pretending to work.
  *
- * Two pins are an exception: PIN_LCD_RESET and PIN_EXT_RESET have the vendor
- * pin ids the stock firmware uses, read off its own call sites. They work as
- * soon as a vendor back end is installed - see cores/sl6806/hal_gpio.h - and
- * need no register map.
+ * Two pins are an exception: PIN_LCD_RESET and PIN_EXT_RESET have the pad
+ * ids the stock firmware uses, read off its own call sites. They work as
+ * soon as the pad controller is installed as the GPIO back end, which the
+ * display bring-up does (variants/p20_player/lcdc.c).
  *
- * To bring the rest up, either:
- *   1. Find the GPIO registers - see the recipe in cores/sl6806/hal_gpio.h -
- *      fill in sl6806_gpio_ports[] and sl6806_pin_map[] in variant.c, and
- *      define SL6806_GPIO_CONFIGURED; or
- *   2. Work out which vendor pin id each button and LED uses and add it to
- *      sl6806_vendor_pin_map[] in variant.c.
- * Either way, give the pins names below so sketches read like Arduino
- * sketches.
+ * To bring the rest up, work out which pad id each button and LED uses -
+ * the recipe is in cores/sl6806/hal_gpio.h - add it to
+ * sl6806_vendor_pin_map[] in variant.c, and give it a name below so sketches
+ * read like Arduino sketches.
  *
  * If you are bringing up a different SL6806 board, copy this directory
  * rather than editing it, and build with BOARD=<your-board>.
@@ -36,8 +33,8 @@
 /*
  * Display geometry, read out of the stock firmware's panel descriptor
  * (flash 0x00C519FC). See variants/p20_player/panel.c for the full decode.
- * These are real values - size your framebuffers with them - even though the
- * panel driver's flush path is not implemented yet.
+ * A full framebuffer at this size is 139 KB, which only fits in firmware
+ * mode - render a band and push it, as examples/GfxDemo does.
  */
 #define SL6806_PANEL_WIDTH     240   /* [V] */
 #define SL6806_PANEL_HEIGHT    296   /* [V] */
@@ -55,9 +52,10 @@
 #define SL6806_DCS_RAMRD       0x2E
 #define SL6806_DCS_MADCTL      0x36
 
-/* Panel reset line, as the vendor's packed pin id. The vendor code drives it
- * high / 10ms / low / 20ms / high / 120ms. See cores/sl6806/hal_gpio.h for
- * what is and is not understood about the encoding. */
+/* Panel reset line, as a packed pad id: bank 1, pin 7. The vendor code
+ * drives it high / 10ms / low / 20ms / high / 120ms. The display bring-up
+ * uses 0x000138CB, the same pad with its configuration fields filled in -
+ * output, initially high. See cores/sl6806/sl6806_padctl.h. */
 #define SL6806_PANEL_RESET_PIN_ID  0x13800   /* [V] */
 
 /*
@@ -80,11 +78,10 @@
 #define PIN_LCD_RESET 7   /* [V] vendor id 0x13800, panel reset */
 #define PIN_EXT_RESET 8   /* [V] vendor id 0x18000, [I] an I2C device's reset */
 
-/* Peripherals known to exist on this board from the firmware analysis, none
- * of which have a driver yet - listed so the hardware inventory lives with
- * the board definition:
- *   - colour LCD driven through an LVGL 8.x port (lv_lcd_init at 0x00D3E34C
- *     in the stock image is the vendor porting layer to read)
+/* Peripherals known to exist on this board from the firmware analysis.
+ * Listed so the hardware inventory lives with the board definition; only the
+ * display has a driver:
+ *   - colour LCD on a QSPI bus - driven, see panel.c and lcdc.c
  *   - SD/MMC card slot (also exposed as the USB card reader)
  *   - SPI NOR flash, 4 MiB, XIP at 0x00C00000
  *   - audio DAC / headphone out
