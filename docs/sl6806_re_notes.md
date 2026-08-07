@@ -761,11 +761,12 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
 5. ~~Dump the mask ROM~~ **DONE** — §7f. It handed over GPIO (the pad
    controller, via a bank table the earlier scan missed) but not the LCD
    writers, which are in the bootloader instead.
-5b. **Run the display on hardware.** This is now the top of the list. The
-   stack is complete and tested against a model, and two things in it are
-   still guesses: `+0x20` bits 17 and 18, inferred from where the vendor sets
-   and clears them, and the pixel byte order, which the firmware does not
-   settle because the vendor's framebuffer comes from LVGL. See docs/LCD.md.
+5b. ~~**Run the display on hardware.**~~ **DONE, and it works** (2026-08-07).
+   `examples/GfxDemo` puts shapes and text on the glass in the right colours.
+   The two guesses are confirmed by that: `+0x20` bits 17 and 18 are right,
+   and so is the byte order §13d derived. The blocker was never the bus
+   driver — it was the backlight (§14a), which nothing turned on, so every
+   earlier "no picture" run was measuring a dark lamp.
 6. ~~**Find the PLL**~~ — largely settled in practice. The clock was
    **measured at 64.000 MHz** (2026-08-06, one P20 Player) by timing the
    device's counter against the host's with `tools/sl6806-calibrate`; the

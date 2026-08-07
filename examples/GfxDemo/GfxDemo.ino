@@ -4,17 +4,19 @@
  * WHAT YOU SHOULD SEE: a 160x40 band in the top-left corner of the panel,
  * with a title bar, some shapes and a running millisecond count.
  *
- * "Should", because the driver behind it was written from a disassembly of
- * the stock bootloader and has never been checked against a screen.
+ * And it does - verified on hardware 2026-08-07. Which is worth a sentence,
+ * because the bus driver underneath was written entirely by disassembling the
+ * stock bootloader, was never run against a panel while it was written, and
+ * had two bits of the transfer register inferred from where the vendor sets
+ * them rather than read. Those two bits are right.
  *
- * WHAT IS DIFFERENT NOW: the backlight works, and this sketch turns it on. So
- * for the first time a dark panel is a statement about the bus driver rather
- * than about the lamp. Every previous "no picture" result on this board was
- * taken with the backlight off and means nothing.
+ * What was wrong the whole time was the backlight, which is not part of the
+ * LCD path and which nothing here used to turn on. This sketch turns it on
+ * first, and says so if it fails - a dark panel with the lamp off proves
+ * nothing, and every earlier "no picture" result on this board was exactly
+ * that.
  *
- * If it stays dark, docs/LCD.md has the list of things to try in the order
- * worth trying them - and section 5 of that list, the byte order, is now
- * settled from two directions, so start further down.
+ * If it does stay dark, docs/LCD.md has the checklist.
  *
  * Either way the sketch also reads its own pixels back and prints them, so
  * it says something useful even with the display disconnected: the
@@ -117,12 +119,21 @@ void setup()
 void loop()
 {
     static uint32_t frame;
+    static uint32_t next;
+
+    /*
+     * Paced with millis(), not delay(). In RUN_MODE=poll this runs inside the
+     * boot ROM's USB handler, and a long delay there is clamped - which used
+     * to print a page of explanation in the middle of an otherwise clean run.
+     * Returning early and checking the clock is what the core asks for.
+     */
+    if (millis() < next)
+        return;
+    next = millis() + 1000;
 
     drawScene();
     Screen.display();
 
     Serial.print("frame ");
     Serial.println(frame++);
-
-    delay(1000);
 }

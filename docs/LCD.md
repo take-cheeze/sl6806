@@ -6,27 +6,30 @@ The display stack is in three layers, and all three now exist.
 |---|---|
 | Drawing — framebuffer, primitives, font, `Display`/`Screen` | **done**, 64 host tests |
 | Panel — geometry, init sequence, windowing, sleep/wake | **done**, recovered from the firmware, 53 host tests |
-| Bus — putting a byte on the wire | **written**, 195 host tests against a model — **on hardware it runs clean and produces no picture** |
+| Bus — putting a byte on the wire | **done**, 195 host tests against a model, and **verified on the panel 2026-08-07** |
 
-Read that last cell before you read anything else. The bus driver was written
-by disassembling the stock bootloader. It has not been run against a panel and
-nobody has put a logic analyser on the pins, so two bits of the transfer
-register are inferred from where the vendor sets them rather than read. And
-before any of that: **the backlight is a separate PWM channel that nothing
-here turns on**, so a dark screen does not yet mean a broken driver. This
-document is half "how it works" and half "what to try when it doesn't".
+**It works.** `examples/GfxDemo` draws shapes and text on the panel, in the
+right colours, and the whole stack from a `Screen.fillRect()` call to a lit
+pixel is verified end to end.
 
-> **THE BACKLIGHT WORKS NOW**, so the paragraph above is out of date in the
-> best way: a dark screen is finally a statement about the bus driver rather
-> than about the lamp. Call `sl6806_backlight_begin(100)`
-> (`cores/sl6806/sl6806_pwm.h`); `examples/GfxDemo` already does.
->
-> **Every "no picture" result recorded on this board was taken with the
-> backlight off** and should be re-run before it is believed. That includes
-> the headline in the table above.
->
-> It is on/off only — the PWM counter does not run, so duty has no effect —
-> which is enough for this purpose. §14a has the detail.
+That is worth dwelling on for a moment, because the bus driver was written
+entirely by disassembling the stock bootloader, was never run against a panel
+while it was being written, and had **two bits of the transfer register
+inferred from where the vendor sets them rather than read**. Those two bits are
+right. So is the 33-command init sequence, the window arithmetic, the QSPI
+frame layout and the pixel byte order.
+
+**What had been wrong the whole time was the backlight**, which is not part of
+the LCD path and which nothing here used to turn on. Every "the driver produces
+no picture" result in the history of this repository was taken with the lamp
+off, and none of them meant what they appeared to. Call
+`sl6806_backlight_begin(100)` (`cores/sl6806/sl6806_pwm.h`) — `GfxDemo` does.
+It is on/off only; the PWM counter does not run, so duty has no effect, which
+does not matter here. §14a has that story.
+
+The rest of this document is still "how it works", and its checklist is still
+worth keeping for the next board or the next bug — but it is no longer a list
+of reasons the screen might be dark.
 
 ```cpp
 #include <Arduino.h>
