@@ -69,28 +69,36 @@
  * A counter with no source is exactly what "every register correct, nothing
  * moves" looks like.
  *
- * SWEPT, AND IT WAS NOT THE ANSWER EITHER. Sixteen sources against six
- * dividers: the counter stayed stopped. The sweep did pin the register's
- * shape - it only retains 0x10F, so src is [3:0] and the divider is one bit
- * at [8], not the eight-bit field `div << 8` implied.
+ * SWEPT - AND THE PANEL LIT UP DURING THE SWEEP.
+ *
+ * That is the first light anyone has got out of this board from a payload,
+ * and it says the previous run's conclusion was wrong for a specific reason:
+ * CTRL bit 28 is not a usable "counter stopped" flag. It stayed set the whole
+ * time while the backlight was visibly blinking. Every "still busy" in that
+ * log, and the "no clock source started the counter" at the end of it, were
+ * measuring the wrong thing.
+ *
+ * Worse, the sweep threw the answer away. It wrote the pair register back to
+ * zero at the end of each divider row, so whatever setting lit the panel was
+ * extinguished a moment later - which is exactly what "blinks, then dark for
+ * good" looks like.
+ *
+ * The sweep did pin the register's shape: it retains only 0x10F, so src is
+ * [3:0] and the divider is a single bit at [8], not the eight-bit field
+ * `div << 8` implied.
  *
  * ---------------------------------------------------------------------
- * THIS SKETCH HAS RUN OUT OF THINGS TO TRY, AND THAT IS THE POINT OF IT.
+ * SO THE DETECTOR IS NOW YOU, NOT A STATUS BIT.
  *
- * The gate, the pad, the register contents, all 128 module ids in the ROM's
- * own order, every gate-shaped CRU register, every module clock, and the
- * counter's clock select have each been covered by measurement. The PWM is
- * correctly programmed and its counter does not move. Whatever starts it is
- * not in the address space a payload can reach.
+ * This holds ONE clock setting per host tick and prints it before applying
+ * it, and it never writes the register back to zero. When the panel lights,
+ * the value naming it is the line you just read.
  *
- * So do not add another register guess here. The next move is ground truth:
- * read the CRU and this block while the stock firmware runs, and diff it
- * against the cold state in 13f. That needs a way past read_mem being refused
- * in card-reader mode (7d.1), which is a project rather than a run.
- *
- * What this sketch is still good for is confirming the map on another board,
- * and as the place the sweep lives if someone finds a new register class to
- * point it at.
+ * Type any character into the monitor (anything but a bare newline, which is
+ * what --tick sends) and it FREEZES on the current setting and keeps it. So
+ * the procedure is: watch, and the moment the backlight comes on, hit a key.
+ * The log then says exactly which source and divider did it, and the panel
+ * stays lit while you read it.
  * ---------------------------------------------------------------------
  *
  * THE PROBE IS A WRITE AND A READ BACK, not a bare read: a register that
@@ -123,27 +131,22 @@
 
 static sl6806_color_t band[240 * 8];
 
-static const uint8_t ramp[] = { 0, 20, 40, 60, 80, 100, 80, 60, 40, 20 };
-#define NRAMP ((int)(sizeof ramp))
+/*
+ * Every setting the pair register can actually hold. The sweep measured the
+ * writable mask as 0x10F, so that is src 0..15 against a one-bit divider -
+ * 32 combinations, not the 96 the last run thought it was trying.
+ */
+#define NSRC   16
+#define NDIV   2
+#define NCOMBO (NSRC * NDIV)
 
-#define BL_CHAN 3
+static int  idx;
+static bool frozen;
+static bool white;
 
-/* Dividers worth trying: none, a couple of small ones, and a big one. */
-static const uint8_t divs[] = { 0, 1, 3, 7, 15, 63 };
-#define NDIVS ((int)(sizeof divs / sizeof divs[0]))
-
-enum { ST_SWEEP, ST_DRIVE, ST_DONE };
-
-static uint8_t state = ST_SWEEP;
-static int     di;                 /* index into divs[] */
-static int     found_src = -1, found_div = -1;
-static int     step;
-static bool    white;
-
-static bool busy(void)
+static uint32_t combo_value(int i)
 {
-    return (sl6806_mmio_read(SL6806_PWM_CHAN(BL_CHAN) + SL6806_PWM_CTRL)
-            & SL6806_PWM_CTRL_BUSY) != 0;
+    return SL6806_PWM_PAIR_VALUE(i % NSRC, (i / NSRC) ? 1u : 0u);
 }
 
 static void show(const char *what, uint32_t addr)
@@ -156,134 +159,99 @@ static void show(const char *what, uint32_t addr)
 
 static void configure(void)
 {
-    uint32_t base = SL6806_PWM_CHAN(BL_CHAN);
+    uint32_t base = SL6806_PWM_CHAN(3);
 
     Serial.print("  pad 0x");
     Serial.print(SL6806_PWM_BL_PAD, HEX);
-    Serial.print(" (bank 1 pin 0 fn 4) -> ");
+    Serial.print(" -> ");
     Serial.println(sl6806_pad_configure(SL6806_PWM_BL_PAD) == 0 ? "ok" : "REFUSED");
 
     sl6806_mmio_write(base + SL6806_PWM_CTRL, SL6806_PWM_CTRL_INIT);
     sl6806_mmio_write(base + SL6806_PWM_CTRL,
                       sl6806_mmio_read(base + SL6806_PWM_CTRL) | 0x3Fu);
-    sl6806_pwm_set(BL_CHAN, SL6806_PWM_BL_PERIOD, SL6806_PWM_BL_DUTY(60));
-    sl6806_pwm_enable(BL_CHAN, 1);
-    sl6806_pwm_run(BL_CHAN, 1);
+    /* Full brightness while hunting - a dim backlight is easy to miss. */
+    sl6806_pwm_set(3, SL6806_PWM_BL_PERIOD, SL6806_PWM_BL_DUTY(100));
+    sl6806_pwm_enable(3, 1);
+    sl6806_pwm_run(3, 1);
 
     show("ctrl", base + SL6806_PWM_CTRL);
     show("p/d ", base + SL6806_PWM_PERIOD_DUTY);
-    show("pair", SL6806_PWM_PAIR(BL_CHAN));
-}
-
-/* One divider's worth of sources per loop() call. */
-static int sweep_step(void)
-{
-    uint32_t reg = SL6806_PWM_PAIR(BL_CHAN);
-    unsigned src;
-
-    if (di >= NDIVS)
-        return -1;
-
-    Serial.print("  div ");
-    Serial.print(divs[di]);
-    Serial.print(", src 0..15: ");
-
-    for (src = 0; src < 16; src++) {
-        sl6806_mmio_write(reg, SL6806_PWM_PAIR_VALUE(src, divs[di]));
-        delayMicroseconds(300);
-        if (!busy()) {
-            Serial.print("src ");
-            Serial.print(src);
-            Serial.println(" CLEARED BUSY - the counter runs");
-            found_src = (int)src;
-            found_div = divs[di];
-            di = NDIVS;
-            return 1;
-        }
-    }
-    Serial.print("still busy (pair reads 0x");
-    Serial.print(sl6806_mmio_read(reg), HEX);
-    Serial.println(")");
-    sl6806_mmio_write(reg, 0);
-    di++;
-    return 0;
 }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 backlight: the counter's clock source ===");
+    Serial.println("=== SL6806 backlight: hold each clock setting ===");
 
     Serial.print("module ");
     Serial.print(SL6806_PWM_MODULE_ID);
     Serial.print(" -> ack ");
     Serial.println(sl6806_module_enable(SL6806_PWM_MODULE_ID) ? "yes" : "no");
-
     configure();
-    Serial.print("  busy: ");
-    Serial.println(busy() ? "STUCK (counter stopped)" : "clear (counter runs)");
-
-    if (!busy()) {
-        Serial.println("Already running - skipping the sweep.");
-        state = ST_DRIVE;
-        di = NDIVS;
-    } else {
-        Serial.println("Sweeping the pair clock register 0x40084014.");
-    }
 
     if (!Screen.begin(band, 240, 8))
-        Serial.println("no panel - the flash below will do nothing");
+        Serial.println("  no panel");
+
+    Serial.println();
+    Serial.println("Duty is 100%. One clock setting per tick, held, never");
+    Serial.println("reset. WHEN THE PANEL LIGHTS, PRESS ANY KEY - that");
+    Serial.println("freezes it here and the last line printed is the answer.");
     Serial.println();
 }
 
 void loop()
 {
+    int c;
+
+    /* Keep the picture moving so a lit panel is unmistakable. */
     white = !white;
     Screen.fill(white ? SL6806_WHITE : SL6806_BLACK);
     Screen.display();
 
-    if (state == ST_DONE)
+    c = Serial.read();
+    if (c < 0)
         return;
 
-    if (state == ST_SWEEP) {
-        int r = sweep_step();
-
-        if (r == 1) {
-            state = ST_DRIVE;
-            step = 0;
-        } else if (r == -1) {
-            Serial.println();
-            Serial.println("=== no clock source started the counter ===");
-            Serial.println("Module ids exhausted, gate correct, pad correct,");
-            Serial.println("registers correct, clock select swept. The next");
-            Serial.println("move is ground truth, not another guess.");
-            state = ST_DONE;
-        }
-        return;
-    }
-
-    if (Serial.read() < 0)
-        return;
-
-    if (step >= NRAMP) {
+    /* Anything but the tick's newline means "stop here". */
+    if (c != '\n' && c != '\r' && !frozen) {
+        frozen = true;
         Serial.println();
-        if (found_src >= 0) {
-            Serial.print("=== counter runs with src ");
-            Serial.print(found_src);
-            Serial.print(", div ");
-            Serial.print(found_div);
-            Serial.println(" ===");
-        } else {
-            Serial.println("=== done ===");
-        }
-        state = ST_DONE;
+        Serial.print("*** FROZEN at src ");
+        Serial.print((idx - 1 + NCOMBO) % NCOMBO % NSRC);
+        Serial.print(", div ");
+        Serial.print(((idx - 1 + NCOMBO) % NCOMBO) / NSRC);
+        Serial.print("  (pair 0x");
+        Serial.print(sl6806_mmio_read(SL6806_PWM_PAIR(3)), HEX);
+        Serial.println(") - holding");
         return;
     }
-    sl6806_pwm_set(BL_CHAN, SL6806_PWM_BL_PERIOD, SL6806_PWM_BL_DUTY(ramp[step]));
-    Serial.print("  duty ");
-    Serial.print(ramp[step]);
-    Serial.print("%  busy ");
-    Serial.println(busy() ? "stuck" : "clear");
-    step++;
+    if (frozen)
+        return;
+
+    if (idx >= NCOMBO) {
+        Serial.println();
+        Serial.println("=== all 32 settings tried and held ===");
+        Serial.println("If the panel lit at some point and you missed the");
+        Serial.println("key, re-run: the order is deterministic.");
+        frozen = true;
+        return;
+    }
+
+    Serial.print("  [");
+    Serial.print(idx);
+    Serial.print("/");
+    Serial.print(NCOMBO - 1);
+    Serial.print("] src ");
+    Serial.print(idx % NSRC);
+    Serial.print(", div ");
+    Serial.print(idx / NSRC);
+    Serial.print("  -> pair 0x");
+    Serial.print(combo_value(idx), HEX);
+    Serial.print("   busy ");
+    Serial.println((sl6806_mmio_read(SL6806_PWM_CHAN(3) + SL6806_PWM_CTRL)
+                    & SL6806_PWM_CTRL_BUSY) ? "set" : "clear");
+
+    sl6806_mmio_write(SL6806_PWM_PAIR(3), combo_value(idx));
+    idx++;
 }

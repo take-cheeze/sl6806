@@ -44,7 +44,7 @@ so it is worth being precise about which parts are real:
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | Keys — the two volume buttons | **Works.** They are an ADC resistor ladder, not GPIO; driver in [`cores/sl6806/sl6806_adc.c`](cores/sl6806/sl6806_adc.c), board map in the variant, 97 host tests. Verified on hardware. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
-| Backlight | **Not working, and thoroughly mapped.** The PWM is at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4 — all verified, every register takes the vendor's own values, and the counter still will not run. See §14a of the RE notes for the full list of what has been eliminated. |
+| Backlight | **Lit, briefly, and being pinned down.** The PWM is at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, all verified. Sweeping the counter's clock select made the panel blink, so the hardware path works; which setting did it is what `examples/Backlight` is now finding. See §14a. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 

@@ -1229,7 +1229,32 @@ not the eight-bit field `div << 8` in `0x00811EC0` implied.
 Also checked and eliminated: FIRM's `HAL_timer_*` is at `0x40099000`, a
 different block, so the PWM is not the timer and its clock is not the timer's.
 
-### CLOSED for now. What is established, and what is left
+### REOPENED — the panel lit during the sweep, and CTRL bit 28 is not a busy flag
+
+**The backlight came on**, blinking, while the pair-register sweep ran, and
+went dark for good once it finished (2026-08-07). First light out of this board
+from a payload.
+
+Two things follow, and the first invalidates the run above.
+
+**CTRL bit 28 is not a usable "counter stopped" indicator.** It stayed set
+throughout, while the backlight was visibly blinking. So every "still busy" in
+that log, and its closing "no clock source started the counter", measured
+something else. Whatever bit 28 means — `0x00811E74` does spin on it before
+writing period/duty — it is not "the counter is not running", and no negative
+in this section that used it as a test should be trusted.
+
+**And the sweep destroyed its own result.** It wrote the pair register back to
+zero at the end of each divider row, so a setting that lit the panel was
+extinguished a moment later. "Blinks, then dark" is precisely that.
+
+The register's writable mask is `0x10F`, so the real search space is 16 sources
+against a **one-bit** divider — 32 settings, not the 96 the sweep believed it
+was covering. `examples/Backlight` now holds one setting per tick, never resets
+the register, and freezes on any keypress, so the operator is the detector and
+the log line names the answer.
+
+### Superseded — the state when this was thought closed
 
 Everything reachable has been tried, most of it twice and the second time
 correctly. Established and verified on hardware:
