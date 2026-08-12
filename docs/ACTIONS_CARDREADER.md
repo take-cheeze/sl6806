@@ -46,8 +46,76 @@ ROM itself answers. The commands that talk to the raw boot ROM - `inquiry`,
 `adfu_reboot`, `adfu_info`, `write_mem`, `switch`, `read_mem` - are sent
 before any chip-specific binary is loaded, which is why they read as a
 generic ADFU protocol rather than something written specifically for the
-ATJ2127. Whether *this* chip answers the same commands has never been
-checked. That is the actual unknown.
+ATJ2127.
+
+## What has actually been confirmed on real hardware
+
+One unit has been tested (`lsusb -d 20d6:2101 -v` at the top of this file).
+Findings, most useful first:
+
+- **This is not really an "Actions" device or even a card reader.** `20d6` is
+  officially registered to PowerA (a gaming-peripherals company); the
+  `ACTIONS`/`USB CARDREADER` strings in the USB descriptors are unrelated
+  defaults the firmware never customised. The SCSI INQUIRY vendor/product
+  fields tell a different story: `HUASHENGDI` / `TECH RECPRO67`. Tracing
+  that back, the hardware is a generic, unbranded IC recorder / voice
+  recorder (32 GB, touch panel, one-button recording) resold under many
+  different storefront names on Amazon/AliExpress - the kind of product with
+  no dedicated PC software at all, because drag-and-drop mass storage is all
+  it has ever needed to offer. No FCC ID, no model number, no vendor tool
+  has been found for it (web search, GitHub code search, and Chinese 量产工具
+  forums all came up empty).
+- **The `0xcc` handshake matches ATJ2127/2157 exactly.** `actions_dump --id
+  20d6:2101 adfu_reboot`'s first step (CDB `cc`, requesting 11 bytes) gets
+  back `ACTIONSUSBD` byte-for-byte, with a GOOD status - real shared lineage
+  with the chip this tool targets, not a coincidence.
+- **The second step is rejected.** The follow-up CDB `cb 21 ... 02` (11
+  bytes then a 2-byte confirmation read) gets back `ff 3d` where the tool
+  wants `ff 00`; the SCSI status for that command is still GOOD, so the
+  device processed the request and chose to answer this way - it is not a
+  transport error. Confirmed with `dmesg`/`lsusb` that no reboot into ADFU
+  actually happens: the device stays at `20d6:2101` throughout.
+- **A second, independent implementation** ([nfd/atj2127decrypt](https://github.com/nfd/atj2127decrypt/blob/master/dfu/adfu.py))
+  hard-codes the identical `cb 21` pair for this step, which argues it is a
+  fixed protocol request rather than a per-chip submode byte - i.e. `0x3d`
+  is most likely this chip's own status/rejection code for a request it
+  understood, not evidence the wrong sub-command was sent. That makes
+  brute-forcing `cdb[1]` a low-confidence move, not a promising one - see
+  below for why it is still worth a few tries.
+- **A protocol footgun worth knowing about separately from any of this:**
+  `actions_dump`'s `adfu_reboot` does not read the second command's CSW
+  status packet when the payload mismatches - it just prints "unexpected
+  response" and exits. That leaves a stale status packet queued on the
+  device's endpoint, which then corrupts the *next* `actions_dump`
+  invocation's first read (observed directly: a subsequent `inquiry` read a
+  stale `USBS` packet before the real 36-byte reply). Always replug the
+  device between `actions_dump` attempts on this chip until that step
+  succeeds cleanly.
+
+## Trying alternate sub-commands (exploratory, low confidence)
+
+Given the above, sweeping `cdb[1]` values other than `0x21` is not grounded
+in documentation - there is none for this chip - but it costs little: this
+specific command has not been observed to touch flash on any chip it has
+been tried against, and the kernel's SCSI generic (`SG_IO`) layer frames each
+attempt as a clean, self-contained transaction, so it cannot reproduce the
+stale-CSW footgun above.
+
+`tools/actions-cardreader-try-subcmd` sends one value at a time, deliberately
+- so you can check `lsusb`/`dmesg` between attempts rather than looping
+blindly:
+
+```sh
+# find the SCSI generic device node right after plugging in:
+dmesg | grep 'Attached scsi generic'   # e.g. sg1
+
+sudo tools/actions-cardreader-try-subcmd /dev/sg1 0x21   # reproduces ff 3d
+sudo tools/actions-cardreader-try-subcmd /dev/sg1 0x01
+sudo tools/actions-cardreader-try-subcmd /dev/sg1 0x00
+```
+
+A result worth reporting: `data` other than `ff 3d`, or the device
+disappearing from `lsusb` right after (meaning it rebooted).
 
 `tools/actions-cardreader-probe` automates finding out, safely:
 
