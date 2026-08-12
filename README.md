@@ -44,6 +44,7 @@ so it is worth being precise about which parts are real:
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
+| Touch panel, camera | **Not yet, but fully decoded.** Both are I2C devices and both are documented register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h — including their pads, which are now in the variant. What blocks a driver is the TWI controller base, not the devices. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
 Two honest caveats worth reading before you trust output:
@@ -138,9 +139,9 @@ rather than a silently mangled stream. Typing in the monitor feeds
 `Print` interface so `Screen.print(x)` works like `Serial.print(x)`. It is
 verified natively (`make -C tests/host`), including clipping and the font.
 
-The panel is **240x296 RGB565, drawn at controller offset (0, 12)**, behind a
-standard MIPI DCS command set, with a **33-command vendor init sequence**
-recovered from the firmware into
+The panel is an **NV3030B — 240x296 RGB565, drawn at controller offset
+(0, 12)** — behind a standard MIPI DCS command set, with a **33-command
+vendor init sequence** recovered from the firmware into
 [`variants/p20_player/panel.c`](variants/p20_player/panel.c). Regenerate any
 of it from a dump with `tools/sl6806-panelseq`.
 
@@ -351,11 +352,20 @@ In rough order of how much they unlock:
    ([`sl6806_padctl.h`](cores/sl6806/sl6806_padctl.h)); what is missing is
    which pad each button and LED is on. The ids are immediates at the stock
    firmware's 54 GPIO call sites, so this is a reading exercise plus a meter.
-3. **A DMA driver.** The display pushes pixels 16 bytes at a time because
+   Four pads came out that way already — the touch panel's reset and
+   interrupt, and the camera's reset and power-down — so the method works;
+   see §7h of the notes. The buttons are the ones still open.
+3. **The TWI controller's base address.** Two decoded devices are waiting on
+   it: a CST816 touch panel on bus 1 and a 1 MP camera on bus 0, both with
+   their registers, init tables and pads already written down (§7h). The
+   firmware reaches them only through mask-ROM routines that a payload
+   cannot call, so this is the same kind of hunt §12b did for the LCDC — and
+   it unlocks both at once.
+4. **A DMA driver.** The display pushes pixels 16 bytes at a time because
    that is the FIFO depth. The vendor uses the DMA controller at
    `0x40070000`; its command-list format is decoded at the bottom of
    [`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
-4. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+5. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
    clock, so this no longer blocks anything; finding the PLL registers would
    still give it exactly. They are *not* at the clock unit's base:
    `0x40080000` has dividers but no multiplier.
