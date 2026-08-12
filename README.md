@@ -236,6 +236,11 @@ If `Hello` prints, the whole chain works: the payload loaded, the ROM called
 it, `.bss` was cleared, constructors ran, the heap works, and `loop()` is
 being driven.
 
+**Not every "USB card reader" is an SL6806.** If `lsusb` shows vendor ID
+`20d6` rather than `301a`, that is a different chip vendor (Actions
+Semiconductor) with an unrelated protocol - see
+[docs/ACTIONS_CARDREADER.md](docs/ACTIONS_CARDREADER.md).
+
 ## Two build modes
 
 **`MODE=payload`** (default) — a 64 KiB RAM image at `0x00820000`, loaded and
@@ -302,6 +307,7 @@ declarations are not synthesised — define helpers before you call them.
 | `sl6806-panelseq` | Recovers the panel descriptor and its DCS command sequences from a dump; `--c` emits the variant tables. |
 | `sl6806-ramcalls` | Lists the SRAM and mask-ROM routines the stock firmware calls, ranked, with the constants passed at each call site. |
 | `sl6806-dumpram` | Reads device memory over USB — the mask ROM is the one worth reading. |
+| `actions-cardreader-probe` | **Not for the SL6806.** Identifies an Actions-brand (VID `20d6`) USB card reader and walks it into ADFU mode — see [docs/ACTIONS_CARDREADER.md](docs/ACTIONS_CARDREADER.md). |
 
 ## Hardware notes
 
@@ -390,8 +396,11 @@ tools/            host-side Python tools
 examples/         Hello, Blink, GfxDemo, LcdProbe, MmioProbe, RomProbe,
                   CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
-docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
-3rd/              smartlink_flash submodule
+docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md,
+                  ACTIONS_CARDREADER.md
+3rd/              smartlink_flash submodule, actions_flash submodule
+                  (for a different, non-SL6806 device - see
+                  docs/ACTIONS_CARDREADER.md)
 ```
 
 ## Credit
