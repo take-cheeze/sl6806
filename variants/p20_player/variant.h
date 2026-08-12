@@ -76,7 +76,13 @@
 #define BTN_VOL_DOWN  6   /* [?] */
 
 #define PIN_LCD_RESET 7   /* [V] vendor id 0x13800, panel reset */
-#define PIN_EXT_RESET 8   /* [V] vendor id 0x18000, [I] an I2C device's reset */
+#define PIN_EXT_RESET 8   /* [V] vendor id 0x18000, touch controller reset */
+#define PIN_TP_INT    9   /* [V] vendor id 0x16800, touch interrupt, active low */
+
+/* PIN_EXT_RESET was named before its device was known. It is the reset line
+ * of the touch controller - see docs/sl6806_re_notes.md §7h - so prefer this
+ * name in new code. The old one stays because sketches use it. */
+#define PIN_TP_RESET  PIN_EXT_RESET
 
 /* Peripherals known to exist on this board from the firmware analysis.
  * Listed so the hardware inventory lives with the board definition; only the
@@ -87,6 +93,14 @@
  *   - audio DAC / headphone out
  *   - Bluetooth Classic + LE radio
  *   - FM tuner
+ *   - capacitive touch panel - Hynitron CST816 family, TWI bus 1, addr 0x15
+ *   - camera - 1 MP "sc101", TWI bus 0, addr 0x68, DVP on bank 4, with
+ *     hardware JPEG and H.264 encoders behind it
+ *
+ * The last two are documented register-for-register in
+ * docs/sl6806_re_notes.md §7h. Neither can be driven yet: both reach the
+ * hardware only through mask-ROM routines that are not resident in
+ * bootloader mode, so the TWI controller base has to be found first.
  */
 
 #endif /* SL6806_VARIANT_H */

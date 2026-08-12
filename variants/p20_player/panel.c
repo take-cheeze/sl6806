@@ -13,6 +13,14 @@
  *   COLMOD 0x55 = RGB565, MADCTL 0x00, display inversion on
  *   33 vendor commands, ending INVON / SLPOUT / 120 ms / DISPON / 50 ms
  *
+ * The controller is an NV3030B. That is not a guess from the register set:
+ * the routine these tables came from logs its own name, nv3030b_lcd_init, at
+ * 0x00D3F46C. A 240x320 controller drawn as 240x296 at y offset 12 is what
+ * that part looks like behind a short panel. Note that the HLKJ bootloader
+ * initialises a *different* controller (st7388_lcd_init, a different command
+ * sequence, a descriptor whose width slot says 320) - so the bootloader's
+ * display code is not evidence about this glass. See notes 7b.
+ *
  * The byte-level transport - the last thing that was missing - is the LCD
  * controller at 0x400D9000, driven as a QSPI master. It lives in
  * cores/sl6806/sl6806_lcdc.c, and this board's half of it (pads, module

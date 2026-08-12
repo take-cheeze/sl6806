@@ -375,6 +375,27 @@ where the application uses bank 1. It may be generic SDK code that the vendor
 never ran here. The register semantics it implies could be right in general
 and wrong in some detail this board depends on.
 
+Two later findings sharpen that doubt into something close to a conclusion,
+and both are in notes 7b and 7h:
+
+- **The two paths name different controllers.** The bootloader's init routine
+  is `st7388_lcd_init`; the application's is `nv3030b_lcd_init`. They share no
+  vendor registers - the bootloader opens with an `F0`/`F2` unlock and
+  `B0`-`B4`, the application with `FD`, `61`-`68`, `E0`-`EC`. These are not two
+  revisions of one sequence; they are two different parts.
+- **Bank 4 is the camera.** The camera's I2C, its MCLK and its DVP data bus
+  are all bank 4 function-2 pads. So the bootloader's LCD setup is programming
+  what is, on this board, the camera bus - which is about as clear a signal as
+  one can get from a dump that this code was written for a different layout.
+
+What survives intact is the part that never touched the panel:
+`HAL_lcdc_module_init` copies a 14-byte config into LCDC registers and reads
+nothing from the panel descriptor, and both paths use the same QSPI opcodes
+(`0x02`, `0x32`, `0x0B`). So the *controller* semantics in `sl6806_lcdc.c`
+stand. What does not carry over is anything about pads, timing or panel
+behaviour inferred from the bootloader - including the `0x310` module clock
+suggested below, which is that board's number, not necessarily this one's.
+
 **4. Is the screen dark but the sketch healthy?**
 
 Then the transfers complete and the panel is not listening. In rough order of

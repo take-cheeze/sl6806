@@ -189,9 +189,68 @@ typedef int (*act_handler_t)(activity_t *self, uint32_t msg_id, uint32_t a2, uin
   disassembles it back into a table; the result is 33 commands ending
   INVON 0x21 / SLPOUT 0x11 / 120ms / DISPON 0x29 / 50ms, with COLMOD 0x55
   (RGB565) and MADCTL 0x00. The vendor register set spans 0x61-0x68,
-  0xB1-0xB6, 0xDF-0xEC and 0xF1-0xF6, so it is a vendor variant rather than a
-  stock ST7789. The tables live in `variants/p20_player/panel.c` and are
-  checked byte for byte by `tests/host/test_panel.c`.
+  0xB1-0xB6, 0xDF-0xEC and 0xF1-0xF6. The tables live in
+  `variants/p20_player/panel.c` and are checked byte for byte by
+  `tests/host/test_panel.c`.
+- **The panel controller is an NV3030B — named, not inferred.** The routine
+  at `0x00D3F46C` logs its own name, `nv3030b_lcd_init` (`0x00C7C380`), from a
+  literal pool at `0x00D3F834` that sits inside its own body. So the sequence
+  `tools/sl6806-panelseq` recovers *is* the NV3030B sequence and
+  `variants/p20_player/panel.c` is right; what it gained is a part number.
+  This supersedes the older reading of "a vendor variant rather than a stock
+  ST7789" - it is a different controller family altogether, which is why the
+  register set never matched. A 240x320 controller driven as 240x296 at y
+  offset 12 is exactly what an NV3030B behind a short panel looks like.
+- **The panel descriptor at `0x00C519FC` decodes completely.** `sl6806-panelseq`
+  reads the fields it needs; the rest are:
+
+  | Off | Value | Meaning |
+  |---|---|---|
+  | +0x00 | `0x012800F0` | u16 width 240, u16 height 296 |
+  | +0x04 | `0x000C0000` | u16 x offset 0, u16 y offset 12 |
+  | +0x08 | `0x00020001` | u16 mode 1, u16 device id 2 |
+  | +0x0C | `0x32` | **QSPI pixel-stream opcode** |
+  | +0x0D | `0x02` | **QSPI command opcode** - this is the byte the writers pass as `devid`, i.e. the `02` of `02 00 <cmd> 00` |
+  | +0x0E | `0x0B` | **QSPI read opcode** |
+  | +0x0F..+0x13 | `2C 2E 2A 2B 36` | RAMWR, RAMRD, CASET, RASET, MADCTL |
+  | +0x14..+0x24 | five pointers | init, sleep, wake, display_on, display_off |
+  | +0x2C | `4` | [?] |
+  | +0x30, +0x34 | `0x0081C1FC` | SRAM state, both slots the same |
+  | +0x38, +0x3C | `0x00D42174`, `0x00D420AC` | **both are `movs r0,#0; bx lr`** - stubs, so nothing is missing here |
+
+### The bootloader drives a *different* panel, and it is not this one
+
+Worth knowing before comparing the two LCD paths, because they look
+interchangeable and are not. The HLKJ bootloader has its own panel driver and
+its own descriptor:
+
+| | bootloader | application (FIRM) |
+|---|---|---|
+| init routine | `st7388_lcd_init` at `0x00828604` | `nv3030b_lcd_init` at `0x00D3F46C` |
+| descriptor | `0x0082EB3C` | `0x00C519FC` |
+| geometry word | `0x01810140` (width slot = **320**) | `0x012800F0` (240 x 296) |
+| first commands | `F0 08`, `F2 08`, `9B 51`, `86 53`, `F2 80`, `F0 00`, `F0 01`, `F1 01`, `B0 56`, `B1 4D`, `B2 24`, `B4 66` | `FD 06 08`, `61 07 04`, `62 00 44 40`, `63 41 07 12 12`, ... |
+| descriptor layout | same fields, minus the offsets word at +0x04 | as above |
+
+The two sequences share no registers beyond the standard DCS ones, and the
+bootloader's is an ST7789/ST7796-shaped `F0`/`F2` unlock plus `B0`-`B4`. Its
+geometry word puts 320 where the application puts 240; read as u16 pairs the
+height slot comes out 385, which is not a panel, so the bootloader's struct
+either carries one field this note has not placed or the entry is stale
+vendor boilerplate. Either way it is not describing the glass FIRM drives.
+Only one panel is compiled into the bootloader - a full string scan of the
+segment finds `st7388_lcd_init` and no sibling - so there is no table to
+select from.
+
+**What this does and does not change for `sl6806_lcdc.c`.** It does not
+invalidate the transcription: `HAL_lcdc_module_init` is panel-agnostic (it
+copies a 14-byte config into registers and nothing else), and the config the
+bootloader passes - `9,9,9,9` into `+0x00`, interface type 2, `+0x20` bits
+21:20 = 1 and 11:10 = 3 - is not derived from the descriptor's geometry. Both
+paths use the same QSPI opcodes `0x02`/`0x32`/`0x0B` and the same DCS bytes.
+What it does mean is that **the bootloader's panel behaviour is not evidence
+about this panel**: anything reasoned from "the bootloader's driver works, so
+these registers are right" is reasoning from a driver for different glass.
 - **The backlight is a PWM channel, not part of the LCD path.** `/dev/pwm_ch3`
   (`0x00C68585`), opened at `0x00D10354` with a 48000 Hz period and a duty of
   `percent * 480`; the default is 60% and the setter is `0x00D102F4`. Strings
@@ -228,12 +287,16 @@ seven plain outputs are the ones that matter for bring-up:
 | `0x0001A0D0` | 1/20 | **`vcomo`** - the console handler at `0x00D0AEE0` maps that string to this id and its low twin `0x0001A090`. VCOM is an LCD supply |
 | `0x000508C0` | 5/1 | driven high at `0x00D3CBFE` and low at `0x00D3C9DC`/`0x00D3CC3C`, the display's suspend/resume pair |
 | `0x000300C0` | 3/0 | output set high, `0x00D46432` |
-| `0x00047080` | 4/14 | `gpio_write`, power sequencing at `0x00D44AB8` |
-| `0x00047880` | 4/15 | same routine |
+| `0x00047080` | 4/14 | the **camera's RESET**; power sequencing at `0x00D44B1C`, §7h |
+| `0x00047880` | 4/15 | the **camera's PWDN**; same routine, §7h |
+| `0x00018000` | 1/16 | the **touch controller's RESET**, `0x00D4024C`, §7h |
+| `0x00016800` | 1/13 | the **touch controller's INT**, active low, `0x00D3FF24`, §7h |
 
 Other groups worth naming: bank 1 pins 1-8 are the LCD's QSPI pads
-(function 2) with a matching teardown to function 15; bank 4 pins 0-15 are a
-sixteen-pad function-2 group; bank 3 pins 1-6 are function 11; bank 1 pins
+(function 2) with a matching teardown to function 15; **bank 4 is the camera**
+- its sixteen function-2 pads are the DVP bus, with 4/3 the sensor MCLK and
+4/12, 4/13 the TWI0 pins the sensor answers on (§7h); bank 3 pins 1-6 are
+function 11; bank 1 pins
 22-27, 30, 31 go through `gpio_config` and are the likely button group -
 these are the ids §7d recorded under the old, wrong 6-bit pin decode.
 
@@ -299,6 +362,153 @@ by USB polling, the freeze also destroys the evidence of which pad did it.
 **RESOLVED: the LCDC is at `0x400D9000`, and its driver is in flash.** See
 §12b - the descriptor goes to LCDC `+0x88` and the controller is started with
 `+0x80` bit 0 and `+0x84` bit 0.
+
+## 7h. Touch and camera — IDENTIFIED
+
+This board has both, and they are two different I2C devices on two different
+TWI buses. §7g's `0x18000` and the pair `0x47080`/`0x47880` are now attributed.
+Nothing here is guessed from a product photo: every number below is an
+immediate or a table in `dump.bin`, which is this unit's own flash.
+
+### The touch controller: a Hynitron CST816 family part, TWI 1, address 0x15
+
+Driver at `0x00D3FE00`-`0x00D40300`. The register map is the published
+CST816S/CST816T one, which is what identifies the part - the firmware never
+names it.
+
+| Operation | Transfer |
+|---|---|
+| chip id | read reg `0xA7`, 1 byte -> `tp drv chip id = 0x%x` |
+| firmware version | read reg `0xA9`, 2 bytes -> `tp drv fw version = 0x%04x` |
+| touch data | read **7 bytes from reg `0x00`** (`0x00D4018C`) |
+| sleep | write reg `0xE5` = `0x03` (`0x00D4022E`), used by `tp_suspend` |
+
+Bus parameters: `twi_init(1, 0x30D40)` at `0x00D463F0`, so **bus 1 at 200 kHz**,
+address **`0x15`** (7-bit - the same argument slot carries `0x68` for the
+camera, and `0x15` is odd, so this is not an 8-bit address).
+
+The 7-byte read is decoded exactly like the vendor's, `buf[n]` = register `n`:
+
+```
+x = ((buf[3] & 0x0F) << 8) | buf[4]
+y = ((buf[5] & 0x0F) << 8) | buf[6]
+buf[3] >> 4:   0 = press-down    4 = lift-up    8 = contact
+```
+
+Two constants fall out of the path above it, both worth knowing before
+trusting a coordinate: **y is clamped to 286** (`0x11E`, at `0x00D3FFD2`), and
+**swipes are computed in software, not read from the chip.** The chip's
+gesture register (`0x01`, `buf[1]`) is read and ignored; on lift-up the driver
+compares |Δx| and |Δy| against a **19-pixel** threshold and fires a direction
+callback for whichever axis wins (`0x00D3FFB0`).
+
+`ioctl` cmd 3 sets the active area from one word - high half = horizontal
+limit at `+0x30`, low half = vertical at `+0x32` - and logs it as
+`=== set lcd para: %x, tp_hor: %d, tp_ver: %d`.
+
+**Pads.** This is the part that matters for §12's pinout item.
+
+| Line | pad id (cfg) | bank/pin | evidence |
+|---|---|---|---|
+| TP **RESET** | `0x00018000` (`0x000180F0`) | 1/16, output, drive 3 | `gpio_write(id,0)` / 10 ms / `(id,1)` / 50 ms, then immediately the `0xA7` read (`0x00D4024C`) |
+| TP **INT** | `0x00016800` (`0x00016F08`) | 1/13, **alt function 14**, pull-up | IRQ armed at `0x00D3FEF0`; handler `0x00D3FF24` |
+| TWI1 SDA/SCL | `0x00017618`, `0x00017E18` | 1/14, 1/15, alt function 12, drive 1, pull-up | configured immediately before `twi_init(1, ...)` |
+
+The INT line is **active low**: the handler reads the pad and only queues a
+transfer when it reads 0. Alt function 14 is consistent with §7g's measured
+pad table, where function 14 is one of only two functions that leave the pad's
+input buffer alive - which is exactly what an interrupt input needs.
+
+### The camera: a 1 MP sensor the firmware calls `sc101`, TWI 0, address 0x68
+
+Driver at `0x00D44B00`-`0x00D44D60`, registered through a descriptor at
+`0x00C51D34` whose first word points at the string `sc101` and whose slots
+hold `0x00D44CBC` (init), `0x00D44B1C` (power on) and five more.
+
+| Operation | Transfer |
+|---|---|
+| chip id | read regs `0xF7` then `0xF8`, one byte each; must be **`0xDA`, `0x4A`** |
+| register style | **paged**: reg `0xF0` selects the high byte, so `F0=32` then `03=78` means 16-bit register `0x3203 = 0x78` |
+| init | table of `{reg, val}` byte pairs, `FF FF` terminated, ~40 µs between writes (`0x00D44C50`) |
+
+Bus parameters: `twi_init(0, 0x186A0)` -> **bus 0 at 100 kHz**, address **`0x68`**.
+
+There are **two init tables**, chosen by the init routine's argument:
+
+| table | address | pairs | tail |
+|---|---|---|---|
+| A | `0x00C7DA51` | 192 | no crop block - full array |
+| B | `0x00C7DBD3` | 203 | a `0x32xx` crop window |
+
+Table B's crop decodes cleanly and is what sizes the sensor:
+
+```
+0x3200 = 0x0140 (320)   0x3204 = 0x03C7 (967)    x: 320..967  -> 648 wide
+0x3202 = 0x0078 (120)   0x3206 = 0x025F (607)    y: 120..607  -> 488 tall
+```
+
+A centred 648x488 window (VGA plus the usual 8-pixel margin) inside an array
+that must therefore be **1280x720** - 320 + 648 + 312 and 120 + 488 + 112 both
+land exactly. So table A is 720p, table B is VGA, and "sc101" is a 1 MP part,
+which is what the name says. After the terminator the routine optionally
+writes `0x3221 = 0x06`, gated on a global at `0x008299CA` - a flip/mirror bit.
+
+**Pads and the power-up order** (`0x00D44B1C`):
+
+| Line | pad id | bank/pin |
+|---|---|---|
+| **MCLK** | `0x00041930` | 4/3, alt function 2, drive 3 |
+| **PWDN** | `0x00047880` | 4/15, output |
+| **RESET** | `0x00047080` | 4/14, output |
+| TWI0 SDA/SCL | `0x00046938`, `0x00046138` | 4/12, 4/13, alt function 2, drive 3, pull-up |
+
+```
+mux MCLK -> clock channel 6 programmed with 2800 -> PWDN low, RESET low
+  -> 5 ms -> RESET high -> 5 ms -> PWDN high -> 20 ms -> read chip id
+```
+
+Note the level convention: `gpio_write` takes the **level in bit 6** of the
+packed id, so the "drive high" calls are literally `gpio_write(id, 0x40)`.
+That is the same encoding §7e describes, used as a value rather than an id.
+
+Downstream of the sensor is a DVP/CSI front end feeding hardware codecs -
+`/dev/jenc` (JPEG, writes `1:\photo\YYMMDD-HHMMSS.jpeg`), `/dev/henc` (H.264,
+writes `1:\video\..._NN.avi`), plus `/dev/jdec`, `/dev/hdec`, `/dev/g2d`. The
+scene is `camerca` (the vendor's own typo) and it has a dedicated `CAMERCA`
+key. `drv_henc_open` logs `-bind_dvp_channel CSI_CHAN failed`, so the DVP is a
+named channel resource rather than a register block the app touches.
+
+### SETTLED, NEGATIVE: neither driver can be ported from `dump.bin` alone
+
+Both drivers reach the hardware entirely through the mask ROM / SRAM library,
+the same wall §7d and §7f describe for GPIO:
+
+```
+0x0080FF64  twi_write(bus, addr, buf, len, stop)
+0x0080FFD4  twi_read (bus, addr, buf, len)
+0x00D9A310  twi_init (bus, hz)                  [in FIRM, wraps the two above]
+0x008051F4  pad_configure(packed_pad_id)        one argument, not the 0x811Cxx pair
+0x008051EC  module_clock_enable(id)             23 = TWI1, 58 = TWI0
+0x00811C78  gpio_read(id)
+0x00811C7C  gpio_write(id, value)               (§7d already had this one)
+0x00811C84  gpio_irq_setup(id, mode)
+0x00811C88  gpio_irq_status(id)
+0x00811C8C  gpio_irq_clear(id)
+```
+
+The four-byte spacing at `0x00811C78`..`0x00811C8C` says that block is a thunk
+table, which extends §7d's three entries rather than contradicting them.
+
+To confirm there is no second path, FIRM was scanned twice for a peripheral
+base: every PC-relative literal *and* every `MOVW`/`MOVT` pair across the whole
+1.8 MB partition. **Zero `0x4xxxxxxx` constants from either scan** in the
+touch, camera or codec driver regions - the one apparent hit at `0x00D42EB4` is
+a float constant pool (`0x40040000` is 2.0625). And per §7f none of the
+addresses above is resident in bootloader mode; `sram.bin` reads as noise at
+all nine.
+
+So the TWI controller base is the blocker for both. Finding it is the same
+kind of job that §12b did for the LCDC, and it buys two devices at once.
 
 ## 7c. Peripheral map
 

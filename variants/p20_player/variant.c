@@ -73,11 +73,23 @@ const uint32_t sl6806_vendor_pin_map[] = {
      * is the one entry here that is known to be usable end to end. */
     0x13800u,
 
-    /* 8  PIN_EXT_RESET. [V] id, [I] role: driven low / 10 ms / high / 50 ms
-     * at 0x00D401E6, immediately before a register read over what looks like
-     * an I2C transfer to address 0x15 - so, the reset line of an I2C device
-     * (touch controller or camera; the scene table has both). */
+    /* 8  PIN_EXT_RESET, also PIN_TP_RESET. [V] id, [V] role: the reset line
+     * of the touch controller. Driven low / 10 ms / high / 50 ms at
+     * 0x00D401E6, immediately before reading register 0xA7 over I2C from
+     * address 0x15 - the CST816 chip-id register. The camera is a separate
+     * device on a separate bus (bank 4, address 0x68), which is what settles
+     * the ambiguity this comment used to carry. See notes §7h.
+     * The pad is configured as 0x000180F0 - output, drive 3. */
     0x18000u,
+
+    /* 9  PIN_TP_INT. [V] id, [V] role: the touch controller's interrupt.
+     * The vendor arms it at 0x00D3FEF0 and its handler at 0x00D3FF24 reads
+     * the pad and only queues an I2C read when it reads 0, so the line is
+     * active low. The vendor puts the pad on alt function 14 with a pull-up
+     * (0x00016F08); function 14 is one of only two functions §7g measured
+     * that leave the input buffer alive, so as a plain input (function 0)
+     * this pad is readable too - which is what digitalRead() will do. */
+    0x16800u,
 };
 
 const uint8_t sl6806_nvendor_pins =
@@ -91,7 +103,21 @@ const uint8_t sl6806_nvendor_pins =
  *   0x1B000 0x1B800 0x1C000 0x1C800 0x1D000 0x1D800 0x1F000 0x1F800
  *       pins 54..59, 62, 63. Used with the config routine at 0x00811C90 and
  *       a value of 0x780, from code around 0x00D93E00-0x00D94800.
- *   0x41F80 0x47080 0x47780 0x47880 0x47F80
- *       the second selector group. Driven with values 0 and 0x40 in a
- *       power-sequencing routine at 0x00D44AB8.
+ *   0x47080 0x47880
+ *       the camera's RESET and PWDN, bank 4 pins 14 and 15. Driven with 0
+ *       and 0x40 - the level lives in bit 6 of the packed id - by the sensor
+ *       power-up at 0x00D44B1C: both low, 5 ms, RESET high, 5 ms, PWDN high,
+ *       20 ms, then the chip-id read. Not mapped to an Arduino pin because
+ *       driving them without a sensor driver does nothing useful.
+ *   0x41930
+ *       the camera's MCLK, bank 4 pin 3, alt function 2. Not a GPIO.
+ *   0x46138 0x46938   bank 4 pins 12, 13 - TWI0, the camera's I2C.
+ *   0x17618 0x17E18   bank 1 pins 14, 15 - TWI1, the touch panel's I2C.
+ *       All four are alternate functions, so they are pads to leave alone
+ *       rather than pins to drive.
+ *   0x41F80 0x47780 0x47F80
+ *       the rest of that selector group, role still unknown.
+ *
+ * See docs/sl6806_re_notes.md §7h for the touch and camera devices these
+ * belong to, register by register.
  */
