@@ -44,7 +44,8 @@ so it is worth being precise about which parts are real:
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
-| Touch panel, camera | **Not yet, but fully decoded.** Both are I2C devices and both are documented register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h — including their pads, which are now in the variant. What blocks a driver is the TWI controller base, not the devices. |
+| Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
+| Camera | **Not yet, but fully decoded.** Documented register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h, pads included. It is on TWI 0 and needs a real bus — a 1 MP sensor is not something to bit-bang — so the TWI controller base still blocks it. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
 Two honest caveats worth reading before you trust output:
@@ -213,7 +214,7 @@ peripheral behind them. See `tests/emu/sl6806_emu.py`.
 hardware says back — mode detection from a SCSI inquiry, for instance. Those
 are pure functions, and `--help` in CI cannot check them.
 
-CI runs all three on every push and pull request, plus a build of all six
+CI runs all three on every push and pull request, plus a build of seven
 sketches in both modes with `-Werror`.
 
 ## Getting started
@@ -365,8 +366,10 @@ In rough order of how much they unlock:
    it: a CST816 touch panel on bus 1 and a 1 MP camera on bus 0, both with
    their registers, init tables and pads already written down (§7h). The
    firmware reaches them only through mask-ROM routines that a payload
-   cannot call, so this is the same kind of hunt §12b did for the LCDC — and
-   it unlocks both at once.
+   cannot call, so this is the same kind of hunt §12b did for the LCDC. The
+   touch panel no longer waits on it — `examples/TouchDemo` bit-bangs bus 1
+   on the pads, which is plenty for seven bytes per touch — so what the base
+   would buy is the camera, and speed.
 4. **A DMA driver.** The display pushes pixels 16 bytes at a time because
    that is the FIFO depth. The vendor uses the DMA controller at
    `0x40070000`; its command-list format is decoded at the bottom of
@@ -393,8 +396,8 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, LcdProbe, MmioProbe, RomProbe,
-                  CallbackProbe
+examples/         Hello, Blink, GfxDemo, TouchDemo, LcdProbe, PadScope,
+                  PadSweep, BacklightHunt, MmioProbe, RomProbe, CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
 docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md,
                   ACTIONS_CARDREADER.md

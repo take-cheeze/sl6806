@@ -100,7 +100,10 @@
  * The last two are documented register-for-register in
  * docs/sl6806_re_notes.md §7h. Neither can be driven yet: both reach the
  * hardware only through mask-ROM routines that are not resident in
- * bootloader mode, so the TWI controller base has to be found first.
+ * bootloader mode, so the TWI controller base has to be found first - for
+ * the camera. The touch panel does not have to wait for it: its reset,
+ * interrupt and both TWI1 pads are ordinary pads, so examples/TouchDemo
+ * bit-bangs the bus and reads coordinates without any TWI controller.
  */
 
 #endif /* SL6806_VARIANT_H */
