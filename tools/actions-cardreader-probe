@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""
+actions-cardreader-probe - identify an Actions-brand USB card reader and walk
+it from card-reader mode into ADFU (boot ROM) mode.
+
+WHY THIS EXISTS. This is NOT an SL6806. `lsusb -d 20d6:2101 -v` on the target
+device reports `20d6:2101 ACTIONS USB CARDREADER`, Mass Storage / SFF-8070i,
+bulk-only - a different vendor and chip family than the Zhuhai Smartlink
+SL6806 this repository otherwise targets, and `smtlink_dump` does not speak
+to it.
+
+`3rd/actions_flash` (github.com/ilyakurdyukov/actions_flash) dumps Actions'
+ATJ2127/ATJ2157 MP3-player chips over a `libusb` SCSI vendor-command channel
+(CDB 0xcc/0xcb) that its own source treats as a stable boot-ROM "ADFU"
+protocol, not something specific to those two chips: `inquiry`, `adfu_reboot`
+and `adfu_info` are all sent to the chip's mask ROM before any chip-specific
+binary is loaded. Whether this card reader's chip answers the same way has
+NOT been confirmed - that is what this script establishes, and only that.
+
+WHAT THIS DOES, in order:
+  1. `inquiry`     - confirms the SCSI vendor channel answers at all, in
+                     card-reader mode.
+  2. `adfu_reboot` - asks the device to reboot into ADFU/boot-ROM mode.
+                     Gated behind --yes; see the warning below.
+  3. Waits for a new USB id to appear on the bus (diffed against the id set
+     from before the reboot, not assumed) and runs `adfu_info` against it - a
+     read-only boot ROM query that reports two ID bytes. That names the chip
+     if it matches a known one (currently ATJ2127/ATJ2157), or at least gives
+     a number worth recording and searching for.
+
+WHAT THIS DELIBERATELY DOES NOT DO: read or write flash. `read_lfi` and
+`write_flash` need a chip-specific `fwscfNNN.bin` this project does not have
+for an unidentified chip, and guessing one is how a device gets bricked - see
+3rd/actions_flash/README.md. Once `adfu_info` reports an id, RAM (not flash,
+not ROM) can be read safely with the underlying tool directly:
+
+    3rd/actions_flash/actions_dump --id <adfu_id> read_mem <addr> <size> out.bin
+
+`<addr>` is chip-specific and this script does not guess it.
+
+SAFETY, from upstream (3rd/actions_flash/README.md): some of these devices
+have a software power switch and stay in ADFU mode after unplugging; if a
+step hangs, that is not by itself evidence of a brick - holding the boot key
+for a few seconds may recover it. Read that file before using --yes on
+hardware you cannot afford to lose.
+"""
+
+import argparse
+import os
+import shutil
+import string
+import subprocess
+import sys
+import time
+
+# Chip IDs adfu_info is known to decode, from 3rd/actions_flash/README.md.
+# A card reader with a different id is expected to print a number not in
+# this table - that is the useful result, not a failure.
+KNOWN_CHIPS = {
+    0x10d6: "ATJ2127",
+    0x3051: "ATJ2157",
+}
+
+
+def find_tool(explicit):
+    if explicit:
+        return explicit
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "..", "3rd", "actions_flash", "actions_dump"),
+        shutil.which("actions_dump") or "",
+    ]
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return os.path.abspath(c)
+    sys.exit("error: actions_dump not found. Build 3rd/actions_flash "
+             "(run make there; needs libusb-1.0-0-dev), or pass --tool <path>.")
+
+
+def run(tool, usb_id, args, sudo, capture=True, timeout=15.0):
+    cmd = (["sudo"] if sudo else []) + [tool, "--id", usb_id] + args
+    try:
+        return subprocess.run(cmd, capture_output=capture, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def parse_hexdump(text):
+    """Reassemble the bytes from actions_dump's hexdump output.
+
+    Same shape as smtlink_dump's: hex byte columns, optionally followed by
+    "|ascii|". Non-hex lines (headers, warnings) are skipped.
+    """
+    data = bytearray()
+    for line in text.splitlines():
+        row = line.split("|", 1)[0].strip()
+        if not row:
+            continue
+        toks = row.split()
+        if not all(len(t) == 2 and all(c in string.hexdigits for c in t)
+                   for t in toks):
+            continue
+        data += bytes(int(t, 16) for t in toks)
+    return bytes(data)
+
+
+def parse_inquiry(text):
+    """(vendor, product, revision) from a SCSI INQUIRY response, or None.
+
+    Standard field layout: bytes 8-15 vendor, 16-31 product, 32-35 revision.
+    """
+    data = parse_hexdump(text)
+    if len(data) < 36:
+        return None
+    def field(lo, hi):
+        return data[lo:hi].decode("latin-1").strip()
+    return field(8, 16), field(16, 32), field(32, 36)
+
+
+def parse_adfu_info(text):
+    """The two ID bytes from an adfu_info response, or None.
+
+    Per 3rd/actions_flash README the reply starts "\\0CADFUD", then two id
+    bytes at offset 7-8 (0x10d6 for ATJ2127, 0x3051 for ATJ2157).
+    """
+    data = parse_hexdump(text)
+    if len(data) < 9 or data[:7] != b"\0CADFUD":
+        return None
+    return (data[7] << 8) | data[8]
+
+
+def list_usb_ids():
+    """{(idVendor, idProduct)} for every USB device currently on the bus."""
+    ids = set()
+    base = "/sys/bus/usb/devices"
+    try:
+        entries = os.listdir(base)
+    except OSError:
+        return ids
+    for d in entries:
+        p = os.path.join(base, d)
+        try:
+            with open(os.path.join(p, "idVendor")) as f:
+                vid = f.read().strip()
+            with open(os.path.join(p, "idProduct")) as f:
+                pid = f.read().strip()
+        except OSError:
+            continue
+        ids.add((vid, pid))
+    return ids
+
+
+def wait_for_new_id(before, timeout, want=None):
+    """Block until a USB id absent from `before` appears (or `want` does).
+
+    Returns the id as "vid:pid", or None on timeout.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        now = list_usb_ids()
+        if want:
+            if want in now:
+                return "%s:%s" % want
+        else:
+            new = now - before
+            if new:
+                vid, pid = sorted(new)[0]
+                return "%s:%s" % (vid, pid)
+        time.sleep(0.2)
+    return None
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--id", default="20d6:2101",
+                   help="card-reader-mode USB id (default 20d6:2101)")
+    p.add_argument("--adfu-id",
+                   help="skip bus-diffing for the post-reboot id and use "
+                        "this one instead (vid:pid, hex)")
+    p.add_argument("--skip-reboot", action="store_true",
+                   help="assume the device is already in ADFU mode at "
+                        "--adfu-id (or --id); just run adfu_info")
+    p.add_argument("--yes", action="store_true",
+                   help="actually send adfu_reboot. Without this, the "
+                        "script stops after `inquiry` and prints what it "
+                        "would do next - read the module docstring first")
+    p.add_argument("--tool", help="path to actions_dump")
+    p.add_argument("--no-sudo", action="store_true",
+                   help="do not prefix with sudo (use if you installed "
+                        "udev rules per 3rd/actions_flash/README.md)")
+    p.add_argument("--wait", type=float, default=30.0,
+                   help="seconds to wait for the card-reader-mode device")
+    p.add_argument("--adfu-wait", type=float, default=15.0,
+                   help="seconds to wait for the post-reboot id to appear")
+    args = p.parse_args()
+
+    tool = find_tool(args.tool)
+    sudo = not args.no_sudo
+
+    if args.skip_reboot:
+        adfu_id = args.adfu_id or args.id
+    else:
+        before = list_usb_ids()
+        if tuple(args.id.split(":")) not in before:
+            print("warning: %s not seen on the bus yet; waiting up to %gs"
+                  % (args.id, args.wait), file=sys.stderr)
+        deadline = time.time() + args.wait
+        while tuple(args.id.split(":")) not in list_usb_ids():
+            if time.time() > deadline:
+                sys.exit("error: %s never appeared." % args.id)
+            time.sleep(0.2)
+
+        r = run(tool, args.id, ["inquiry"], sudo)
+        if r is None or r.returncode != 0:
+            sys.exit("error: inquiry failed. Is the device really at %s and "
+                     "in card-reader mode?" % args.id)
+        text = (r.stdout or "") + (r.stderr or "")
+        ident = parse_inquiry(text)
+        if ident:
+            print("inquiry: vendor=%r product=%r rev=%r" % ident)
+        else:
+            print("inquiry: got a response but it did not parse as a "
+                  "standard SCSI INQUIRY reply - see the raw output below")
+            print(text)
+
+        if not args.yes:
+            print("\nStopping here (no --yes). Next step would be "
+                  "`adfu_reboot`, which asks the device to switch into "
+                  "ADFU/boot-ROM mode. This has not been confirmed to work "
+                  "on this chip. Read the warning in "
+                  "3rd/actions_flash/README.md, then re-run with --yes.")
+            return 0
+
+        print("sending adfu_reboot ...")
+        r = run(tool, args.id, ["adfu_reboot"], sudo)
+        if r is None or r.returncode != 0:
+            sys.exit("error: adfu_reboot failed (exit %s). Output:\n%s"
+                     % (r.returncode if r else "timeout",
+                        ((r.stdout or "") + (r.stderr or "")) if r else ""))
+
+        want = tuple(args.adfu_id.split(":")) if args.adfu_id else None
+        print("waiting up to %gs for a new USB id ..." % args.adfu_wait)
+        adfu_id = wait_for_new_id(before, args.adfu_wait, want=want)
+        if adfu_id is None:
+            sys.exit("error: no new USB id appeared within %gs. The device "
+                     "may still be at %s, gone from the bus, or the reboot "
+                     "was not accepted. See the docstring's SAFETY note "
+                     "before power-cycling it." % (args.adfu_wait, args.id))
+        print("new id on the bus: %s" % adfu_id)
+
+    r = run(tool, adfu_id, ["adfu_info"], sudo)
+    if r is None or r.returncode != 0:
+        sys.exit("error: adfu_info failed at %s (exit %s)."
+                 % (adfu_id, r.returncode if r else "timeout"))
+    text = (r.stdout or "") + (r.stderr or "")
+    chip_id = parse_adfu_info(text)
+    if chip_id is None:
+        print("adfu_info: response did not match the expected "
+              "\"\\0CADFUD\" shape - raw output:")
+        print(text)
+        return 1
+
+    name = KNOWN_CHIPS.get(chip_id)
+    print("adfu_info: chip id = 0x%04x%s" % (chip_id,
+          " (%s)" % name if name else " - not in KNOWN_CHIPS, please record it"))
+    print("\nRAM (not flash) can now be read safely with:\n"
+          "  %s --id %s read_mem <addr> <size> out.bin"
+          % (tool, adfu_id))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

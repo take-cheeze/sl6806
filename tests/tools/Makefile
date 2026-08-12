@@ -8,7 +8,7 @@
 # in CI cannot check.
 
 PYTHON ?= python3
-TESTS  := test_inquiry.py test_calibrate.py
+TESTS  := test_inquiry.py test_calibrate.py test_actions_cardreader.py
 
 .PHONY: all clean
 all:
