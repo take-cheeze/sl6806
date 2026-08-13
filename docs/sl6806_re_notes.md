@@ -1561,3 +1561,56 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
    `__act_on_request` dispatcher (turns `method_20` + siblings into named
    methods across all scenes).
 9. **Build a Unicorn harness** to execute functions from the image.
+10. **Run `examples/BtProbe` on hardware.** §13 found a single, exclusively
+    referenced candidate peripheral base for Bluetooth, `0x400E2000`, from
+    the code next to the application's HCI command dispatcher — but nothing
+    in it has been read on a real device yet. See docs/BLUETOOTH.md.
+
+## 13. Bluetooth — link-manager code and a candidate register block
+
+**Confirmed:** the application embeds a complete Bluetooth stack, not a
+stub. String evidence: a full `BT_EVENT_*` enum (stack open/close, inquiry,
+pairing, A2DP/AVRCP/HFP/SPP/OPP open/close/stream), profile name strings
+(`l2cap`, `rfcomm`, `a2dp`, `avrcp`), and 27 persisted keys in the `PSMP`
+partition including `bt_addr`, `bt_name`, `bt_relink`, `le_addr` (§7k) — this
+unit has paired with something. No external-chip transport is visible: no
+vendor strings (Airoha/Jieli/Beken/Realtek/CSR/RDA), no AT-command text, no
+`hci_h4`/`hci_uart` layer. The naming (`lm`/`llm` — link manager / lower
+link manager) and a 64-entry HCI opcode dispatch table that logs
+`"-hci cmd0x%x"` for unimplemented opcodes read as an HCI stack terminating
+on this CPU against local hardware, not a UART bridge to a separate radio.
+
+**Candidate register block: `0x400E2000`.** Already listed as an
+unidentified block in the whole-firmware scan (§7c). What ties it to
+Bluetooth: it is the **single** literal load of that exact constant anywhere
+in the 1.8 MB FIRM image (`tools/sl6806-xref dump.bin 0x400E2000`), and the
+instruction that loads it, `0x00D98C9E`, sits inside a module-registration
+routine a few hundred bytes from the HCI dispatch table (`0x00DA0000`
+.. `0x00DA9BCA`, found via
+`tools/sl6806-xref dump.bin --string="-hci cmd0x%x" --context 12`).
+
+That routine (`0x00D98C9C`) does a clear-bit31 / delay(10, via the
+already-documented delay veneer `0x00807214`) / set-bit31 reset pulse on
+`+0x228`, writes `0xFFFFFFFF` to `+0x200` during the window, registers
+`{base=0x400E2000, config_ptr}` into an SRAM descriptor at `0x0082B3A8`, sets
+bit 24 of `+0x214`, then fans a caller-supplied config struct out into
+roughly a dozen narrow bitfields at `+0x10, +0x14, +0x20, +0x44, +0x48,
++0x4C, +0x50, +0x54, +0x58, +0x70, +0x78, +0x7C`. A separate accessor
+cluster (`0x00D98B18`..`0x00D98C58`) reads `+0x200`, `+0x218` and `+0x228`
+back through the same descriptor; `+0x218`'s top nibble gates a small table
+lookup, the shape of a status/mode field.
+
+Reset-then-config-fanout is the same two-part shape every other confirmed
+peripheral bring-up in this codebase has (CRU divider setters, LCD panel
+init), which is the basis for treating this as real hardware rather than a
+data table. Full offset list and citations: `cores/sl6806/sl6806_bt.h`.
+Writeup with the reproduction commands and what to check on hardware next:
+`docs/BLUETOOTH.md`.
+
+**Not established:** what any bit means (the mixed 7/8/10/12/14/16/18-bit
+field widths are consistent with radio/link timing parameters but that is a
+shape argument, not a decode); whether the block is even readable from a
+payload (LCD and GPIO both needed SRAM-resident vendor code absent in
+bootloader mode — this may be the same); whether one register window is the
+whole story for a part with an actual radio. `examples/BtProbe` is the
+read-only hardware test for the first of those.

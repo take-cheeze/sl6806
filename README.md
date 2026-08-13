@@ -45,7 +45,8 @@ so it is worth being precise about which parts are real:
 | `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
-| Audio, SD, Bluetooth | **Not yet.** Hardware confirmed present; no drivers. |
+| Audio, SD | **Not yet.** Hardware confirmed present; no drivers. |
+| Bluetooth | **Candidate register block found, unread.** `0x400E2000` — the single literal reference to that address anywhere in FIRM, sitting next to the application's HCI command dispatcher. No bit in it has been checked against a real device yet. See [docs/BLUETOOTH.md](docs/BLUETOOTH.md) and `examples/BtProbe`. |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
 | I2C on bare pads | **Works — confirmed on hardware.** `examples/CameraDemo` bit-bangs TWI 0 on two pads and reads the FM tuner's chip id: `0x5808`, the exact value the stock driver checks for, on a read-only pass. First device this framework has ever read over I2C, and it needs no TWI controller. |
 | Camera | **The module is fitted and works — under the stock firmware. From a payload, `0x68` is silent, and the cause is now known to be power.** Decoded register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h. The vendor's camera app shows a live preview on this unit, which confirms the pads, the bus, the address and the clock from the other end — `examples/CameraDemo` reaches the same sensor over the same wires and gets nothing. What the vendor does and a payload does not is switch a rail: its `power_on` is only pads, delays and clock channel 6, so the enable happens further up, behind the indexed register file a payload cannot reach. |
@@ -336,6 +337,7 @@ Peripheral blocks identified so far:
 | `0x40070000` | DMA |
 | `0x40080000` | clock & reset ([`sl6806_cru.h`](cores/sl6806/sl6806_cru.h)) |
 | `0x400D9000` | LCD controller ([`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h)) |
+| `0x400E2000` | **candidate** Bluetooth register block, unconfirmed on hardware ([`sl6806_bt.h`](cores/sl6806/sl6806_bt.h), [docs/BLUETOOTH.md](docs/BLUETOOTH.md)) |
 | `0x400F7000` | SD/MMC + SPI flash host |
 
 Flash layout: HLKJ bootloader at `0x0`, partition table at `0xF000`, then
@@ -386,7 +388,13 @@ In rough order of how much they unlock:
    that is the FIFO depth. The vendor uses the DMA controller at
    `0x40070000`; its command-list format is decoded at the bottom of
    [`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
-7. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+7. **Run `examples/BtProbe` on a real P20 and report what happens.** A
+   candidate Bluetooth register block, `0x400E2000`, is found — see
+   [docs/BLUETOOTH.md](docs/BLUETOOTH.md) — but read-only and completely
+   unconfirmed on hardware. Cheap to run, and the outcome (flat zero, flat
+   ones, or something that moves on its own) decides whether this is worth
+   any further reverse engineering at all.
+8. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
    clock, so this no longer blocks anything; finding the PLL registers would
    still give it exactly. They are *not* at the clock unit's base:
    `0x40080000` has dividers but no multiplier.
@@ -410,9 +418,9 @@ ld/               linker scripts, one per build mode
 tools/            host-side Python tools
 examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, FmDemo,
                   RegFileProbe, LcdProbe, PadScope, PadSweep, BacklightHunt,
-                  MmioProbe, RomProbe, CallbackProbe
+                  MmioProbe, RomProbe, CallbackProbe, BtProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
-docs/             BRINGUP.md, DUMPING.md, FLASHING.md, LCD.md,
+docs/             BRINGUP.md, DUMPING.md, FLASHING.md, LCD.md, BLUETOOTH.md,
                   sl6806_re_notes.md, ACTIONS_CARDREADER.md
 3rd/              smartlink_flash submodule, actions_flash submodule
                   (for a different, non-SL6806 device - see
