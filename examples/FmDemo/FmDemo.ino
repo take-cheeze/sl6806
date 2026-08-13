@@ -67,7 +67,19 @@
 
 #define FM_ADDR_SEQ     0x10u   /* [V] sequential access, from register 0x02 */
 #define FM_ADDR_RANDOM  0x11u   /* [V] random access, register number first  */
-#define FM_CHIP_ID      0x5808u /* [V] 0x00D3D988                            */
+/*
+ * Two different "chip ids", and they are not the same thing.
+ *
+ *   0x5804  register 0x00, the part's actual CHIPID, read by random access.
+ *           Stable whatever the chip is doing. Measured on this unit.
+ *   0x5808  what the vendor driver checks: bytes 8 and 9 of a ten-byte
+ *           sequential read from 0x10, which is register 0x0E. That reads
+ *           0x5808 on a chip fresh out of reset and something else once it
+ *           has been enabled and tuned - 0x0000, observed. A fine power-on
+ *           presence check, a poor identity check.
+ */
+#define FM_CHIP_ID      0x5804u   /* register 0x00 */
+#define FM_VENDOR_ID    0x5808u   /* register 0x0E, fresh out of reset */
 
 /*
  * Published RDA5807 register bits. These are not from the dump - the vendor
@@ -85,8 +97,18 @@
 #define R02_ENABLE      0x0001u
 
 #define R03_TUNE        0x0010u
-#define R03_BAND_87_108 0x0000u
-#define R03_SPACE_100K  0x0000u
+#define R03_SPACE_100K  0x0000u   /* bits [1:0]; Japan uses 100 kHz steps */
+
+/*
+ * Band, register 0x03 bits [3:2]. The default of 87-108 MHz is the US and
+ * European band and it is the wrong one in much of the world - Japanese FM
+ * runs from 76 MHz, so a 87-108 sweep misses most of the stations there and
+ * comes back looking like a dead aerial.
+ */
+#define R03_BAND_87_108 0x0000u   /* US / Europe        */
+#define R03_BAND_76_91  0x0004u   /* Japan              */
+#define R03_BAND_76_108 0x0008u   /* both, in one sweep */
+#define R03_BAND_65_76  0x000Cu   /* OIRT, eastern Europe */
 
 #define R0A_STC         0x4000u
 #define R0A_ST          0x0400u
@@ -95,10 +117,40 @@
 /* Leave the audio muted. Set to 1 only if you want to hear it. */
 #define FM_UNMUTE       0
 
-/* The band, in 100 kHz channels above 87.0 MHz. */
+/*
+ * Which band to sweep. The channel number in register 0x03 counts from the
+ * band's own base, so base and count move with it.
+ *
+ *   FM_BAND_JAPAN  76.0 - 91.0    Japan
+ *   FM_BAND_WORLD  76.0 - 108.0   covers Japan and the US/European band
+ *   FM_BAND_US     87.0 - 108.0   the RDA5807's power-on default
+ */
+#define FM_BAND_US      0
+#define FM_BAND_JAPAN   1
+#define FM_BAND_WORLD   2
+
+#ifndef FM_BAND
+#define FM_BAND         FM_BAND_WORLD
+#endif
+
+#if   FM_BAND == FM_BAND_JAPAN
+#define FM_BAND_BITS    R03_BAND_76_91
+#define FM_BASE_KHZ     76000
+#define FM_CHANNELS     150      /* 76.0 .. 91.0 MHz  */
+#define FM_BAND_NAME    "Japan, 76.0-91.0 MHz"
+#elif FM_BAND == FM_BAND_WORLD
+#define FM_BAND_BITS    R03_BAND_76_108
+#define FM_BASE_KHZ     76000
+#define FM_CHANNELS     320      /* 76.0 .. 108.0 MHz */
+#define FM_BAND_NAME    "world, 76.0-108.0 MHz"
+#else
+#define FM_BAND_BITS    R03_BAND_87_108
 #define FM_BASE_KHZ     87000
-#define FM_STEP_KHZ     100
 #define FM_CHANNELS     210      /* 87.0 .. 108.0 MHz */
+#define FM_BAND_NAME    "US/Europe, 87.0-108.0 MHz"
+#endif
+
+#define FM_STEP_KHZ     100
 
 /* Which frequencies to sweep, and how long to give each one to tune. */
 #define SWEEP_STEP_CH   5        /* every 500 kHz */
@@ -240,6 +292,38 @@ static int fmReadRegs(uint16_t *out, int n)
     return 1;
 }
 
+/*
+ * Random access: address 0x11, the register number, then a repeated START to
+ * read it. This exists because the sequential read is not a reliable way to
+ * ask "which part is this".
+ *
+ * The vendor's driver takes bytes 8 and 9 of a ten-byte sequential read from
+ * 0x10 - register 0x0E - and compares them against 0x5808. That works on a
+ * chip fresh out of reset and stops working once it has been enabled and
+ * tuned: the same read came back 0x5808 on one run of this sketch and 0x0000
+ * on the next, the difference being that the first run had left the tuner
+ * running. Register 0x00 is the real chip id and reads the same whatever the
+ * chip is doing.
+ */
+static int fmReadReg(uint8_t reg, uint16_t *out)
+{
+    uint8_t hi, lo;
+
+    i2cStart();
+    if (!i2cWrite((uint8_t)(FM_ADDR_RANDOM << 1))) goto fail;
+    if (!i2cWrite(reg))                            goto fail;
+    i2cStart();
+    if (!i2cWrite((uint8_t)((FM_ADDR_RANDOM << 1) | 1))) goto fail;
+    hi = i2cRead(1);
+    lo = i2cRead(0);
+    i2cStop();
+    *out = (uint16_t)((hi << 8) | lo);
+    return 1;
+fail:
+    i2cStop();
+    return 0;
+}
+
 static unsigned chanToKHz(unsigned ch) { return FM_BASE_KHZ + ch * FM_STEP_KHZ; }
 
 static void printMHz(unsigned khz)
@@ -272,7 +356,7 @@ static int tuneTo(unsigned channel)
 
     regs[0] = R02_DHIZ | R02_NEW_METHOD | R02_ENABLE
             | (FM_UNMUTE ? R02_DMUTE : 0);
-    regs[1] = (uint16_t)((channel << 6) | R03_TUNE | R03_BAND_87_108
+    regs[1] = (uint16_t)((channel << 6) | R03_TUNE | FM_BAND_BITS
                                         | R03_SPACE_100K);
     if (!fmWriteRegs(regs, 2))
         return -1;
@@ -318,20 +402,23 @@ void loop()
     switch (state) {
 
     case ST_ID: {
-        uint16_t r[5];
+        uint16_t id;
 
-        if (!fmReadRegs(r, 5)) {
-            Serial.println("no answer at 0x10. Is this a P20 with the FM part?");
+        Serial.print("band: ");
+        Serial.println(FM_BAND_NAME);
+
+        if (!fmReadReg(0x00, &id)) {
+            Serial.println("no answer at 0x11. Is this a P20 with the FM part?");
             state = ST_DONE;
             break;
         }
         Serial.print("chip id 0x");
-        Serial.print(r[4], HEX);
-        if (r[4] != FM_CHIP_ID) {
-            Serial.println(" - not the 0x5808 the vendor driver expects.");
+        Serial.print(id, HEX);
+        if (id != FM_CHIP_ID) {
+            Serial.println(" - not the 0x5804 an RDA5807 reports in register 0.");
             Serial.println("Carrying on anyway; the register map may differ.");
         } else {
-            Serial.println(" - the RDA5807 the vendor driver expects.");
+            Serial.println(" - an RDA5807, from its own CHIPID register.");
         }
         state = ST_ENABLE;
         break;

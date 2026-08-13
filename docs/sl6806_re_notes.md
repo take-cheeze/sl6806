@@ -872,7 +872,7 @@ I2C device on this board rather than a second look at one of the two in §7h.
 | driver | `0x00D3D92C` (chip-id read), wrappers at `0x00D3D6F8` / `0x00D3D70A` |
 | bus | **0**, the camera's - both wrappers pass `r0 = 0` to the vendor's twi calls |
 | address | **`0x10`** in the driver; `0x11` and `0x60` also ACK on hardware |
-| chip id | **`0x5808`**, compared at `0x00D3D988` |
+| chip id | the driver compares **`0x5808`**, at `0x00D3D988` - see the caveat below |
 
 The three addresses are one part: `0x10` is the RDA5807's sequential-access
 address, `0x11` its random-access one and `0x60` its TEA5767-compatible alias.
@@ -887,6 +887,13 @@ twi_read (0, 0x10, buf, 10)                   ; 0x00D3D962
 id = (buf[8] << 8) | buf[9]                   ; 0x00D3D972
 id == 0x5808 ?                                ; 0x00D3D988
 ```
+
+**The vendor's id check is a presence check, not an identity check.** It takes
+bytes 8 and 9 of the ten-byte sequential read - register `0x0E` - and those are
+state-dependent: `0x5808` on a chip fresh out of reset, `0x0000` once
+`examples/FmDemo` has enabled and tuned it, both observed on this unit. The
+part's real identity is register `0x00`, read by random access at address
+`0x11`, and on this board it is **`0x5804`**.
 
 Strings around it: `FM chip id: 0x%x` (`0x00C75C1E`), `fm init err`,
 `fm_clk_init over`, `/dev/fm`, and a whole `fm_band` / `fm_search` /
