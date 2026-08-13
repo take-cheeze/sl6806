@@ -5346,3 +5346,90 @@ Which sharpens the remaining puzzle rather than solving it. Of those six pads,
 the card-inserted `PadMap` run reads pins 16 and 17 hard low and 12, 13, 14
 floating — no sign of a card's pull-ups anywhere on a bus the bootloader
 drives. Worth one more look with the socket in hand.
+
+## 25. The PLL, found in the bootloader's first phase — and §19 corrected
+
+Digging the bootloader's `hardware_init` (`0x00820378`, the first thing main
+calls) turns up the clock tree, which this project has been without since the
+beginning.
+
+### The call
+
+```
+0x00820378  hardware_init(1)
+    0x00820164()                 NVIC and SCB (0xE000E100, 0xE000ED14)
+    ROM 0x3BFC()
+    0x00820DF8(24)
+    0x008206D0(2, 384000000, 32000000)      <- the clock tree
+    0x00820284()
+    pad_configure(0x00011300)                bank 1 pin 2, function 6
+    0x0082A220(&{48000000, 1500000, ...})    a block at 0x40091000, unlisted in 7c
+    0x0082356C(1)
+```
+
+Two of those arguments are frequencies written as plain integers:
+`0x16E36000` is **384,000,000** and `0x01E84800` is **32,000,000**.
+
+### What 0x008206D0 does
+
+```
+[0x400F7000 + 0x60] = 0
+ROM 0x2E5C(3, 10)  and  0x2E5C(6, 10)      clock source select, both no-ops
+ROM 0x3A6C(2, 384000000)                    <- set clock id 2 to 384 MHz
+ROM 0x24C4(8)  and  0x24C4(9)               romclk_disable of two ids
+[0x400F7000 + 0xD8] &= ~2
+ROM 0x289C(3, 2)   0x289C(4, 1)   0x289C(5, 1)
+ROM 0x289C(6, 384000000 / 32000000 = 12)    <- dividers
+```
+
+### The PLL itself
+
+ROM `0x3A6C` is a dispatcher over clock ids 0..83; id 2 tail-calls **ROM
+0x1F6C**, which is three register accesses and no loops:
+
+```
+    ref = 24576000
+    mul = (freq == ref) ? 0x3126 : 0x000186C2
+
+    [0x40080010] = ([0x40080010] & 0xFC1F0000) | 0x3000 | (freq == ref ? 0x60 : 0x40)
+    [0x40080014] = ([0x40080014] & 0x00003800) | 0x80000000 | 0x400 | (mul << 14)
+```
+
+and its readback, ROM `0x1FB8`, says what those mean:
+
+```
+    frequency = ((([0x40080000] >> 8) & 0xFF) * 48 / ([0x40080000] & 0xF)) MHz
+```
+
+So **`0x40080000` bits [15:8] are a multiplier and bits [3:0] a divider, in
+units of 48 MHz**, and m = 8, d = 1 gives exactly the 384,000,000 the
+bootloader asks for. `0x40080010` and `0x40080014` are the PLL's own control
+and multiplier registers, the latter holding its value at bit 14 and up.
+
+**This corrects the README and §19.** The capability table says *"The clock and
+reset unit at 0x40080000 holds dividers and gates, not a PLL multiplier, and
+nothing in the dump establishes the crystal"*, and §19 read the vendor's clock
+init without finding one. Both are wrong: the PLL is at `+0x10`/`+0x14`, its
+rate is legible at `+0x00`, and the bootloader programs it to 384 MHz on every
+boot.
+
+**384 MHz is six times the measured 64 MHz CPU clock.** `[I]` and no more than
+that — the dividers this routine sets are for clock ids 3 to 6, and which of
+them feeds the core is not established here. But a measured 64,000,071 Hz
+against a PLL that this code sets to exactly 384,000,000 is not a coincidence,
+and it is the first explanation the F_CPU measurement has had.
+
+**And 24,576,000 is the audio clock.** §16 found the audio controller
+switching between 24.576 MHz and 22.579 MHz on a `rate % 8000` test. Here the
+generic PLL setter carries 24,576,000 as its one special case, with its own
+multiplier constant. The two findings are the same clock seen from opposite
+ends, which is worth knowing for whoever picks up the audio block: the
+frequency it wants is one the PLL knows how to make.
+
+### Still open from this phase
+
+`0x0082A220` initialises a block at **`0x40091000`** — not in §7c's map — from
+a struct whose first two words are 48,000,000 and 1,500,000. A 48 MHz clock
+and a 1.5 MHz something is the shape of a serial bus, and it runs in the
+bootloader's very first init phase, before the display or storage. Worth a
+look.

@@ -64,12 +64,24 @@ so it is worth being precise about which parts are real:
 
 Two honest caveats worth reading before you trust output:
 
-**The CPU clock is measured, not documented: 64 MHz.** `F_CPU` now defaults to
+**The CPU clock is measured, not documented: 64 MHz — and now partly
+explained.** [V] 2026-08-14, §25: the bootloader's first init phase programs a
+PLL to exactly **384,000,000 Hz**, which is six times the measured figure. The
+PLL is at CRU `+0x10`/`+0x14` and its rate reads back at `+0x00` as
+`(m × 48 / d)` MHz — so the sentence below about the CRU holding "no PLL
+multiplier" was wrong, though which divider feeds the core is still not
+established.
+
+**The measurement itself:** `F_CPU` now defaults to
 64,000,000 because that is what one P20 Player was measured at — 64,000,071 Hz
-with a bracket of ±0.06% containing exactly one whole MHz. The clock and reset
-unit at `0x40080000` holds dividers and gates, not a PLL multiplier, and
-nothing in the dump establishes the crystal, so this comes from timing the
-device against the host rather than from a register.
+with a bracket of ±0.06% containing exactly one whole MHz. ~~The clock and
+reset unit at `0x40080000` holds dividers and gates, not a PLL multiplier, and
+nothing in the dump establishes the crystal~~ — **retracted (§25)**: it holds
+both. The PLL is at `+0x10`/`+0x14`, its rate reads back at `+0x00` as
+`(m × 48 / d)` MHz, and the bootloader's first init phase programs it to
+exactly 384,000,000 Hz — six times the measured figure. The 64 MHz still comes
+from timing the device against the host rather than from a register, because
+which divider reaches the core is not decoded yet.
 
 If you are bringing up a different unit, re-measure rather than assume — it is
 a single scale factor, and one measurement fixes every `delay()` and
