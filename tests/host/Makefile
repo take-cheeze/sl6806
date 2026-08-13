@@ -10,7 +10,8 @@ VARIANT := ../../variants/p20_player
 CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
-TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm
+TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
+         test_regfile
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -31,6 +32,9 @@ run-test_adc: test_adc
 	./$<
 
 run-test_pwm: test_pwm
+	./$<
+
+run-test_regfile: test_regfile
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -61,6 +65,14 @@ test_adc: test_adc.c $(CORE)/sl6806_adc.c $(CORE)/sl6806_module.c
 # write order. Guards the pair-register clock enable above all - nothing in the
 # vendor's firmware writes it, so it looks removable and is not.
 test_pwm: test_pwm.c $(CORE)/sl6806_pwm.c $(CORE)/sl6806_module.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
+
+# The indexed register file against a model of the mailbox and the chip on
+# the far side of it. This driver has never run on hardware, so what these
+# check is that the transcription performs the vendor's sequence - the
+# transfer order, the direction byte, the bounded poll, and the two voltage
+# scales, in both directions.
+test_regfile: test_regfile.c $(CORE)/sl6806_regfile.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:

@@ -307,7 +307,8 @@ seven plain outputs are the ones that matter for bring-up:
 Other groups worth naming: bank 1 pins 1-8 are the LCD's QSPI pads
 (function 2) with a matching teardown to function 15; **bank 4 is the camera**
 - its sixteen function-2 pads are the DVP bus, with 4/3 the sensor MCLK and
-4/12, 4/13 the TWI0 pins the sensor answers on (§7h); bank 3 pins 1-6 are
+4/12, 4/13 the TWI0 pins the sensor answers on (§7h); §7n names the other
+eleven pin by pin, out of the driver that muxes them; bank 3 pins 1-6 are
 function 11; bank 1 pins
 22-27, 30, 31 go through `gpio_config` and are the likely button group -
 these are the ids §7d recorded under the old, wrong 6-bit pin decode.
@@ -462,7 +463,17 @@ Table B's crop decodes cleanly and is what sizes the sensor:
 A centred 648x488 window (VGA plus the usual 8-pixel margin) inside an array
 that must therefore be **1280x720** - 320 + 648 + 312 and 120 + 488 + 112 both
 land exactly. So table A is 720p, table B is VGA, and "sc101" is a 1 MP part,
-which is what the name says. After the terminator the routine optionally
+which is what the name says. §7n's DVP block reads that same 1280x720 as its
+input size, from an entirely different driver - two independent confirmations
+of the array.
+
+**Both tables are extractable and now are.** `tools/sl6806-sensortab` walks
+them, resolves the `0xF0` paging and emits a C header; the crop decode above
+is reproduced by the tool from the bytes rather than transcribed, which is
+what checks it. `examples/CameraDemo` carries the result and replays it into
+the sensor after a successful chip id, at the writer's own 40 us pacing. A
+payload has to carry them: it runs from SRAM in bootloader mode with no XIP
+mapping, so it cannot read its own flash at `0x00C7DA51`. After the terminator the routine optionally
 writes `0x3221 = 0x06`, gated on a global at `0x008299CA` - a flip/mirror bit.
 
 **Pads and the power-up order** (`0x00D44B1C`):
@@ -794,6 +805,24 @@ the argument space is six values, and the same file is behind 140 other call
 sites - so whoever finds how `0x00804E44` reaches the hardware unlocks
 considerably more than MCLK.
 
+> **RETRACTED — the callee *is* in the flash image, and §7m disassembles it.**
+> The reasoning below is kept because its failure is instructive and because
+> two of its four searches are still valid. What it got wrong is one number:
+> it took the FIRM header's `0x00804C00` as the segment's *load* address when
+> that word is the *entry*. The segment opens with a 256-entry vector table,
+> `0x400` bytes, and the reset handler follows it — so the load address is
+> `0x00804800`, which is exactly what §13a says. Disassembled `0x400` lower,
+> `0x00804E44` is `push {r4, r5, r6, lr}` and the register file falls out in
+> nine instructions. `tools/sl6806-sram --check` scores the three candidate
+> bases against every SRAM address the XIP code calls: 10 prologues at
+> `0x00804800`, none at either neighbour.
+>
+> The general lesson is the expensive one. Every search below took "the code
+> is not at the offset I computed" as evidence about the *image* rather than
+> about the *offset*, and then five further searches inherited the premise
+> without re-deriving it. A negative that rests on one unverified constant is
+> only as strong as that constant.
+
 **SETTLED, NEGATIVE: the callee is not in the flash image.** The obvious next
 move is to disassemble `0x00804E44` itself, and it cannot be done from
 `dump.bin`:
@@ -816,7 +845,23 @@ The library is therefore not stored uncompressed in flash. The mask ROM was
 the obvious next place to look - it is where the pad controller turned out to
 be - and that hunt has now been run across all three binaries in the tree.
 
-### SETTLED, NEGATIVE: the SRAM library is in none of the three dumps
+### ~~SETTLED, NEGATIVE: the SRAM library is in none of the three dumps~~ — half right
+
+**Half of this stands and half of it is the same wrong premise.** What stands:
+many of the addresses `sl6806-ramcalls` reports really are four-byte veneers
+branching into the mask ROM, and §13's check #5 later confirmed it from the
+other side. What does not: the conclusion that therefore *no* static search
+could find *any* of them. `0x00804E44` and `0x00804EAC` are not veneers, they
+are ordinary functions, and the reason they read as noise below is the `0x400`
+offset error above — not the run-time-written-target argument, which is true
+of different addresses.
+
+Read the spacing evidence again with that in mind. `0x008051E8`, `0x008051EC`,
+`0x008051F0`, `0x008051F4` are 4 bytes apart and *are* veneers — `0x008051F4`
+disassembles as `b.w 0x93C`, straight into the ROM. `0x00804E44` and
+`0x00804EAC` are 104 bytes apart, which was never veneer spacing, and nothing
+here noticed that the argument did not apply to the two addresses the whole
+section was about.
 
 **And there is a structural reason, which is the useful part.** The addresses
 `sl6806-ramcalls` reports are **not function entry points**. Their spacing
@@ -1081,17 +1126,789 @@ are the only literals of that shape in the image.
 not a plain MMIO array.** What is left fits a computed base plus index, or a
 serial/indirect protocol - either of which is invisible to a pattern search.
 
-**But it is reachable, and cheaply, by one runtime read.** The veneers live in
-SRAM and are written at boot; the only code that is always resident to be
-written *into* them is the mask ROM. So `0x00804E44` almost certainly branches
-to a ROM address, and a single read of that veneer on a running system - four
-bytes, over SWD - decodes to the accessor, which then decodes to the base. That
-is the whole remaining problem: four bytes that cannot be read from a dump.
+~~**But it is reachable, and cheaply, by one runtime read.**~~ The plan was to
+read the veneer at `0x00804E44` off a running system over SWD, on the reasoning
+that its target is written at boot and only the mask ROM could write it. **No
+device was needed: `0x00804E44` is not a veneer and was in `dump.bin` all
+along.** §7m has it.
 
 **Still true, and independent of all this:** the camera's two enable writes at
-`0x00D44EA6` and `0x00D44F06` - registers `0x03` and `0x16` of the file,
-whatever its address - and the clock driver's use of `0x03` and `0x2C`. Those
-come from the drivers' own code. What remains unknown is where the file lives.
+`0x00D44EA6` and `0x00D44F06` - registers `0x03` and `0x16` of the file - and
+the clock driver's use of `0x03` and `0x2C`. Those come from the drivers' own
+code, and §7m confirms every one of them against the accessor.
+
+**One thing this section got right and did not know it.** "A ~130-entry
+byte-wide indexed file reached by index rather than by address is the shape of
+a PMU / analog register bank on a serial side-channel, not of an MMIO block."
+That is precisely what it is, and it was written while the search was still
+looking for an MMIO base.
+
+## 7m. FOUND: the indexed register file is a chip on a serial bus
+
+Everything in this section is from `dump.bin` alone. **None of it has been run
+on hardware.** It is the last piece §7l said the camera was missing, and it
+should be read as a decode awaiting a measurement, not as a result.
+
+### How it was missed for five searches
+
+One number. The FIRM header at `0x10010` carries `load = 0x00804C00`, and §7h
+used it as the segment's load address. It is the *entry*: the segment at file
+`0x10030` opens with a full 256-entry Cortex-M vector table — `0x400` bytes, 90
+non-zero entries, every one an odd Thumb pointer into the segment, into XIP
+flash or into the mask ROM — and the reset handler follows it. So the load
+address is `0x00804800`, which is what §13a says in the course of explaining
+something else entirely, and the two readings sat in this file contradicting
+each other without either being checked against the other.
+
+Disassembled `0x400` lower, `0x00804E44` is `push {r4, r5, r6, lr}`.
+
+`tools/sl6806-sram` now maps both regions and `--check` prints the
+discriminator. It is worth having because nothing PC-relative can tell the
+candidates apart — shift the base and code and literals shift together — so
+the test has to be an *absolute* reference. It collects every SRAM address the
+XIP image `BL`s to more than once and counts how many begin a function:
+
+```
+26 SRAM addresses below the blob are BLed to from XIP code more than once
+    load 0x00804400:   0 of  26
+    load 0x00804800:  10 of  26   <-
+    load 0x00804C00:   0 of  26
+```
+
+### The accessors
+
+`0x00804EAC` read and `0x00804E44` write, both in the first stage, both plain
+flash. Stripped of the mutex they take when the scheduler is up
+(`0x008066AC` / `0x008066D8`, guarded by a byte at `0x0082BDB8` — a payload has
+neither), they are one four-register mailbox at `0x400F7000`:
+
+| Offset | Role |
+|---|---|
+| `+0x104` | command: `[31]` start/busy, `[30]` set on every transfer, meaning unknown, `[15:8]` register index, `[7:0]` target address |
+| `+0x108` | byte to write |
+| `+0x10C` | byte read back, in `[7:0]` |
+| `+0x110` | status; the writer fails if `& 0xF000` |
+
+```
+write(idx, val):  [0x108] = val
+                  [0x104] = 0x40000060 | (idx << 8)
+                  [0x104] |= 0x80000000
+                  spin while [0x104] & 0x80000000
+                  return ([0x110] & 0xF000) ? 1 : 0
+
+read(idx):        [0x104] = 0x40000061 | (idx << 8)
+                  [0x104] |= 0x80000000
+                  spin while [0x104] & 0x80000000
+                  return [0x10C] & 0xFF
+```
+
+**`0x60` and `0x61`.** The low byte differs by exactly one between the two
+directions, which is an 8-bit I2C address and its R/W bit: **device `0x30`**.
+So the file is a separate chip on a bus this block masters — a PMIC, on the
+evidence below — and that is why §7l's vote over `0x4xxxxxxx` literals could
+not have hit it at any threshold. There was never an MMIO base to find.
+
+`0x400F7000` is filed in §7c as the SD/MMC and SPI flash host. Not a
+contradiction: this is one sub-block at `+0x100`, the same way §15b found
+module gates for ids 96–127 at `0x400F1000 +0x20`. That base is busier than
+§7c knew.
+
+### The "clock channels" are voltage rails
+
+§7h read `0x00CC769C` as `clk(channel, op, arg)` because the camera passes
+2800 and 2800 looks like kHz. Channel 6's setter at `0x00CC7536` decodes its
+argument as
+
+```
+1700..2450 mV  ->  (mv - 1700) / 50
+2650..3300 mV  ->  (mv - 2650) / 50 + 16
+```
+
+— 50 mV steps from 1.7 V to 3.3 V in a five-bit field, with a gap in the
+middle. That is an LDO and nothing else. **So the camera's `clk(6, 2, 2800)`
+is 2.8 V, the standard supply for a sensor of this class, and §7l's guess that
+this file "is exactly the kind that carries LDO enables" was right.**
+
+The whole dispatcher, `op` in `r1`:
+
+| op | Meaning |
+|---|---|
+| 0 | enable: `reg 0x2C |= 1 << (ch - 2)` |
+| 1 | disable: `reg 0x2C &= ~(1 << (ch - 2))` |
+| 2 | set voltage, per-channel register below |
+| 3 | read voltage back, inverting the same scale |
+
+| Channel | Voltage register | Scale |
+|---|---|---|
+| 2 | `0x0D` `[4:0]` | 1500 mV + n×100 |
+| 3 | `0x0E` `[3:0]` | 2650 mV + n×50 |
+| 4 | `0x03` bits 1/5/7 | a six-entry menu: 2700, 2800, 2900, 3000, 3200, 3300 |
+| 5 | `0x79` `[4:0]` | the split 50 mV scale |
+| **6** | **`0x7A` `[4:0]`** | **the split 50 mV scale — the camera's** |
+
+Channel 4 is the odd one: it re-asserts its voltage on enable, and brackets
+the change with bit 7 of `reg 0x1B`. Channel 4's menu lives in bits 1, 5 and 7
+of `reg 0x03` (the vendor masks with `0x5D`), which is the *same register* as
+the camera's field in bits `[4:3]` — two fields, one byte, each driver
+preserving the other's. Anything writing this file byte-wise rather than
+read-modify-write will break one of them.
+
+### So the camera's power-up is six writes
+
+Pads aside, `0x00D44B1C` plus the sensor driver's own two writes:
+
+```
+reg 0x2C  &= ~0x10                 rail 6 off
+                                   5 ms
+reg 0x7A   = (reg 0x7A & 0xE0) | 0x13     rail 6 to 2800 mV
+reg 0x2C  |= 0x10                  rail 6 on
+reg 0x03   = (reg 0x03 & 0xE7) | 0x08     camera field [4:3] = 01   (0x00D44EA6)
+reg 0x16  |= 0x80                  camera enable                    (0x00D44F06)
+```
+
+`0x13` is `(2800 - 2650) / 50 + 16 = 19`. Every mask is the vendor's own.
+
+**This is the answer the README's camera row predicted**: "what the vendor does
+and a payload does not is switch a rail". It is that rail, and it is now three
+writes away rather than behind an unknown address.
+
+### What is implemented, and what would confirm it
+
+`cores/sl6806/sl6806_regfile.h` and `.c` carry the mailbox, the five rails and
+`sl6806_camera_power_on()`. `examples/RegFileProbe` reads the file and decodes
+the rails without writing anything; `examples/CameraDemo` performs the six
+writes before it goes near the bus.
+
+The confirmation to look for, in order of how much it proves:
+
+1. **The rail voltages read back as recognisable supplies.** `RegFileProbe`
+   prints all five through the vendor's inverse scale. A wrong block cannot
+   fake 1.8 V and 3.3 V out of bytes that had no reason to produce them, and
+   this costs no writes at all. Do this one first.
+2. **The writes stick.** Every write in `CameraDemo` is verified by reading it
+   back. That is what turned §7l's wrong base into a clean negative instead of
+   a mystery, and it is the reason a failure here will be legible.
+3. **`0x68` answers.** Registers `0xF7` and `0xF8` reading `0xDA` and `0x4A` is
+   the sensor, and would settle the camera question that §7h opened.
+
+A fourth outcome is possible and worth naming in advance: the mailbox may be
+gated off in payload mode, in which case every transfer times out and none of
+the above means anything. `RegFileProbe`'s verdict says so explicitly rather
+than printing 131 dashes and leaving it to be inferred.
+
+### MEASURED, 2026-08-13 — the decode is right and the prediction was wrong
+
+`examples/RegFileProbe` on a P20 in payload mode: **131 of 131 registers read,
+zero timeouts.** The mailbox works from a payload.
+
+**The rails are what confirm it**, read back through the vendor's inverse
+scale:
+
+| Channel | Register | Reads |
+|---|---|---|
+| 2 | `0x0D` | **1800 mV**, on |
+| 3 | `0x0E` | **3300 mV**, on |
+| 4 | `0x03` = `0xAE` | on (menu) |
+| 5 | `0x79` = `0x19` | 3100 mV, on |
+| 6 | `0x7A` = `0x19` | 3100 mV, on |
+
+1.8 V and 3.3 V falling out of a five-bit field through a split 50 mV scale is
+not something a wrong block produces by accident. The registers hold still,
+too — eight samples of the eight busiest indices differ in one bit of `0x30`,
+once. §7l's free-running `0x2C` was a different peripheral entirely.
+
+**And the writes work.** `examples/CameraDemo` performed the rail sequence and
+every one read back: `0x2C` `0x1F`→`0x0F`→`0x1F`, `0x7A` `0x19`→`0x13`, rail 6
+reporting 2800 mV afterwards. This is the first time anything in this project
+has written the register file.
+
+**But the camera's bits were already set before any of it:**
+
+| | Expected after `power_on` | Found cold |
+|---|---|---|
+| `0x2C` rail enables | bit 4 | `0x1F` — **all five rails on** |
+| `0x03` `[4:3]` | `01` | `0xAE` → **already `01`** |
+| `0x16` bit 7 | set | `0x93` → **already set** |
+| `0x7A` voltage | `0x13` = 2800 mV | `0x19` = 3100 mV |
+
+So the sensor already had power and both enable bits in a device that had done
+nothing but run the boot ROM, and `0x68` was silent anyway. **That retires
+"the rail is why the camera does not answer"** — the README's own prediction,
+now falsified. Finding the register file is what made it falsifiable, which is
+the value of having found it whatever the camera turns out to need.
+
+One oddity worth recording: registers `0x70`–`0x76` read `05 1C 55 20 24 2E CB`,
+byte for byte what `0x06`–`0x0C` read. Seven consecutive registers mirrored at
+a `0x6A` offset is a shadow bank or a trim copy, and it will explain a
+confusing write one day. The full cold dump:
+
+```
+index  00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
+ 0x00  08 10 09 AE 21 00 05 1C 55 20 24 2E CB 63 6D 7C
+ 0x10  15 9B 5A 28 34 87 93 14 00 E5 03 41 23 6F 0F 60
+ 0x20  2F B9 00 00 44 FF 00 01 00 01 48 71 1F 00 00 00
+ 0x30  12 00 00 30 00 00 00 88 01 08 19 0A 1B 00 3F C0
+ 0x40  13 00 00 00 00 00 00 00 00 00 10 3D 00 07 00 00
+ 0x50  00 00 5A 00 DC DC 05 44 03 30 45 06 00 D6 01 00
+ 0x60  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+ 0x70  05 1C 55 20 24 2E CB 00 00 19 19 44 00 00 00 00
+ 0x80  03 70 0A
+```
+
+**And a warning that is not boilerplate.** Rails 2, 3, 4 and 5 go somewhere,
+and nothing in the dump says where. On a SoC that includes the core, the SRAM
+a payload executes from and the USB PHY the console rides on. Neither sketch
+touches anything but rail 6, and neither should any sweep — a rail hunt here
+is not the same kind of experiment as a gate-bit sweep, because there is no
+recovery from switching off the supply that is running the code doing the
+switching.
+
+## 7n. The camera front end — the pixel path is not undecoded any more
+
+From `dump.bin` alone, and **nothing here has been run on hardware.**
+
+Every earlier note in this file says the same thing about the camera's pixel
+path: the sensor is reachable but "pixels leave the sensor on a DVP/CSI
+parallel bus into hardware JPEG and H.264 encoders, and none of that is
+decoded — the firmware reaches the front end as a named channel resource, not
+as a register block." The named resource is real. It sits on an ordinary
+register block, and the block is findable in four hops from a log string.
+
+### The chain
+
+| | |
+|---|---|
+| `0x00C7D473` | the string `-bind_dvp_channel CSI_CHAN failed` |
+| `0x00D42834` | logs it, having called… |
+| `0x00D44740` | …which muxes eleven pads and calls… |
+| `0x00D98224` | …whose only MMIO literal is **`0x400E1000`** |
+
+That is the whole search. `sl6806-xref` does the first hop and the rest is
+reading. It was never hidden; nobody had followed the string.
+
+### Bank 4 is the camera port, all sixteen pins
+
+`0x00D44740` muxes eleven pads to alternate function 2 before it configures
+anything. With the four §7h already had, bank 4 is accounted for end to end:
+
+| Pins | Line | |
+|---|---|---|
+| 0, 1, 2 | DVP sync and clock — PCLK / HSYNC / VSYNC | [V] pads, [?] which is which |
+| 3 | MCLK out to the sensor | [V] §7h |
+| 4–11 | DVP data D0–D7 | [V] |
+| 12, 13 | TWI0 SDA / SCL | [V] §7h |
+| 14, 15 | sensor RESET and PWDN | [V] §7h |
+
+Sixteen pins, one bank, one peripheral. §7g already had "bank 4 is the
+camera", from a sweep that saw sixteen function-2 pads move together; what is
+new is **which pin is which**, from the driver rather than from a pattern, and
+the confirmation that the sweep's grouping was right. Eight consecutive data
+lines and three sync lines is what a DVP bus looks like, and the vendor muxes
+them in exactly that grouping.
+
+The firmware never names pins 0–2 individually, so which carries PCLK is open.
+A scope on a working stock firmware settles it in one capture: PCLK is the
+fast one.
+
+### The register block
+
+`0x00D9817C` is `dvp_configure(geometry *)` and every write is a `bfi` into a
+field, so the map is exact. Sizes are stored **minus one** and offsets as-is,
+consistently, across all six registers.
+
+| Offset | Field | |
+|---|---|---|
+| `+0x00` | `[11:8]` format (8), then bit 4 set, then bit 1 set | three separate stores, in that order |
+| `+0x04` | `[11:0]` width−1, `[27:16]` height−1 | the sensor array: 1280×720 |
+| `+0x08` | cleared, then bit 4 set | by the open routine |
+| `+0x10` | `[11:0]` crop x | |
+| `+0x14` | `[11:0]` crop y | |
+| `+0x18` | `[11:0]` crop width−1 | |
+| `+0x1C` | `[11:0]` crop height−1 | |
+| `+0x20` | `[11:0]` out width−1, `[27:16]` out height−1 | after the scaler |
+| `+0x24` | `[13:0]` (crop_w << 10)/out_w, `[29:16]` the same vertically | **there is a scaler** |
+| `+0x40` | width−1 / height−1 again, from `0x00D98160` | [?] which stage |
+
+The scaler is the part worth noticing. A 10-bit fractional step, so `0x400` is
+1:1 and larger downscales — which is how a 1280×720 sensor feeds a 240×296
+panel without software touching a pixel.
+
+The geometry struct the routine reads is recovered field for field in
+[`cores/sl6806/sl6806_dvp.h`](../cores/sl6806/sl6806_dvp.h).
+
+### And the wall, which is §15's wall
+
+`0x00D9A734` is `enable(id)`: `0x400E0000 |= 1 << id`, then 10 ms.
+`0x00D9A74C` disables. `0x00D9A768` is a reset pulse, and it uses a **second
+register, `0x400E0008`** — clear the bit, wait, set it. **The camera front end
+is id 6.**
+
+§15 recorded `0x400E0000` as dead from a payload and called it the same wall
+as the backlight's. It is. But that negative was reached when the register was
+known only as "the thing the application enables peripherals through" — no id,
+no second register, and no peripheral downstream to check the result against.
+All three of those now exist, so the experiment is no longer the unanswerable
+"does this register take writes" but:
+
+```
+read 0x400E1004                     remember it
+0x400E0000 |= (1 << 6), wait 10 ms
+write a size to 0x400E1004, read it back
+if it did not stick: pulse 0x400E0008 bit 6, try again
+restore
+```
+
+A block that holds a written size is enabled; one that does not is not. That
+is the read-back discipline from §7l, pointed at a register that has a
+downstream witness for the first time.
+
+### MEASURED, 2026-08-13 — the wall is down, and not where the firmware says
+
+`examples/DvpProbe` ran the four mechanisms in order on a P20:
+
+| | Result |
+|---|---|
+| as found | `0x400E0000` = 0, `0x400E0008` = 0, CRU `+0x118` = 0, the whole block reads zeros and drops writes |
+| CRU `+0x118` module clock | the write sticks (reads back `1`) — and changes nothing |
+| `0x400E0000` bit 6 | **the bit does not stick.** The register reads back 0 |
+| `0x400E0008` bit 6 | likewise |
+| **mask ROM module id 46** | **the block takes and holds writes** |
+
+So §15's negative on `0x400E0000` is *confirmed* — it is genuinely dead from a
+payload, and not for want of an id or a reset register. It is presumably how
+the vendor's supervisor reaches the same gates from code the boot ROM has not
+handed control away from. **The way in is a mask ROM module clock, id 46**,
+exactly as the ADC turned out to be id 84 (§15b).
+
+That is twice now that walking 0..127 and testing a downstream witness has
+succeeded where reading the firmware could not. The ids are in neither the
+ROM, the bootloader nor the application; the walk is the method.
+
+### MEASURED, second run — the whole clock tree comes up, and `0x68` stays mute
+
+The first bring-up enabled the block and its gate and produced an awake DVP
+with no MCLK, because gates are not clocks. `dvp_open`'s *first* call, at
+`0x00D98232`, is to `0x00D9A7FC`, and that is the clock:
+
+```
+0x00D9A7AC()                the request/ack walk
+0x40080008 = 0xC0000C04     a PLL
+poll until bit 28           lock
+0x40080008 |= 0x10000       release it to the tree
+0x4008011C = 0x31           media module clock, enabled, source 3
+```
+
+`0x00D9A7AC` walks ten request bits at `[9:0]` of `0x40000070`, each with an
+acknowledgement at `[25:16]`: set the request, spin for the ack.
+
+Measured with all of it applied:
+
+| | |
+|---|---|
+| `0x40000070` | `0x3FF03FF` cold — **all ten already granted**, nothing to ask for |
+| `0x40080008` | `0x801` cold → `0xD0010C04` after: **bit 28 set, it locks** |
+| `0x4008011C` | `0x31`, as written |
+| DVP block | `CTRL 0x812`, `INSIZE`/`OUTSIZE` `0x2CF04FF` — every write holds |
+| `0x68` | silent, under all eight pad/MCLK combinations |
+
+**`0x40080008` is a PLL, and it locks.** §7c and the README both say this unit
+has no PLL multiplier — "the clock and reset unit at `0x40080000` holds
+dividers and gates, not a PLL multiplier". There is a multiplier at `+0x08`
+with a lock bit at 28, programmed by the vendor at camera-open time on a
+running system. It is not the core's, but the negative was stated too broadly
+and the README's caveat under the measured `F_CPU` should be read with that in
+mind.
+
+So the state of the camera is now: rail on at 2.8 V, both sensor enable bits
+set, bus proven against the FM tuner in the same run, RESET and PWDN drivable,
+front end awake and configured, PLL locked, media and camera module clocks
+enabled, MCLK muxed — and the sensor does not ACK its address.
+
+**Every remaining hypothesis is about the sensor rather than the SoC**, and
+they cannot be told apart by asking `0x68` anything. The next experiment
+therefore stops using I2C: the DVP sync and data pads are the sensor's
+*outputs*, and a powered, clocked sensor drives PCLK whether or not anyone has
+configured it. `examples/CameraDemo` now samples those pads as plain inputs
+and sweeps MCLK's source and divider at CRU `+0x118` — the vendor's source 0
+came from a register it had just tested for zero, which is weaker evidence
+than it looked. Three outcomes, and they separate the hypotheses:
+
+| Reading | Means |
+|---|---|
+| something toggles | fitted, powered, clocked — the problem is I2C-side, a different search entirely |
+| static but pulled | fitted, no clock reaching it or held off |
+| nothing at all | consistent with no module fitted |
+
+### MEASURED, third run — and the reading that is not yet evidence
+
+The scope pass and the sixteen-way MCLK sweep both came back completely flat:
+all six sampled DVP lines at `0`, zero transitions, under every combination of
+source and divider at CRU `+0x118`, and `0x68` never ACKed. The PLL had also
+retained `0xD0010C04` across the power cycle — it reads back locked before
+anything is written, so the clock tree stays up.
+
+**That looks like an absent module and it does not yet establish one.** The
+vendor's pad words for these eleven pins end in `0x30`: drive 3, **pull
+selector 0**. Every pull sweep in this repository exercises selectors 4–15,
+because the ROM's pull table is twelve entries indexed from 4 (§7f), so
+selector 0 has never been characterised. If it is an internal pull-down, those
+pads read `0` whatever is or is not attached, and the flat reading is the pad's
+own doing rather than a fact about the board.
+
+The bus pads were not trusted this way — §7h swept their pulls and timed their
+charge decay before concluding they reach a fitted chip — and the DVP pads have
+to be asked the same two questions:
+
+| Test | If the line reaches a fitted device | If it reaches nothing |
+|---|---|---|
+| sweep pull selectors 4–15 | stays `0` — something off-chip holds it down | lifts on a pull-up |
+| drive high, release, time it | decays, there is a load | holds >10 ms, like RESET does |
+
+`examples/CameraDemo` now runs both on the sync and data lines before the bus
+attempts. Until that comes back, "no module fitted" and "module fitted but
+mute" are still both open, and the flat scope reading is not an argument for
+either.
+
+### CONFIRMED: the module is fitted and works — so this is a software gap
+
+The camera works under the stock firmware on the unit all of the above was
+measured on (2026-08-13). That closes the only remaining "is the hardware
+there" question and kills the second hypothesis outright: the sensor is
+fitted, powered and functional, and everything measured from a payload is a
+statement about what the payload is not doing.
+
+It also means the flat DVP lines are not evidence of an absent module. They
+are either the pad's own pull selector 0 (untested, see above) or a sensor
+receiving no clock.
+
+### The pattern this fits, and it is the backlight's
+
+§14a and §15: module id 68 makes the PWM's registers writable **and its
+counter still does not run**. Registers and function are two different enables
+on this chip, and a module id buys only the first.
+
+Read the camera the same way and it fits without strain. Module 46 bought the
+DVP its register file — which is why every geometry write holds and reads back
+— and a block whose registers answer but whose logic is unclocked would do
+exactly what was measured: accept `CTRL 0x812`, report it, and drive no MCLK.
+**The functional clock is what `0x400E0000` carries**, and that register will
+not hold a bit from a payload.
+
+So the camera and the backlight are one problem, as §15 suspected for
+different reasons, and the question is not "what enables the camera" but
+**"what gates `0x400E0000` itself"**.
+
+A register that will not hold a bit is usually not dead — it is a register in
+a block that is gated off. Nothing here has ever tested that, because every
+sweep has used `0x400E0000` as a *mechanism* and none has used it as a
+*witness*. `examples/DvpProbe` now does: the clock tree, then module 46, then
+a retry of the enable (the previous run tested it *before* 46 and never went
+back), then all 128 module ids with `0x400E0000`'s own writability as the
+test. If an id turns up, two peripherals come unstuck at once.
+
+### RESOLVED — `0x400E0000` is not dead, it is gated, and its gate is a module clock
+
+Measured 2026-08-13, and it is the answer to §15's wall:
+
+```
+cold                       0x400E0000 ignores writes, bit 6 will not stick
++ the clock tree           still no
++ sl6806_module_enable(46) DVP registers writable, as before
++ retry 0x400E0000         **bit 6 holds.**  0x400E0000 = 0x40
+```
+
+**So the order is the operation, again.** Registers first, function second:
+
+```
+sl6806_module_enable(46);      the module clock -> the peripheral's registers
+sl6806_periph_enable(6);       0x400E0000 -> the peripheral's logic
+sl6806_periph_reset(6);        0x400E0008, the vendor's pulse
+```
+
+The two ids are from different spaces — 46 and 6 for the same peripheral — and
+`0x400E0000` is itself gated, so writing it from a cold chip does nothing. That
+is what every previous sweep did, which is why §15 recorded the register as
+dead from a payload. It was never dead; nothing had ever been awake enough
+first to open it.
+
+This is the third time the same shape has caught this project out: §15b's
+shadow-then-gate-then-poll, §7l's read-back-or-it-did-not-happen, and now
+registers-before-function. A peripheral on this chip needs *two* enables from
+*two* register spaces in *one* order, and getting any of it wrong produces a
+block that reads plausible values and does nothing.
+
+**It should unstick the backlight too.** §14a's PWM has its registers through
+module id 68 and a counter that has never run — the same signature exactly.
+What is not known is which bit of `0x400E0000` is the PWM's; only the camera's
+id 6 is documented (`0x00D98236`). The other 31 have to be walked, with the
+PWM's counter as the witness.
+
+`sl6806_module.h` carries both calls and the whole rule.
+
+### The DVP pads, asked properly — and my flat reading was the pad, not the board
+
+Measured with the full bring-up in place, functional clock included:
+
+```
+sync pin 0..2, data pin 4, pin 11
+  pulls:  4:0 5:0 6:0 7:0 8:1 9:1 10:1 11:1 12:0 13:1 14:0 15:0   none:0
+  hold:   high held >10ms, low held >10ms
+```
+
+**They lift.** Selectors 8–11 and 13 take every one of them high, so the
+`0 0 0 0 0 0` the scope pass reported was pull selector 0 doing exactly what
+was suspected, and that reading is void. It measured the pad's own
+configuration, not the board.
+
+What it does say: all five behave *identically to RESET* — no external pull
+either way, and they hold charge for more than 10 ms. The bus pads, which
+reach the FM tuner, decay in 1–2 µs onto their pull-ups. So nothing is
+actively driving the DVP lines at the moment they were sampled.
+
+**That is weaker than it sounds, for one reason worth recording**: the pad
+tests run *before* the reset sequence, so the sensor may well be in reset
+while they happen. A sensor in reset drives nothing, and a trace to a sensor
+in reset is indistinguishable from a trace to nowhere. Re-running this after
+the reset release, with a pull-up selector rather than selector 0, is what
+would make it evidence.
+
+### State of the camera after the functional clock
+
+Rail on at 2.8 V, both sensor enable bits set, bus proven against the FM
+tuner in the same run, RESET and PWDN drivable, PLL locked, media clock,
+camera module clock, module id 46, **and `0x400E0000` bit 6 with the reset
+pulse** — full geometry accepted and read back. The sensor still does not ACK
+and the DVP lines still do not move.
+
+So every register either vendor routine writes has been written, and the
+front end still produces no sensor clock. The next question is whether the
+block has registers *neither* routine touches: `configure` and `open` between
+them write ten offsets, and a front end that generates MCLK has a divider for
+it somewhere. `examples/DvpProbe` now maps the whole block, `+0x00`–`+0xFC`,
+by writing ones and reading back — anything writable outside those ten is
+where the missing control would live.
+
+### RESOLVED by mapping: where the frames go
+
+Writing ones into every word of the live block and reading back what stuck
+(2026-08-13) found four registers **neither vendor routine touches**:
+
+| Offset | Cold | Writable bits |
+|---|---|---|
+| `+0x30` | `0` | `0x0000000B` — bits 0, 1, 3 |
+| `+0x34` | `0` | `0x00FFFFFF` — 24 bits |
+| `+0x38` | **`0x00800000`** | `0x000FFFFC` — bits [19:2] |
+| `+0x3C` | `0` | `0x000FFFFF` — 20 bits |
+
+**`+0x38` is a buffer pointer into SRAM.** Its resting value is the SRAM base,
+and the bits that take writes are exactly [19:2] — a 1 MB span at 4-byte
+alignment, with the `0x008` on top fixed. A register that rests at the base of
+the only RAM on the chip and can be moved anywhere inside 1 MB but not outside
+it is a DMA destination and very little else. `+0x3C`'s twenty bits fit a
+length over the same span, `+0x34`'s twenty-four a second address or a byte
+count, `+0x30`'s three bits the control that starts it.
+
+That is the question this section opened with, answered — by mapping a live
+block rather than by reading code, which is worth noting because the code that
+writes these registers is presumably in the encoder path nobody has located.
+
+**The block is `0x80` bytes and aliases.** `+0x80`–`+0xC0` read back exactly
+what `+0x00`–`+0x40` hold, including values this framework had just written, so
+the upper half is the same registers decoded twice, not a second channel. The
+map's "18 words outside the vendor's ten" is really four new registers and
+fourteen aliases.
+
+**And nothing in it looks like a clock divider.** Those four are an output
+path, not an input one. So MCLK is owned by something outside this block, or
+it only runs once the block is streaming — and the sensor cannot stream
+without it, which would be a chicken-and-egg the vendor must break somewhere
+that has not been read yet.
+
+### The sensor's outputs are high-impedance — the first reading here that discriminates
+
+Sampled against the vendor's own pull-up (selector 8), with the whole bring-up
+in place and after the reset sequence: **all six lines read 1 and never move**,
+under all sixteen MCLK settings.
+
+Both earlier versions of this measurement were void — the first left the pads
+on selector 0 and read the pad rather than the board. This one is not. A line
+held at 1 by a pull-up is a line nothing is driving, so:
+
+| | |
+|---|---|
+| the module is fitted | the stock camera app works on this unit |
+| the rail is on | 2.8 V, read back through the vendor's scale |
+| the sensor's outputs are Hi-Z | measured, against a pull-up |
+
+A powered CMOS output is normally driving something. One that is
+high-impedance is in power-down, or has its output drivers gated behind an
+internal clock it has not got. Given the rail is on and both enable bits are
+set, the clock is the remaining explanation — which is where this has pointed
+since the LDO decode retired the power hypothesis.
+
+### Two candidates left, both cheap
+
+**The divider is four bits and only four values have been tried.** CRU
+`+0x118` carries `[11:8]` as a divider — sixteen values — and every sweep so
+far covered 0–3, which is the *source* field's range. Divider 0 may mean
+stopped. It is what the vendor passes, but that argument comes out of a
+variable the vendor had just tested for zero, and reading a guard's tested
+value as a meaningful argument is the same mistake that produced "2800 kHz"
+and "source 0". Sixteen dividers × four sources is sixty-four tries.
+
+**MCLK may only run while the block is capturing.** The four registers the map
+found are an output path, and nothing has ever told the block to start. If the
+sensor clock is gated on the capture engine running, then configuring geometry
+and walking away is exactly how to get a silent sensor. `examples/DvpProbe`
+now points `+0x38` at a buffer in its own BSS, sets both length registers, and
+tries each of `+0x30`'s three writable bits and all of them together.
+
+Both are judged by the same witness: do the sensor's output pins move.
+
+### NEGATIVE on both candidates — and then the ROM gave up a second clock family
+
+Sixty-four source/divider combinations at CRU `+0x118` and all four writable
+values of `+0x30` with the DMA pointed at a real buffer: **every DVP line
+static at 1 throughout.** `+0x38` read back `0x00829D10`, the exact address
+written, which does confirm the DMA-pointer decode even though it changed
+nothing.
+
+Going back to the ROM settled what the vendor's own routine does:
+
+| | |
+|---|---|
+| ROM `0x1E54` | `module_clock_is_enabled(id)` — reads shadow *and* gate, returns whether both are set. A query |
+| ROM `0x1EC0` | `b.w 0x1C5C` — an alias of `module_clock_enable` |
+| ROM `0x1EC4` | `b.w 0x1CE8` — an alias of the disable |
+| ROM `0x99E` | `set_level(id, val)` is `val != 0 ? 1 : 0`, so the vendor's `gpio_write(id, 0x40)` really is **high** — the RESET/PWDN polarity question is closed |
+
+So `0x00D9A7FC` is exactly `if (!enabled(46)) { domains; PLL; enable(46);
+media clock; }`, which is what this framework already does. The front-end path
+was fully replicated and it is not enough.
+
+### The half nobody had read: `sensor_init`
+
+The camera bring-up is in two halves. `bind_dvp_channel` sets up the front
+end, and this project had read only that. **`sensor_init` at `0x00D44CBC`
+enables two more clocks before it touches the bus:**
+
+```
+0x00D44CD2   module_clock_enable(80)     via ROM 0x1EC0
+0x00D44CD8   rom_clock_enable(58)        via SRAM veneer 0x008051EC
+             then TWI0 pads, twi_init(0, 100k), power_on, chip id
+```
+
+**ROM `0x20EC` is a second clock family.** The veneer at `0x008051EC` branches
+to it, and it is an 85-entry `tbh` table where each id maps to one CRU
+register and one bit:
+
+```
+id 58  ->  0x400800C0 |= 1
+id 59  ->  0x400800C4 |= 1        (and +0xC8, +0x104 nearby, same shape)
+```
+
+CRU `+0xC0` has never been written by anything in this repository, and neither
+has module id 80. Together they are the only things the vendor does for the
+camera that a payload has not — after the rail, the register clock, the
+functional clock, the PLL, the media clock, the camera module clock and the
+full geometry all came up correctly and the sensor stayed mute with its
+outputs in high impedance.
+
+**This also means the module-gate space is not the whole clock tree.** §15b
+established four gate/shadow register pairs and 128 ids; ROM `0x20EC` is a
+separate 85-id family on top of that, and no sweep in this repository has
+touched any of it. That is worth more than the camera: every peripheral
+previously written off as ungateable should be re-tested against it.
+
+### The whole second family, extracted
+
+`tools/sl6806-romclocks` pulls the table out of `maskrom.bin` and emits
+[`cores/sl6806/sl6806_romclk.h`](../cores/sl6806/sl6806_romclk.h). Every
+implemented arm is the same five instructions — load a base, load an offset,
+OR one immediate, store, return — so the extraction is exact rather than
+heuristic. **56 of the 85 ids are implemented**; the other 29 branch to the
+default arm at `0x24BE`.
+
+| Ids | Reach |
+|---|---|
+| 17–58, 61–75 | CRU `+0x80`–`+0x120`, bit 0 each — a per-peripheral clock enable window **this project had never written a byte of** |
+| 0, 2, 8, 9, 41, 42, 53 | CRU `+0x30`, various bits |
+| 71 | CRU `+0x1C` bit 16 |
+| 60, 77–84 | `0x400F1000` `+0x00`–`+0x5C` |
+
+Only two are attributed. **58** is the camera sensor's, from `sensor_init`.
+**73** sets CRU `+0x118`, which `0x00D44688` also programs as the camera's
+module clock — so the two families overlap, and a register reachable one way
+is reachable the other.
+
+That overlap is the useful part for anyone else: §15a read `+0x100`–`+0x13C`
+as module clocks with source and divider fields, and ids 52, 54, 61, 63, 66,
+72–75 set bit 0 of exactly those registers. The two decodes agree, which is
+the first independent check either has had.
+
+**MEASURED: enabling id 58 and module 80 changes nothing.** CRU `+0xC0` reads
+back `0x1`, the module gate acknowledges, and the sensor stays mute with its
+outputs in Hi-Z. So the vendor's own two halves are now both fully
+replicated. `examples/CameraDemo` sweeps the remaining 55 one at a time,
+pinging `0x68` after each — the enables accumulate, so an ACK bisects rather
+than isolates, which is the cheap version of the right experiment.
+
+### COMPLETE NEGATIVE — every clock mechanism applied, sensor still mute
+
+All 56 ROM clock enables written one at a time with a ping after each: **no
+ACK, and the device survived all of them.** With that, the state of the camera
+from a payload is:
+
+| | Measured |
+|---|---|
+| the bus | an FM tuner on those two pads returns its own driver's chip id, same run |
+| the rail | 2.8 V, read back through the vendor's inverse scale — and already on cold |
+| the sensor's enable bits | `0x03[4:3]` and `0x16` bit 7, also already set cold |
+| the pads | both control lines drive; both bus lines pull |
+| the module | fitted — the stock camera app works on this unit |
+| the DVP | register clock, functional clock, PLL locked, media clock, geometry accepted and read back |
+| the camera module clock | all 64 source × divider settings |
+| the ROM's second family | all 56 enables |
+| the sensor's outputs | **1 against a pull-up — high impedance, not driving** |
+
+A fitted, powered sensor whose outputs are Hi-Z is one that has never started.
+And every mechanism this chip is known to have has now been applied to it.
+
+**So this is a complete negative, not a missing experiment.** The difference
+between a payload and the working stock firmware is no longer expressible in
+any register anyone has found — which means more probing of the same kind has
+nothing left to vary.
+
+### Where that leaves it
+
+Two honest options, and they are of very different sizes.
+
+**Observe the working configuration.** The only thing that would settle this
+in one step is reading the CRU, `0x400E0000` and the DVP block *while the
+stock camera app is running*, and comparing. §7d.1 records that `read_mem` is
+refused in card-reader mode, so this needs SWD — the same conclusion §7l
+reached about the register file, for the same reason, and that one turned out
+to be answerable from the dump instead. This one may not be.
+
+**Run it in the application's context.** `MODE=firmware` puts the same code
+where the vendor's runs, which is the one variable that has never been
+changed. It is also the only mode in this project that can leave a device that
+does not boot, and the camera is not worth that to most people.
+
+Everything else about the camera is done: the sensor is decoded register for
+register, its init tables are extracted and replayable, its rail is
+controllable, its front end is mapped and can be enabled and configured, and
+where its frames would land is known. What is missing is one clock that
+nothing in three binaries explains.
+
+### Still missing for an image
+
+~~**Where the frames go.**~~ Answered. What remains is MCLK, and it is not in
+any register file this project can reach. Configure and open set geometry and enables and never
+touch a destination address. So the output is either programmed elsewhere —
+the encoders, or the DMA at `0x40070000` whose command-list format §12b
+decodes — or consumed by the JPEG/H.264 blocks directly. That is the next
+question and it is a different one.
 
 ## 7k. PSMP — the settings partition, decoded
 

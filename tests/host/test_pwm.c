@@ -27,6 +27,10 @@
 
 #include "sl6806_pwm.h"
 
+/* sl6806_module.c's functional-clock helpers wait the vendor's 10 ms.
+ * Nothing to wait for here, and the tests are about register order. */
+void delay(uint32_t ms) { (void)ms; }
+
 static int failures, checks;
 
 #define CHECK(cond, what) do {                                          \

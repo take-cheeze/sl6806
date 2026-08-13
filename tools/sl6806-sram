@@ -21,6 +21,26 @@ descriptor all disassemble out of dump.bin - no device, no RAM dump. The
 addresses in the notes' "RAM-resident code" table are the addresses this
 resolves.
 
+TWO REGIONS, NOT ONE. The boot ROM loads a first stage straight from the FIRM
+header, and that stage then pulls the blob above. Both are in flash and both
+are mapped here:
+
+    first stage   file 0x010030 .. 0x015892  ->  SRAM 0x00804800 .. 0x0080A062
+    the blob      file 0x03B430 .. 0x052EF4  ->  SRAM 0x00805C00 .. 0x0081D6C4
+
+They overlap, and the blob is loaded second, so an address in the overlap is
+resolved as blob. Addresses below 0x00805C00 - which is where the indexed
+register file's two accessors live - exist only in the first stage.
+
+THE FIRST STAGE'S LOAD ADDRESS IS NOT THE HEADER'S WORD. 7h read the FIRM
+header's 0x00804C00 as the load address, disassembled 0x00804E44 at the
+implied offset, found floating-point DSP and concluded the SRAM library was
+not in the image. 0x00804C00 is the *entry*. The segment begins with a full
+256-entry Cortex-M vector table - 0x400 bytes, 253 of whose entries are odd
+Thumb pointers into the segment and three into the mask ROM - and the reset
+handler follows it, so the load address is 0x400 lower. Disassembled there,
+the accessors are ordinary prologues. --check prints the evidence.
+
 WHAT IT IS NOT. The blob is loaded, not executed in place, so a flash address
 printed here is where the bytes are stored, not where anything branches to.
 Cross-references between the blob and XIP code go through absolute pointers
@@ -38,6 +58,102 @@ FLASH_BASE = 0x00C00000
 FIRM_OFF = 0x010000
 FIRM_HDR = 0x30
 SRAM_LO, SRAM_HI = 0x00800000, 0x00900000
+ROM_HI = 0x00010000          # the mask ROM, where three vectors point
+VECTORS = 256                # 16 system + 240 external, 0x400 bytes
+
+
+def find_stage1(fw):
+    """The segment the boot ROM loads: (src_file_off, load, size).
+
+    The header at FIRM_OFF+0x10 gives entry and length; the load address is
+    derived, not read, because the header does not carry one. The segment
+    opens with the vector table, the reset vector points at the first
+    instruction after it, and a Cortex-M table with 240 external interrupts is
+    0x400 bytes - so load = entry - 0x400. vector_score() is what checks that
+    reading rather than assuming it.
+    """
+    entry, _hdrlen, seglen = struct.unpack_from('<3I', fw, FIRM_OFF + 0x14)
+    entry &= ~1
+    src = FIRM_OFF + FIRM_HDR
+    load = entry - VECTORS * 4
+    if not (SRAM_LO <= load < entry < SRAM_HI) or not (0 < seglen < len(fw)):
+        return None
+    return src, load, seglen
+
+
+def vector_score(fw, src, load, size):
+    """Count how many of the 256 words at src look like exception vectors.
+
+    This establishes that the table is there and how long it is - which is
+    where the 0x400 in find_stage1 comes from. It does not discriminate
+    between candidate load addresses; nothing base-relative can, because
+    shifting the base shifts code and literals together. prologue_score is
+    the test that does.
+
+    A vector is zero (unused), or an odd Thumb pointer into the segment, into
+    XIP flash, or into the mask ROM - SVC, SysTick and one IRQ are the ROM's
+    on this chip. Anything else counts against the reading.
+    """
+    ok = bad = 0
+    for i in range(1, VECTORS):
+        (v,) = struct.unpack_from('<I', fw, src + 4 * i)
+        if v == 0:
+            continue
+        if v & 1 and (load <= v < load + size
+                      or FLASH_BASE <= v < FLASH_BASE + len(fw)
+                      or v < ROM_HI):
+            ok += 1
+        else:
+            bad += 1
+    return ok, bad
+
+
+def xip_calls_into(fw, lo, hi):
+    """Every SRAM address in [lo, hi) that XIP code BLs to.
+
+    Scans for the 32-bit BL encoding at each halfword boundary. Data that
+    happens to decode as a BL contributes noise, but a real entry point is
+    called from many sites and noise is not, so the counts below survive it.
+    Nothing here depends on the load address: a BL is PC-relative and the
+    caller is in flash, executed where it is stored.
+    """
+    hits = {}
+    for off in range(0, len(fw) - 4, 2):
+        hw1, hw2 = struct.unpack_from('<2H', fw, off)
+        if (hw1 & 0xF800) != 0xF000 or (hw2 & 0xD000) != 0xD000:
+            continue
+        s = (hw1 >> 10) & 1
+        i1 = 1 - (((hw2 >> 13) & 1) ^ s)
+        i2 = 1 - (((hw2 >> 11) & 1) ^ s)
+        imm = (i1 << 23) | (i2 << 22) | ((hw1 & 0x3FF) << 12) | ((hw2 & 0x7FF) << 1)
+        if s:
+            imm -= 1 << 24
+        target = FLASH_BASE + off + 4 + imm
+        if lo <= target < hi:
+            hits[target] = hits.get(target, 0) + 1
+    return hits
+
+
+def prologue_score(fw, src, load, size, targets):
+    """How many of `targets` land on something a function can start with.
+
+    This is the test that picks the load address out of its neighbours, and
+    it is the one 7h ran over the whole image instead of over the three
+    candidates that the header allows.
+    """
+    ok = 0
+    for a in targets:
+        if not (load <= a < load + size - 4):
+            continue
+        (hw1,) = struct.unpack_from('<H', fw, src + (a - load))
+        (hw2,) = struct.unpack_from('<H', fw, src + (a - load) + 2)
+        if 0xB400 <= hw1 <= 0xB5FF:                   # push
+            ok += 1
+        elif hw1 == 0xE92D:                           # stmdb sp!, {...}
+            ok += 1
+        elif (hw1 & 0xF800) == 0xF000 and (hw2 & 0xD000) == 0x9000:
+            ok += 1                                   # b.w - a veneer
+    return ok
 
 
 def find_loader(fw):
@@ -71,6 +187,8 @@ def main():
     ap.add_argument('--dis', type=int, metavar='N',
                     help='disassemble N bytes at addr, labelled with SRAM addresses')
     ap.add_argument('--extract', metavar='FILE', help='write the blob out')
+    ap.add_argument('--check', action='store_true',
+                    help="show the evidence for the first stage's load address")
     args = ap.parse_args()
 
     fw = open(args.dump, 'rb').read()
@@ -93,6 +211,39 @@ def main():
     nz = fw[src] != 0 or fw[src + 1] != 0
     print(f'  first source byte non-zero: {"yes" if nz else "NO - suspicious"}')
 
+    stage1 = find_stage1(fw)
+    if stage1:
+        s_src, s_load, s_size = stage1
+        print()
+        print(f'first stage from the FIRM header')
+        print(f'  reads flash file 0x{s_src:06X} .. 0x{s_src + s_size:06X}'
+              f'  (0x{s_size:X} bytes)')
+        print(f'  into SRAM       0x{s_load:08X} .. 0x{s_load + s_size:08X}')
+        print(f'  sram addr  = file offset + 0x{s_load - s_src:X}')
+        good, bad = vector_score(fw, s_src, s_load, s_size)
+        print(f'  vector table: {good} plausible, {bad} not')
+        if args.check:
+            # Only the part of the stage the blob does not overwrite is worth
+            # scoring: above 0x00805C00 the bytes in flash are the stage's,
+            # but the bytes at run time are the blob's.
+            calls = xip_calls_into(fw, s_load - 0x800, dst)
+            calls = {a: n for a, n in calls.items() if n >= 2}
+            print()
+            print(f'  {len(calls)} SRAM addresses below the blob are BLed to from XIP')
+            print('  code more than once. How many start a function, per candidate:')
+            for cand in (s_load - 0x400, s_load, s_load + 0x400):
+                n = prologue_score(fw, s_src, cand, s_size, calls)
+                inrange = sum(1 for a in calls if cand <= a < cand + s_size - 4)
+                mark = ' <-' if cand == s_load else ''
+                print(f'    load 0x{cand:08X}: {n:3d} of {inrange:3d}{mark}')
+            print()
+            print('  three vectors point into the mask ROM rather than into the')
+            print('  segment - SVC, SysTick and one IRQ:')
+            for i in range(1, VECTORS):
+                (v,) = struct.unpack_from('<I', fw, s_src + 4 * i)
+                if v and v & 1 and v < ROM_HI:
+                    print(f'    vector {i:3d}  ->  ROM 0x{v & ~1:06X}')
+
     if args.extract:
         with open(args.extract, 'wb') as f:
             f.write(fw[src:src + size])
@@ -101,12 +252,25 @@ def main():
 
     if args.addr:
         a = int(args.addr, 0)
-        if not (dst <= a < end):
+        region = 'the blob'
+        if a < dst and stage1:
+            # Below the blob's destination, so only the first stage can hold
+            # it. Inside the blob's range the blob wins: it is loaded second
+            # and overwrites the tail of the first stage.
+            s_src, s_load, s_size = stage1
+            if not (s_load <= a < s_load + s_size):
+                sys.exit(f'error: 0x{a:08X} is in neither region '
+                         f'(first stage 0x{s_load:08X}..0x{s_load + s_size:08X}, '
+                         f'blob 0x{dst:08X}..0x{end:08X})')
+            adj = s_load - s_src
+            region = 'the first stage'
+        elif not (dst <= a < end):
             sys.exit(f'error: 0x{a:08X} is outside the loaded blob '
                      f'(0x{dst:08X}..0x{end:08X})')
         off = a - adj
         print()
-        print(f'SRAM 0x{a:08X}  ->  file 0x{off:06X}  ->  flash 0x{off + FLASH_BASE:08X}')
+        print(f'SRAM 0x{a:08X}  ->  file 0x{off:06X}  ->  flash 0x{off + FLASH_BASE:08X}'
+              f'   [{region}]')
         if args.dis:
             print()
             sys.stdout.flush()

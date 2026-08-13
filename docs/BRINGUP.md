@@ -146,6 +146,65 @@ reasoning and its consequences for your own `loop()`.
 The console is bidirectional. Type into the monitor and the characters arrive
 at `Serial.read()`. `tools/sl6806-monitor --send TEXT` does it in one shot.
 
+## Step 4 — the highest-value thing on the bench right now
+
+```
+make SKETCH=examples/RegFileProbe RUN_MODE=poll run
+```
+
+The indexed register file was the single blocker on the camera and it was
+found in the dump, not on hardware — so it is a decode that nobody has ever
+watched run. It is a chip at I2C `0x30` behind a mailbox at `0x400F7000+0x100`
+(notes §7m), and this probe reads it without writing anything.
+
+What to look at, in order:
+
+1. **The verdict line.** "the mailbox never completed a transfer" means the
+   block is gated off in payload mode and everything else on this page about
+   the camera is moot until someone finds its module id. That is a useful
+   answer and it takes one run.
+2. **The five rail voltages.** The probe decodes them with the vendor's own
+   scale. If they come out at recognisable supplies — 1.8, 2.8, 3.3 — the
+   decode is right, and that is a stronger confirmation than any amount of
+   "the registers look live", because a wrong block cannot produce those
+   numbers by accident.
+3. **Whether the registers hold still.** A file that changes on every read is
+   not a register file. This exact mistake — one sample of a free-running
+   register taken as confirmation — is what put the wrong address in these
+   notes for a week (§7l).
+
+If that looks right, `make SKETCH=examples/CameraDemo RUN_MODE=poll run` will
+switch the sensor's 2.8 V rail on and go looking for it at `0x68`. Every write
+it makes is read back and printed, so a rail that does not take is reported
+rather than assumed. If the chip id does answer, the sketch goes on to replay
+the vendor's own 203-pair init table into the sensor and then re-reads the
+chip id, so "the table went in" and "the sensor is still there afterwards"
+are reported as the two separate claims they are.
+
+That is as far as the sensor goes. The **DVP front end** behind it is mapped
+now too (§7n) and gated off, and `examples/DvpProbe` tries every mechanism
+this chip is known to have to open it:
+
+```
+make SKETCH=examples/DvpProbe RUN_MODE=poll run
+```
+
+It judges each attempt by whether the block's own size register then holds a
+written value, which is the only honest test — a gated block on this chip
+reads plausible values and silently drops writes, and that is exactly how the
+ADC was written off for four runs. It touches no rail and no sensor.
+
+A negative here is worth as much as a positive and should be reported the
+same way: it would mean the front end needs something neither the CRU nor the
+mask ROM provides. Either way, copy the "as found" register dump it prints
+first — those values have never been recorded.
+
+**Do not sweep the other rails.** Rails 2 to 5 are unidentified, and on a SoC
+that includes the core, the SRAM the payload runs from and the USB PHY the
+console rides on. There is no recovery-by-unplugging from switching off the
+supply that is running the code doing the switching — unlike everything else
+in this document.
+
 ## What cannot work yet
 
 Do not spend bench time on these; they are blocked on reverse engineering or
@@ -158,7 +217,7 @@ on an unexplained hardware result, not on your setup.
 | `shiftOut` / `shiftIn` / `pulseIn` | Built on the digital calls, so exactly as available as those are. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | No registers known. These report rather than silently doing nothing. |
 | Touch panel coordinates | The interrupt pad and reset have run on hardware; the CST816 register read that produces X/Y has not been confirmed there yet. See `examples/TouchDemo`. |
-| Camera | Fully decoded register-for-register, but blocked on the TWI 0 controller base — not something to bit-bang at 1 MP. |
+| Camera — an actual image | The sensor's bus, address, pads and now its supply rail are all reachable, and step 4 above is the test. What is *not* decoded is the DVP/CSI front end the pixels leave on: the firmware reaches it as a named channel resource, not as a register block. So finding the sensor is in reach; capturing a frame is not. |
 | `MODE=firmware` | Unproven, and the only thing here that can leave a non-booting device. Nothing in this document needs it. See [FLASHING.md](FLASHING.md). |
 
 ## Recovery

@@ -49,6 +49,28 @@
  * draws any conclusion about a silent 0x68. What is left for the camera is
  * MCLK and sensor power, neither of which is on this bus.
  *
+ * ===================================================================
+ *  AND NOW THE POWER IS REACHABLE TOO
+ * ===================================================================
+ * "Sensor power" was the open half of that, and it was open because the
+ * register file the vendor switches it through had no known address. It has
+ * one now, and it is not an address: the two accessors at SRAM 0x00804E44 and
+ * 0x00804EAC drive a mailbox at 0x400F7000+0x100 that carries an index and a
+ * byte to a chip at I2C 0x30. cores/sl6806/sl6806_regfile.h has the decode and
+ * the story of why five static searches missed it.
+ *
+ * Two things fall out, and the second is the one that matters here. The
+ * "clock channels" are LDO rails - the setter divides millivolts by 50 across
+ * 1700..3300 - so the camera's clk(6, 2, 2800) is 2.8 V, not 2800 kHz. And
+ * this sketch can now perform it: powerTheSensor() below writes rail 6 and the
+ * sensor's two enable bits before any of the bus work starts.
+ *
+ * SO THE HONEST STATE IS: every ingredient the vendor uses is now reachable
+ * from a payload, and none of it has been run on hardware. If 0x68 answers
+ * after this change, the rail was the answer all along. If it still does not,
+ * the register file's own read-back - printed - says whether the writes even
+ * landed, which is a different failure from a sensor that will not talk.
+ *
  * So the sketch measures rather than asking, in three stages:
  *
  * 1. THE LINES, before any transfer. Each bus pad is put on function 0 - the
@@ -103,6 +125,12 @@
 
 #include <Arduino.h>
 #include "sl6806_padctl.h"
+#include "sl6806_regfile.h"
+#include "sl6806_dvp.h"
+#include "sl6806_mmio.h"
+#include "sl6806_module.h"
+#include "sl6806_romclk.h"
+#include "sc101_init.h"
 
 /* ------------------------------------------------------------- the pads */
 
@@ -265,7 +293,10 @@ enum {
     STEP_RESET_HIGH,    /* release RESET after 5 ms                        */
     STEP_PWDN_HIGH,     /* release PWDN after another 5 ms                 */
     STEP_SETTLE,        /* the vendor's 20 ms before the chip-id read      */
+    STEP_DVP_PADS,      /* can the DVP lines be pulled, or is something
+                           holding them? - paced, one pad per call         */
     STEP_SCAN,          /* who ACKs, anywhere on the bus                   */
+    STEP_INIT,          /* replay the vendor's init table into the sensor  */
     STEP_TALK,          /* the sensor answered: keep reading it            */
     STEP_STUCK          /* nothing answered under any combination          */
 };
@@ -930,65 +961,76 @@ static void pullTimeReport(uint32_t id, const char *name)
  * ===================================================================
  *  THE ONLY WRITES IN THIS SKETCH THAT ARE NOT ON THE I2C BUS
  * ===================================================================
- * Four bytes into the indexed register file at 0x40040000 (§7l), which is
- * where the clock and camera drivers switch the sensor's clock and rail on.
- * Everything else in this sketch is read-only or drives a pad.
+ * Six bytes into the indexed register file, which is where the vendor's
+ * drivers switch the sensor's 2.8 V rail on. Everything else in this sketch
+ * is read-only or drives a pad.
+ *
+ * THE ADDRESS PROBLEM IS OVER, AND IT WAS NEVER AN ADDRESS. An earlier
+ * version of this block wrote bytes at 0x40040000, because that base had been
+ * identified as the register file and then retracted; all four writes were
+ * ignored on hardware. The file is not an MMIO window at all. The vendor's
+ * accessors drive a mailbox at 0x400F7000+0x100 that carries an index and a
+ * byte to a chip at I2C address 0x30, and cores/sl6806/sl6806_regfile.h has
+ * the whole decode. This sketch now goes through that.
+ *
+ * AND "CLOCK CHANNEL 6" IS A VOLTAGE RAIL. The other thing the decode
+ * changed: 0x00CC7334's argument of 2800 is not 2800 kHz, it is 2800 mV. The
+ * setter divides by 50 across 1700..3300, which is an LDO's scale and nothing
+ * else's. So the sensor's problem was never MCLK - it was that its supply was
+ * off, which is exactly what "the vendor shows a live preview and a payload
+ * gets nothing" predicted.
  *
  * Why this is safe enough to run, stated rather than assumed:
  *
- *   - Each one is a read-modify-write with the vendor's own mask, so only the
- *     bits the stock firmware touches are touched.
- *   - The base is confirmed against four registers whose meaning is known
- *     independently, read live in bootloader mode (§7l).
+ *   - Every write is a read-modify-write with the vendor's own mask, so only
+ *     the bits the stock firmware touches are touched.
+ *   - It only ever touches rail 6. Rails 2..5 go somewhere unknown, and
+ *     unknown on a SoC includes the core and the SRAM this code runs from.
  *   - Payload mode never writes flash, so the worst outcome is a device that
  *     stops responding until it is unplugged.
  *
- * DEFAULT OFF, BECAUSE THE BASE IS WRONG. This ran on hardware and all four
- * writes were ignored: 0x40040000 is not the register file, it is a live
- * peripheral - probably the USB controller - whose 0x2C free-runs (§7l). The
- * machinery is kept because it is correct in every part except the address,
- * and switching it back on is the experiment to run the day that address is
- * known. Read-back verification is what made the failure legible; keep it.
+ * DEFAULT ON. This is the whole point of the sketch now: the bus was proved
+ * with the FM tuner, the pads were swept, and the one thing never tried is
+ * giving the sensor power. Set it to 0 to get the old bus-only behaviour
+ * back.
  *
  * The register map, all of it from the vendor's own code:
  *
- *   0x03  bit 5      clock channel frequency selector, 2800 (§7h)
- *         bits [4:3] the camera's field, set to 01
- *   0x2C  bit 4      clock channel 6 running (bit = channel - 2)
+ *   0x2C  bit 4      rail 6 enabled (bit = channel - 2)
+ *   0x7A  bits [4:0] rail 6 voltage; 0x13 = 2800 mV
+ *   0x03  bits [4:3] the camera's field, set to 01
  *   0x16  bit 7      the camera's enable
  */
-#define CAMERA_POWER_WRITES 0
-
-#define REGFILE_BASE 0x40040000u
+#define CAMERA_POWER_WRITES 1
 
 #if CAMERA_POWER_WRITES
-
-static inline uint8_t regRead(unsigned idx)
-{
-    return *(volatile uint8_t *)(REGFILE_BASE + idx);
-}
-
-static inline void regWrite(unsigned idx, uint8_t v)
-{
-    *(volatile uint8_t *)(REGFILE_BASE + idx) = v;
-}
 
 /*
  * One read-modify-write, announced before it happens and verified after.
  * Announcing first means a device that dies mid-sequence names the register
  * that killed it; verifying after means a register that ignores the write is
- * reported rather than assumed to have taken it.
+ * reported rather than assumed to have taken it. That verification is what
+ * turned the 0x40040000 mistake into a clean negative instead of a mystery,
+ * so it stays even though the address is now right.
  */
-static void regSet(unsigned idx, uint8_t keep, uint8_t set, const char *what)
+static int regSet(unsigned idx, uint8_t keep, uint8_t set, const char *what)
 {
-    uint8_t before, want, after;
-
-    before = regRead(idx);
-    want   = (uint8_t)((before & keep) | set);
+    int before = sl6806_reg_read(idx);
+    uint8_t want;
+    int rc, after;
 
     Serial.print("  reg 0x");
     Serial.print(idx, HEX);
-    Serial.print(": 0x");
+    Serial.print(": ");
+
+    if (before < 0) {
+        Serial.println("read timed out - the mailbox never completed.");
+        return -1;
+    }
+
+    want = (uint8_t)(((unsigned)before & keep) | set);
+
+    Serial.print("0x");
     Serial.print(before, HEX);
     Serial.print(" -> 0x");
     Serial.print(want, HEX);
@@ -996,35 +1038,564 @@ static void regSet(unsigned idx, uint8_t keep, uint8_t set, const char *what)
     Serial.print(what);
     Serial.println(")");
 
-    regWrite(idx, want);
-    after = regRead(idx);
+    rc = sl6806_reg_write(idx, want);
+    if (rc) {
+        Serial.print("    write reported ");
+        Serial.println(rc < 0 ? "a timeout" : "an error in STAT");
+        return rc;
+    }
 
-    if (after != want) {
+    after = sl6806_reg_read(idx);
+    if (after != (int)want) {
         Serial.print("    reads back 0x");
         Serial.print(after, HEX);
         Serial.println(" - the write did not stick.");
+        return 1;
     }
+    return 0;
 }
 
 static void powerTheSensor(void)
 {
+    int mv;
+
     Serial.println();
-    Serial.println("powering the sensor through the register file at 0x40040000,");
-    Serial.println("with the vendor's own masks (notes 7l):");
+    Serial.println("powering the sensor through the register file - mailbox at");
+    Serial.println("0x400F7000+0x100, chip at I2C 0x30 (sl6806_regfile.h):");
 
-    /* Clock first, exactly as the vendor's power_on does: set the channel
-     * frequency, then start the channel. */
-    regSet(0x03, 0x5D, 0x20, "clock channel frequency 2800");
-    regSet(0x2C, 0xFF, 1u << (6 - 2), "start clock channel 6 - MCLK");
+    /* The rail, in the vendor's order at 0x00D44B1C: off, wait, set the
+     * voltage, on. Doing it as three announced writes rather than calling
+     * sl6806_camera_power_on() so that a failure names its register. */
+    regSet(SL6806_RF_LDO_ENABLE, (uint8_t)~(1u << (6 - 2)), 0x00,
+           "rail 6 off");
+    delay(5);
+    regSet(SL6806_RF_LDO6_MV, 0xE0, 0x13, "rail 6 to 2800 mV");
+    regSet(SL6806_RF_LDO_ENABLE, 0xFF, 1u << (6 - 2), "rail 6 on");
 
-    /* Then the camera's own two writes, from 0x00D44EA6 and 0x00D44F06. */
-    regSet(0x03, 0xE7, 0x08, "camera field [4:3] = 01");
-    regSet(0x16, 0xFF, 0x80, "camera enable");
+    /* Then the sensor driver's own two, from 0x00D44EA6 and 0x00D44F06. */
+    regSet(SL6806_RF_CAM_FIELD, SL6806_RF_CAM_FIELD_KEEP,
+           SL6806_RF_CAM_FIELD_SET, "camera field [4:3] = 01");
+    regSet(SL6806_RF_CAM_ENABLE, 0xFF, SL6806_RF_CAM_ENABLE_BIT,
+           "camera enable");
 
+    /* Read the rail back through the vendor's own inverse scale. A number
+     * near 2800 here is the strongest evidence available without a meter
+     * that the block is what it is claimed to be. */
+    mv = sl6806_ldo_get_mv(SL6806_LDO_CAMERA);
+    Serial.print("  rail 6 reads back as ");
+    if (mv < 0)
+        Serial.println("unreadable.");
+    else {
+        Serial.print(mv);
+        Serial.println(" mV.");
+    }
+
+    /* The sensor's own datasheet-scale start-up time is unknown; the vendor
+     * waits 20 ms after the last pad move before it talks to the chip, and
+     * this is the same order. */
+    delay(20);
     Serial.println();
 }
 
 #endif /* CAMERA_POWER_WRITES */
+
+/* ------------------------------------------------ waking the front end */
+
+/*
+ * ===================================================================
+ *  MCLK COMES FROM HERE, AND MODULE ID 46 IS WHAT SWITCHES IT ON
+ * ===================================================================
+ * [M] Measured on hardware 2026-08-13 by examples/DvpProbe. The DVP block at
+ * 0x400E1000 reads all-zero and ignores writes in a cold payload; the
+ * vendor's own three mechanisms do not change that - 0x400E0000 will not even
+ * hold its own bit - and then mask ROM module id 46, enabled the way
+ * sl6806_module_enable does it, makes the block take and hold writes. That is
+ * the wall notes 15 recorded as dead, and it is not.
+ *
+ * WHY THIS SKETCH CARES. The sensor's MCLK leaves on bank 4 pin 3 at
+ * alternate function 2 - the same function as the eleven DVP data and sync
+ * pads on the same bank - so the front end is what generates it. Everything
+ * else the sensor needs has now been measured to be present already: the rail
+ * is on, both enable bits are set, the bus is proven against the FM tuner,
+ * and both control lines can be driven. A hardware clock is the one thing the
+ * vendor supplies that this sketch never has.
+ *
+ * WHAT IT WRITES. The module clock at CRU +0x118 with the vendor's own source
+ * and divider (0 and 0, from 0x00D44688), module id 46, the eleven pads plus
+ * MCLK to function 2, and the geometry registers. No rail is touched.
+ */
+#define DVP_BRINGUP 1
+
+static bool dvp_awake;
+
+#if DVP_BRINGUP
+
+/* [V] The sensor's full array, from the bind path's literals at 0x00D447C4.
+ * Crop and output are set to the whole frame: this wants a clock, not a
+ * picture, and a 1:1 scaler is the configuration least likely to be
+ * rejected. */
+#define DVP_IN_W    1280
+#define DVP_IN_H    720
+#define DVP_SIZE_WORD  (((uint32_t)(DVP_IN_H - 1) << 16) | (DVP_IN_W - 1))
+
+static int scopeTheBus(void);   /* defined below, used by the bring-up */
+
+/* Bounded, because every one of these polls waits on hardware that may not
+ * be there. An unbounded spin in payload mode hangs inside the boot ROM's
+ * USB handler and takes the device off the bus with no log. */
+#define DVP_POLL_LIMIT  200000u
+
+/*
+ * [V] 0x00D9A7FC and 0x00D9A7AC - the clock the front end actually runs on.
+ *
+ * The 2026-08-13 run enabled the block and its gate and got a fully awake,
+ * fully configured DVP that produced no MCLK. This is what was missing: the
+ * request/ack handshake, a PLL, and the media module clock. See
+ * sl6806_dvp.h.
+ */
+static void dvpClockTree(void)
+{
+    unsigned b, n;
+    uint32_t v;
+
+    Serial.print("  request/ack 0x40000070 = 0x");
+    Serial.print(sl6806_mmio_read(SL6806_REQ_ACK), HEX);
+
+    for (b = 0; b < SL6806_REQ_ACK_COUNT; b++) {
+        uint32_t ack = 1u << (b + SL6806_REQ_ACK_SHIFT);
+
+        if (sl6806_mmio_read(SL6806_REQ_ACK) & ack)
+            continue;                       /* already granted */
+
+        sl6806_mmio_set(SL6806_REQ_ACK, 1u << b);
+        for (n = DVP_POLL_LIMIT; n; n--)
+            if (sl6806_mmio_read(SL6806_REQ_ACK) & ack)
+                break;
+        if (!n) {
+            Serial.print(" - domain ");
+            Serial.print(b);
+            Serial.print(" never acknowledged");
+            break;
+        }
+    }
+    Serial.print(" -> 0x");
+    Serial.println(sl6806_mmio_read(SL6806_REQ_ACK), HEX);
+
+    /* The PLL. Announced before it is written, because this is the one write
+     * in the sketch that could plausibly disturb a clock something else is
+     * using - the vendor does it on a running system, which is the reason to
+     * think it will not. */
+    v = sl6806_mmio_read(SL6806_CRU_PLL);
+    Serial.print("  PLL 0x40080008 = 0x");
+    Serial.print(v, HEX);
+    Serial.print(" -> writing 0x");
+    Serial.println(SL6806_CRU_PLL_VALUE, HEX);
+
+    sl6806_mmio_write(SL6806_CRU_PLL, SL6806_CRU_PLL_VALUE);
+    for (n = DVP_POLL_LIMIT; n; n--)
+        if (sl6806_mmio_read(SL6806_CRU_PLL) & SL6806_CRU_PLL_LOCKED)
+            break;
+
+    if (!n) {
+        Serial.print("  PLL never reported lock (bit 28); reads 0x");
+        Serial.println(sl6806_mmio_read(SL6806_CRU_PLL), HEX);
+    } else {
+        sl6806_mmio_set(SL6806_CRU_PLL, SL6806_CRU_PLL_RELEASE);
+        Serial.print("  PLL locked, released; reads 0x");
+        Serial.println(sl6806_mmio_read(SL6806_CRU_PLL), HEX);
+    }
+
+    delay(10);
+    sl6806_mmio_write(SL6806_CRU_MEDIA_CLOCK, SL6806_CRU_MEDIA_VALUE);
+    delay(10);
+    Serial.print("  media clock 0x4008011C reads 0x");
+    Serial.println(sl6806_mmio_read(SL6806_CRU_MEDIA_CLOCK), HEX);
+}
+
+static void dvpBringUp(void)
+{
+    static const uint32_t pads[] = {
+        SL6806_DVP_PAD_D0, SL6806_DVP_PAD_D1, SL6806_DVP_PAD_D2,
+        SL6806_DVP_PAD_D3, SL6806_DVP_PAD_D4, SL6806_DVP_PAD_D5,
+        SL6806_DVP_PAD_D6, SL6806_DVP_PAD_D7,
+        SL6806_DVP_PAD_SYNC2, SL6806_DVP_PAD_SYNC1, SL6806_DVP_PAD_SYNC0,
+    };
+    unsigned i;
+    uint32_t v;
+
+    Serial.println();
+    Serial.println("waking the DVP front end - this is where MCLK comes from:");
+
+    /*
+     * [V] The two the SENSOR's own init does, which the front-end path does
+     * not: 0x00D44CD2 and 0x00D44CD8. Both were missed because this project
+     * had read `bind_dvp_channel` and not `sensor_init`, and between them
+     * they are the only things the vendor does for the camera that a payload
+     * has not - after the rail, both clocks, the PLL and the geometry all
+     * came up right and the sensor stayed mute with its outputs in Hi-Z.
+     *
+     * ROM 0x20EC turns out to be a second clock family, 85 ids each mapping
+     * to one CRU register and bit; id 58 is CRU +0xC0 bit 0, which nothing in
+     * this repository has ever written.
+     */
+    if (!sl6806_module_enable(SL6806_SENSOR_MODULE_ID))
+        Serial.println("  module id 80 did not acknowledge its gate.");
+    sl6806_mmio_set(SL6806_CRU_SENSOR_CLOCK, SL6806_CRU_SENSOR_CLOCK_EN);
+    Serial.print("  sensor clocks: module 80, CRU +0xC0 reads 0x");
+    Serial.println(sl6806_mmio_read(SL6806_CRU_SENSOR_CLOCK), HEX);
+
+    /* The clock tree first. Gates without a clock is exactly what the last
+     * run did, and it produced an awake block and a mute sensor. */
+    dvpClockTree();
+
+    /* [V] 0x00D44688 with source 0, divider 0. */
+    v = sl6806_mmio_read(SL6806_CRU_CAM_CLOCK);
+    v &= ~(uint32_t)(SL6806_CRU_CAM_SRC_MASK | SL6806_CRU_CAM_DIV_MASK);
+    sl6806_mmio_write(SL6806_CRU_CAM_CLOCK, v);
+    sl6806_mmio_write(SL6806_CRU_CAM_CLOCK,
+                      sl6806_mmio_read(SL6806_CRU_CAM_CLOCK)
+                          | SL6806_CRU_CAM_ENABLE);
+
+    /* [M] The register clock. This is what makes the block's registers
+     * answer - and, it turns out, what makes 0x400E0000 answer too. */
+    if (!sl6806_module_enable(SL6806_DVP_MODULE_ID))
+        Serial.println("  module id 46 did not acknowledge its gate.");
+
+    /*
+     * [M] THE FUNCTIONAL CLOCK, and the line whose absence explains the
+     * entire 2026-08-13 session. Measured that day: 0x400E0000 ignores writes
+     * from a cold chip and holds them once module 46 is enabled - so the
+     * order is registers first, function second, and every earlier sweep that
+     * called this register dead was writing it from a cold chip.
+     *
+     * Without this the DVP has its register file and no logic clock: it
+     * accepts every geometry write, reads them all back, and drives no MCLK.
+     * That is exactly what eight pad combinations and sixteen clock settings
+     * measured against a sensor that works fine under the stock firmware.
+     */
+    if (sl6806_periph_enable(SL6806_DVP_PERIPH_ID)) {
+        sl6806_periph_reset(SL6806_DVP_PERIPH_ID);
+        Serial.print("  functional clock on: 0x400E0000 = 0x");
+        Serial.print(sl6806_mmio_read(SL6806_PERIPH_ENABLE_REG), HEX);
+        Serial.print(", 0x400E0008 = 0x");
+        Serial.println(sl6806_mmio_read(SL6806_PERIPH_RESET_REG), HEX);
+    } else {
+        Serial.println("  0x400E0000 would not hold bit 6 - the block has its");
+        Serial.println("  registers but no logic clock, and MCLK will not appear.");
+    }
+
+    /* The block only proves itself by holding a write. */
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_INSIZE, DVP_SIZE_WORD);
+    v = sl6806_mmio_read(SL6806_DVP_BASE + SL6806_DVP_INSIZE);
+    dvp_awake = (v == DVP_SIZE_WORD);
+
+    Serial.print("  INSIZE reads back 0x");
+    Serial.print(v, HEX);
+    Serial.println(dvp_awake ? "  - the block is awake." : "  - still gated.");
+
+    if (!dvp_awake) {
+        Serial.println("  Without it there is no hardware MCLK, and the attempts");
+        Serial.println("  below fall back to the software square wave.");
+        return;
+    }
+
+    /* Pads only once the block is known to be running. */
+    for (i = 0; i < sizeof(pads) / sizeof(pads[0]); i++)
+        sl6806_pad_configure(pads[i]);
+    sl6806_pad_configure(CAM_MCLK_MUX);
+
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_CROP_X, 0);
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_CROP_Y, 0);
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_CROP_W, DVP_IN_W - 1);
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_CROP_H, DVP_IN_H - 1);
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_OUTSIZE, DVP_SIZE_WORD);
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_SCALE,
+                      (SL6806_DVP_SCALE_ONE << 16) | SL6806_DVP_SCALE_ONE);
+
+    /* [V] 0x00D98242, then 0x00D981FE: +0x08 cleared then bit 4; then the
+     * format, bit 4, bit 1 - each a separate store, in that order. */
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_CFG08, 0);
+    sl6806_mmio_set(SL6806_DVP_BASE + SL6806_DVP_CFG08, SL6806_DVP_CFG08_BIT4);
+
+    sl6806_mmio_field(SL6806_DVP_BASE + SL6806_DVP_CTRL,
+                      SL6806_DVP_CTRL_FMT_SHIFT, 4, SL6806_DVP_FMT_CAMERA);
+    sl6806_mmio_set(SL6806_DVP_BASE + SL6806_DVP_CTRL, SL6806_DVP_CTRL_BIT4);
+    sl6806_mmio_set(SL6806_DVP_BASE + SL6806_DVP_CTRL, SL6806_DVP_CTRL_BIT1);
+
+    Serial.print("  CTRL 0x");
+    Serial.print(sl6806_mmio_read(SL6806_DVP_BASE + SL6806_DVP_CTRL), HEX);
+    Serial.print(", INSIZE 0x");
+    Serial.print(sl6806_mmio_read(SL6806_DVP_BASE + SL6806_DVP_INSIZE), HEX);
+    Serial.print(", OUTSIZE 0x");
+    Serial.println(sl6806_mmio_read(SL6806_DVP_BASE + SL6806_DVP_OUTSIZE), HEX);
+    Serial.println("  MCLK is muxed to bank 4 pin 3, function 2. If the sensor");
+    Serial.println("  answers below, that clock was the whole story.");
+
+    /* A baseline before the sensor has been reset, so the sweep at the end
+     * has something to be compared against. */
+    Serial.print("  DVP lines now: ");
+    scopeTheBus();
+    sl6806_pad_configure(CAM_MCLK_MUX);
+}
+
+/*
+ * ===================================================================
+ *  STOP ASKING THE SENSOR AND WATCH ITS PINS
+ * ===================================================================
+ * Every question so far has been "does 0x68 answer", and I2C needs the sensor
+ * to be alive, addressed correctly and willing to talk. The DVP sync and data
+ * lines need none of that: they are the sensor's *outputs*, and a sensor that
+ * is powered and clocked drives PCLK whether or not anyone has configured it.
+ *
+ * So sample them as plain inputs. Three outcomes, and they are the three
+ * hypotheses left, separated for the first time:
+ *
+ *   something toggles   the module is fitted, powered and clocked. The
+ *                       problem is on the I2C side - wrong address, or a part
+ *                       that needs something before it will ACK. That would
+ *                       be a completely different search.
+ *   all stuck high/low  the module is fitted (the pads are pulled somewhere)
+ *                       but has no clock, or is held off.
+ *   nothing at all      consistent with no module, though not proof.
+ *
+ * IT ALSO SWEEPS MCLK'S SOURCE. CRU +0x118 carries a two-bit source at [5:4]
+ * and a divider at [11:8], and the bring-up uses the vendor's 0 and 0. That 0
+ * came from a register the vendor had just tested for zero, which is a weaker
+ * reading than it looked: if source 0 is a clock that is not running, MCLK is
+ * dead no matter how awake the block is. Four sources times four dividers is
+ * sixteen tries and costs a second.
+ *
+ * Muxing pins 0-2 to function 0 takes them away from the DVP, which does not
+ * matter: they are inputs to it, the sensor still drives them, and 7g measured
+ * function 0 as one of the two that leave the pad's input buffer alive.
+ */
+#define SCOPE_SAMPLES   4000
+
+/*
+ * Sample one pad as an input WITH A PULL-UP, and count how many times it
+ * changes.
+ *
+ * ===================================================================
+ *  THE PULL-UP IS THE WHOLE TEST, AND ITS ABSENCE VOIDED THE LAST ONE
+ * ===================================================================
+ * The first version of this left the pad on whatever selector it already
+ * carried, which for the DVP pins is the vendor's selector 0. Every line read
+ * 0 and never moved, and that was reported as "nothing is there". It was
+ * measuring the pad. Asked properly afterwards, all five lift on selectors
+ * 8-11 and 13, so selector 0 is holding them down on its own and a reading
+ * taken under it says nothing about the board.
+ *
+ * With selector 8 - the vendor's own pull-up, the one the bus pads use - the
+ * reading finally means something:
+ *
+ *   reads 1, static    nothing is driving it; the pull-up wins
+ *   reads 0, static    something off-chip is holding it low - a fitted part
+ *   toggles            the sensor is alive and clocked
+ *
+ * A 0 against a pull-up cannot be produced by an absent device, which is
+ * exactly the discrimination this sketch has been missing.
+ */
+static unsigned scopePad(uint32_t id)
+{
+    unsigned n, changes = 0;
+    int last;
+
+    sl6806_pad_configure(PAD_AT_REST(id, PULL_VENDOR));
+    delayMicroseconds(PULL_SETTLE_US);
+    last = sl6806_pad_read(id);
+
+    for (n = 0; n < SCOPE_SAMPLES; n++) {
+        int now = sl6806_pad_read(id);
+
+        if (now != last) {
+            changes++;
+            last = now;
+        }
+    }
+    return changes;
+}
+
+/*
+ * Sample the six most informative DVP lines and print level and transition
+ * count for each. The caller prints whatever label it wants first; this adds
+ * the readings and the verdict.
+ */
+static int scopeTheBus(void)
+{
+    static const uint32_t lines[] = {
+        SL6806_DVP_PAD_SYNC0, SL6806_DVP_PAD_SYNC1, SL6806_DVP_PAD_SYNC2,
+        SL6806_DVP_PAD_D0,    SL6806_DVP_PAD_D1,    SL6806_DVP_PAD_D7,
+    };
+    unsigned i, total = 0;
+
+    for (i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
+        unsigned c = scopePad(lines[i]);
+
+        total += c;
+        Serial.print(sl6806_pad_read(lines[i]) ? "1" : "0");
+        if (c) {
+            Serial.print("(");
+            Serial.print(c);
+            Serial.print(") ");
+        } else {
+            Serial.print(" ");
+        }
+    }
+    Serial.println(total ? " <- SOMETHING IS MOVING" : " all static");
+    return total != 0;
+}
+
+/*
+ * Sweep MCLK's source and divider, watching the DVP bus and pinging 0x68
+ * after each. Returns 1 if anything ever moved or answered.
+ */
+static int mclkSweep(void)
+{
+    unsigned src, div;
+    int found = 0;
+
+    Serial.println();
+    Serial.println("sweeping MCLK's source and divider at CRU +0x118, watching");
+    Serial.println("the sensor's own output pins rather than asking it anything:");
+
+    for (src = 0; src < 4 && !found; src++) {
+        for (div = 0; div < 4; div++) {
+            uint32_t v = sl6806_mmio_read(SL6806_CRU_CAM_CLOCK);
+
+            v &= ~(uint32_t)(SL6806_CRU_CAM_SRC_MASK | SL6806_CRU_CAM_DIV_MASK);
+            v |= (src << 4) | (div << 8);
+            sl6806_mmio_write(SL6806_CRU_CAM_CLOCK, v);
+            sl6806_mmio_write(SL6806_CRU_CAM_CLOCK,
+                              sl6806_mmio_read(SL6806_CRU_CAM_CLOCK)
+                                  | SL6806_CRU_CAM_ENABLE);
+
+            /* Give the sensor time to come up on a new clock, and put the
+             * MCLK pad back where the peripheral can drive it. */
+            sl6806_pad_configure(CAM_MCLK_MUX);
+            delay(20);
+
+            Serial.print("  src ");
+            Serial.print(src);
+            Serial.print(" div ");
+            Serial.print(div);
+            Serial.print(": ");
+            if (scopeTheBus())
+                found = 1;
+
+            /* And ask, now that the pads are ours again. */
+            sl6806_pad_configure(CAM_MCLK_MUX);
+            busInit();
+            if (i2cPing(CAM_ADDR)) {
+                Serial.println("    ...and 0x68 ACKed!");
+                found = 1;
+            }
+            if (found)
+                break;
+        }
+    }
+
+    if (!found) {
+        Serial.println();
+        Serial.println("  Nothing moved on any of the sixteen, and 0x68 never ACKed.");
+        Serial.println("  The sensor's output pins are as static as its bus address is");
+        Serial.println("  silent, which is what an absent module looks like from here.");
+    }
+    return found;
+}
+
+#endif /* DVP_BRINGUP */
+
+/* --------------------------------------- the ROM's other clock family */
+
+/*
+ * ===================================================================
+ *  THE MODULE IDS WERE NEVER THE WHOLE CLOCK TREE
+ * ===================================================================
+ * 15b established 128 module ids across four gate/shadow pairs and this
+ * project has treated that as the clock tree since. It is not. The camera's
+ * own sensor_init calls a veneer that branches into ROM 0x20EC, an 85-entry
+ * dispatcher where each id sets one bit in one CRU register - a completely
+ * separate family, fifty-six of them implemented, reaching CRU +0x1C, +0x30,
+ * +0x80..+0x120 and eight registers at 0x400F1000. Nothing here had written
+ * any of it.
+ *
+ * The sensor's id is 58 and the bring-up above does it. This sweeps the rest,
+ * enabling one at a time and asking 0x68 after each, because the enables
+ * accumulate: if the sensor answers after id N, then N was the last one it
+ * needed and everything before it may or may not have mattered. That is a
+ * weaker result than an isolated test but a far cheaper one, and it converts
+ * a dead end into a bisection.
+ *
+ * WHAT THIS WRITES. Fifty-six OR-ins of a single bit, each transcribed from
+ * the ROM's own table, into clock enable registers. It does not change any
+ * clock source, divider, PLL or voltage. Enabling a clock for a block nobody
+ * is using costs power and does nothing else, which is why this is an
+ * acceptable brute force where a rail sweep would not be.
+ *
+ * Ids 0, 2, 42 and 53 write CRU +0x30 and id 71 writes +0x1C - registers of
+ * unknown purpose rather than the uniform +0x8x..+0x12x clock enables. They
+ * are done last and announced, so that if the device stops responding the
+ * last line printed names the register that did it.
+ */
+static int romClockIsPlain(uint32_t addr)
+{
+    /* The uniform clock-enable window, plus the 0x400F1000 group. */
+    return (addr >= 0x40080080u && addr <= 0x40080120u)
+        || (addr >= 0x400F1000u && addr <= 0x400F105Cu);
+}
+
+static void romClockSweep(void)
+{
+    unsigned pass, i;
+
+    Serial.println();
+    Serial.println("sweeping the ROM's other clock family (notes 7n) - 56 enables");
+    Serial.println("nothing in this project has ever written, one at a time, asking");
+    Serial.println("0x68 after each:");
+
+    busInit();
+
+    for (pass = 0; pass < 2; pass++) {
+        if (pass == 1) {
+            Serial.println();
+            Serial.println("  now the odd ones - CRU +0x1C and +0x30, purpose unknown:");
+        }
+
+        for (i = 0; i < SL6806_ROMCLK_COUNT; i++) {
+            const sl6806_romclk_t *c = &sl6806_romclk[i];
+            int plain = romClockIsPlain(c->addr);
+
+            if ((pass == 0) != (plain != 0))
+                continue;
+
+            Serial.print("  id ");
+            if (c->id < 10)
+                Serial.print(' ');
+            Serial.print(c->id);
+            Serial.print(": 0x");
+            Serial.print(c->addr, HEX);
+            Serial.print(" |= 0x");
+            Serial.print(c->bit, HEX);
+            Serial.flush();
+
+            sl6806_mmio_set(c->addr, c->bit);
+            delay(5);
+
+            if (i2cPing(CAM_ADDR)) {
+                Serial.println("   *** 0x68 ACKed ***");
+                Serial.println();
+                Serial.println("THAT IS THE SENSOR. The clock it was waiting for is this");
+                Serial.println("one or something enabled before it - bisect from here.");
+                return;
+            }
+            Serial.println();
+        }
+    }
+
+    Serial.println();
+    Serial.println("  All 56 enabled, and 0x68 still does not answer. Every clock");
+    Serial.println("  mechanism this chip is known to have has now been applied.");
+}
 
 /* ----------------------------------------------------------- reporting */
 
@@ -1088,6 +1659,119 @@ static void reportCrop(void)
     Serial.print("..");
     Serial.println(y1);
     Serial.println("  (power-on defaults - no init table has been applied)");
+}
+
+/* ------------------------------------------------- initialising the sensor */
+
+/*
+ * The vendor's init tables, lifted out of this unit's flash by
+ * tools/sl6806-sensortab and compiled in. A payload cannot read them at run
+ * time - it runs from SRAM in bootloader mode with no XIP mapping - so the
+ * only way to have them is to carry them.
+ *
+ * Table B is the default because it is the one that sizes the sensor: a
+ * centred 648x488 window inside the 1280x720 array, which is VGA plus the
+ * usual margin. Table A is the full array. Both are here so that neither is
+ * a dead symbol and so the choice is a one-line edit.
+ */
+static const uint8_t (*const init_tables[2])[2] = { sc101_table_A, sc101_table_B };
+static const unsigned init_lengths[2] = { SC101_TABLE_A_PAIRS, SC101_TABLE_B_PAIRS };
+static const char *const init_names[2] = { "A - full 1280x720 array",
+                                           "B - 648x488, VGA" };
+#define INIT_TABLE 1        /* [V] the vendor's own selector: 1 picks B */
+
+/*
+ * Replay one table, exactly as 0x00D44C50 does: byte pairs in order, ~40 us
+ * apart, each one a two-byte write to 0x68.
+ *
+ * ===================================================================
+ *  THIS IS ~200 WRITES INTO A CHIP WITH NO DATASHEET
+ * ===================================================================
+ * and it is worth being clear about what that does and does not risk. The
+ * bytes are the vendor's own, in the vendor's order, into the sensor - not
+ * into the SoC. The sensor is on a removable module, it has its own supply
+ * which this sketch controls, and payload mode gives all of it back on an
+ * unplug. What it can do is leave the sensor in a state that stops it
+ * answering, which is why the chip id is re-read afterwards and reported.
+ *
+ * IT IS PACED ACROSS loop() CALLS. 200 writes at 40 us plus nine clocked
+ * bytes each is milliseconds of solid bit-banging, and doing it in one call
+ * would block the boot ROM's USB handler for long enough to matter in poll
+ * mode - the one rule in docs/BRINGUP.md. A block per call keeps it honest,
+ * and the progress line means a sensor that stops ACKing names the pair it
+ * stopped on rather than just going quiet.
+ */
+#define INIT_PAIRS_PER_PASS 16
+
+static unsigned init_at;            /* next pair to write            */
+static unsigned init_failed_at;     /* 1-based, 0 = nothing failed   */
+static bool     init_running;
+
+static void initBegin(void)
+{
+    init_at = 0;
+    init_failed_at = 0;
+    init_running = true;
+
+    Serial.println();
+    Serial.print("writing the vendor's init table ");
+    Serial.print(init_names[INIT_TABLE]);
+    Serial.print(", ");
+    Serial.print(init_lengths[INIT_TABLE]);
+    Serial.println(" pairs:");
+}
+
+/* One block. Returns 1 when the whole table has been walked. */
+static int initStep(void)
+{
+    const uint8_t (*table)[2] = init_tables[INIT_TABLE];
+    unsigned end = init_lengths[INIT_TABLE];
+    unsigned n;
+
+    for (n = 0; n < INIT_PAIRS_PER_PASS && init_at < end; n++, init_at++) {
+        uint8_t pair[2] = { table[init_at][0], table[init_at][1] };
+
+        if (!i2cWriteTo(CAM_ADDR, pair, 2)) {
+            init_failed_at = init_at + 1;
+            init_running = false;
+            Serial.print("  stopped at pair ");
+            Serial.print(init_failed_at);
+            Serial.print(" of ");
+            Serial.print(end);
+            Serial.print(" (reg 0x");
+            Serial.print(pair[0], HEX);
+            Serial.print(" = 0x");
+            Serial.print(pair[1], HEX);
+            Serial.println(") - no ACK.");
+            return 1;
+        }
+        delayMicroseconds(SC101_WRITE_GAP_US);
+    }
+
+    if (init_at < end) {
+        Serial.print("  ");
+        Serial.print(init_at);
+        Serial.print("/");
+        Serial.println(end);
+        return 0;
+    }
+
+    init_running = false;
+    Serial.print("  all ");
+    Serial.print(end);
+    Serial.println(" pairs went in.");
+
+    /*
+     * The vendor leaves the page selector wherever the table left it, then
+     * writes the flip pair. This does not write the flip - it is gated on a
+     * setting a payload has no opinion about - but it does put the page back
+     * to 0, because every register number this sketch uses elsewhere is a
+     * page-0 one and a stale page would silently redirect them.
+     */
+    if (!camWrite(CAM_REG_PAGE, 0))
+        Serial.println("  (could not restore the page selector to 0)");
+
+    return 1;
 }
 
 /* Read and report the chip id. Returns 1 if it was the sc101's. */
@@ -1499,12 +2183,97 @@ void loop()
 #if CAMERA_POWER_WRITES
             powerTheSensor();
 #endif
+#if DVP_BRINGUP
+            /* After the rail, before any pad the front end owns: the block
+             * has to be running before its pads are muxed to it. */
+            dvpBringUp();
+#endif
             sub = 0;
+#if DVP_BRINGUP
+            step = STEP_DVP_PADS;
+#else
             printAttempt();
             step = STEP_POWER_LOW;
+#endif
             break;
         }
         break;
+
+#if DVP_BRINGUP
+    /*
+     * ===================================================================
+     *  THE READING THAT NEEDED THIS: "all six read 0" MEANT NOTHING YET
+     * ===================================================================
+     * The 2026-08-13 scope pass found every DVP line at 0 and static under
+     * all sixteen MCLK settings, and that looked like an absent module. It
+     * was not evidence. The vendor's pad words for these eleven pins end in
+     * 0x30 - drive 3, **pull selector 0** - and the sweep on the bus pads
+     * only ever exercised selectors 4..15, because the ROM's pull table is
+     * twelve entries indexed from 4 (7f). A pad sitting on selector 0 may
+     * simply be pulled down internally, in which case it reads 0 whatever is
+     * or is not attached to it.
+     *
+     * So ask the question the bus pads were asked in the first place, and
+     * which decided that they reach a fitted chip:
+     *
+     *   sweepPulls  can an internal pull-up take this line high at all? If
+     *               yes, nothing external is holding it, and the 0 was the
+     *               pad's own doing. If no - if it stays 0 through every
+     *               selector - something off-chip is holding it down, and
+     *               that something is a fitted device.
+     *   holdTest    drive it high and let go. A line that holds its charge
+     *               for 10 ms reaches nothing; one that decays has a load.
+     *               RESET holds, the bus pads decay, and both readings were
+     *               informative on those pins.
+     */
+    case STEP_DVP_PADS: {
+        static const struct { uint32_t id; const char *name; } lines[] = {
+            { SL6806_DVP_PAD_SYNC0, "sync pin 0"  },
+            { SL6806_DVP_PAD_SYNC1, "sync pin 1"  },
+            { SL6806_DVP_PAD_SYNC2, "sync pin 2"  },
+            { SL6806_DVP_PAD_D0,    "data pin 4"  },
+            { SL6806_DVP_PAD_D7,    "data pin 11" },
+        };
+        const int n = (int)(sizeof(lines) / sizeof(lines[0]));
+
+        if (sub == 0) {
+            Serial.println();
+            Serial.println("the DVP lines, asked properly this time. A pad that no");
+            Serial.println("internal pull can lift is being held down by something");
+            Serial.println("off-chip; a pad that holds its own charge reaches nothing.");
+        }
+
+        if (sub < n) {
+            sweepPulls(lines[sub].id, lines[sub].name);
+            sub++;
+            break;
+        }
+        if (sub < 2 * n) {
+            holdTest(lines[sub - n].id, lines[sub - n].name);
+            sub++;
+            break;
+        }
+
+        /* Put them back where the front end can use them. */
+        sl6806_pad_configure(SL6806_DVP_PAD_SYNC0);
+        sl6806_pad_configure(SL6806_DVP_PAD_SYNC1);
+        sl6806_pad_configure(SL6806_DVP_PAD_SYNC2);
+        sl6806_pad_configure(SL6806_DVP_PAD_D0);
+        sl6806_pad_configure(SL6806_DVP_PAD_D7);
+
+        Serial.println();
+        Serial.println("Read that against the bus pads above: those reach the FM");
+        Serial.println("tuner and they idle high on a pull-up. If these eleven");
+        Serial.println("cannot be lifted at all, they reach something. If they lift");
+        Serial.println("and hold like RESET does, they reach nothing - and the case");
+        Serial.println("for no module fitted becomes the strong one.");
+
+        sub = 0;
+        printAttempt();
+        step = STEP_POWER_LOW;
+        break;
+    }
+#endif
 
     case STEP_POWER_LOW:
         /*
@@ -1591,9 +2360,8 @@ void loop()
     case STEP_SCAN:
         if (scanBus() && reportChipId()) {
             Serial.println();
-            samples   = 0;
-            sample_at = millis();
-            step      = STEP_TALK;
+            initBegin();
+            step = STEP_INIT;
             break;
         }
 
@@ -1634,20 +2402,39 @@ void loop()
              * MCLK used to head this list. It does not any more, and the
              * reason is the measurement above rather than an argument.
              */
-            if (mclk_khz >= 2500) {
-                Serial.print("MCLK is no longer a good explanation either: it measured ");
-                Serial.print(mclk_khz / 1000);
-                Serial.print(".");
-                Serial.print((mclk_khz % 1000) / 100);
-                Serial.println(" MHz here, and the vendor programs clock channel 6");
-                Serial.println("with 2800 - which as kHz is 2.8 MHz, the same clock. It ran");
-                Serial.println("for 30 ms before the first transfer and through every bit");
-                Serial.println("of it. A sensor given its own nominal clock on a proven bus");
-                Serial.println("and still not answering is not a clock problem.");
-            } else {
-                Serial.print("MCLK only measured ");
-                Serial.print(mclk_khz);
-                Serial.println(" kHz, which is low enough to stay a suspect.");
+            /*
+             * RETRACTED, 2026-08-13. This used to say MCLK was ruled out,
+             * because the software clock measured 2.8 MHz and "the vendor
+             * programs clock channel 6 with 2800, which as kHz is the same
+             * clock". Channel 6 is an LDO and 2800 is millivolts - see
+             * sl6806_regfile.h - so those two numbers had nothing to do with
+             * each other and the agreement was a coincidence between a
+             * voltage and a frequency. Nothing was ever ruled out.
+             *
+             * Worse, the argument pointed away from the one thing that was
+             * never supplied. MCLK leaves on bank 4 pin 3 at alternate
+             * function 2, which is the DVP peripheral's function on that
+             * bank - so the sensor's clock is an output of the camera front
+             * end, and the front end is gated off unless something enables
+             * it. A typical sensor of this class wants 24 MHz; 2.8 MHz from
+             * a toggle loop may simply be below its floor.
+             */
+            Serial.print("MCLK measured ");
+            Serial.print(mclk_khz / 1000);
+            Serial.print(".");
+            Serial.print((mclk_khz % 1000) / 100);
+            Serial.println(" MHz from the software toggle, which is the fastest");
+            Serial.println("this CPU can bit-bang - and there is no reason to think it");
+            Serial.println("is the right frequency. The vendor's 2800 is millivolts, not");
+            Serial.println("kilohertz (notes 7m), so the real MCLK rate is unknown and");
+            Serial.println("parts like this usually want 24 MHz.");
+            Serial.println();
+            Serial.println("MCLK's real source is the DVP front end: pin 3 carries it at");
+            Serial.println("alternate function 2, the same function as the eleven DVP data");
+            Serial.println("and sync pads on this bank (notes 7n).");
+            if (!dvp_awake) {
+                Serial.println("The front end is NOT running in this build, so the sensor has");
+                Serial.println("never had a hardware clock. That is the leading explanation.");
             }
 
             Serial.println();
@@ -1681,18 +2468,29 @@ void loop()
             }
 
             Serial.println();
-            Serial.println("What is left:");
-            Serial.println("  1. Sensor power - now the leading explanation. Every rail a");
-            Serial.println("     module needs is behind a regulator that nothing here");
-            Serial.println("     drives, and the vendor's power-up has no such call in it");
-            Serial.println("     either, so whatever switches it is further up the stack:");
-            Serial.println("     the likeliest home is the byte-wide register file behind");
-            Serial.println("     the clock driver, which a payload cannot reach (notes 7h).");
-            Serial.println("  2. No module fitted. Still possible - one firmware image");
-            Serial.println("     ships across several hardware builds - but weaker now.");
-            Serial.println("     Looking at the case for a lens settles it either way.");
+            Serial.println("WHAT HAS BEEN RULED OUT, all measured on this board:");
+            Serial.println("  the bus       an FM tuner on these two pads gives its own");
+            Serial.println("                driver's chip id in the same run");
+            Serial.println("  the rail      2.8 V, read back through the vendor's scale;");
+            Serial.println("                and it was already on before anything here ran");
+            Serial.println("  the enables   the sensor's two register-file bits were also");
+            Serial.println("                already set, cold");
+            Serial.println("  the pads      both control lines drive, both bus lines pull");
+            Serial.println("  the module    the stock camera app works on this unit");
+            Serial.println("  the clocks    the DVP's register clock, its functional clock,");
+            Serial.println("                the PLL, the media clock, the camera module");
+            Serial.println("                clock across all 64 source/divider settings,");
+            Serial.println("                and every one of the ROM's 56 other enables");
             Serial.println();
-            Serial.println("Neither is on this bus, and neither is fixable from here.");
+            Serial.println("The sensor's own output pins sit at 1 against a pull-up, which");
+            Serial.println("is high impedance: it is not driving them. A fitted, powered");
+            Serial.println("sensor with Hi-Z outputs is one that has never started.");
+            Serial.println();
+            Serial.println("So every mechanism this chip is known to have has been applied,");
+            Serial.println("and the difference between this and the working stock firmware");
+            Serial.println("is no longer expressible in any register anyone has found.");
+            Serial.println("That is a complete negative rather than a missing experiment,");
+            Serial.println("and it is where payload-mode probing ends. See notes 7n.");
         } else if (saw_fm) {
             Serial.println("Something did answer the scan, so the bus is not dead - but");
             Serial.println("the tuner check above did not confirm it. Read that first:");
@@ -1709,7 +2507,51 @@ void loop()
             Serial.println("entirely empty bus here is itself the finding: suspect the");
             Serial.println("pads and the board before the sensor.");
         }
+#if DVP_BRINGUP
+        /*
+         * Last resort, and the first question in this sketch that does not
+         * depend on the sensor being willing to talk: is anything moving on
+         * its output pins at all, under any MCLK the block can produce?
+         */
+        if (dvp_awake)
+            mclkSweep();
+#endif
+        romClockSweep();
         step = STEP_STUCK;
+        break;
+
+    case STEP_INIT:
+        if (!initStep())
+            break;
+
+        /*
+         * Re-read the chip id. Two hundred writes into an undocumented part
+         * can leave it not answering, and "the table went in" is not the same
+         * claim as "the sensor is still there afterwards" - which is the one
+         * that matters to anything built on top of this.
+         */
+        Serial.println();
+        Serial.println("re-reading the chip id after the table:");
+        if (reportChipId())
+            Serial.println("  the sensor survived its own init table.");
+        else
+            Serial.println("  it did not answer afterwards. The table is the suspect.");
+
+        if (init_failed_at) {
+            Serial.println();
+            Serial.println("The table did not finish, so the sensor is in a half-");
+            Serial.println("configured state. Unplug before drawing conclusions from");
+            Serial.println("anything it says below.");
+        }
+
+        Serial.println();
+        Serial.println("What is still missing for an image: the DVP front end at");
+        Serial.println("0x400E1000 is mapped (sl6806_dvp.h) but its enable lives in");
+        Serial.println("0x400E0000, which no payload has ever written successfully.");
+
+        samples   = 0;
+        sample_at = millis();
+        step      = STEP_TALK;
         break;
 
     case STEP_TALK:

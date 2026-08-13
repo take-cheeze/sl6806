@@ -35,6 +35,12 @@
  *     84   the ADC (sl6806_adc.h) - verified, the keys work through it
  *     68   the PWM's registers (sl6806_pwm.h) - they become writable, though
  *          its counter still does not run
+ *     46   the camera front end (sl6806_dvp.h) - the block at 0x400E1000
+ *          goes from reading zeros and dropping writes to holding them.
+ *          Found 2026-08-13 by examples/DvpProbe, and worth reading next to
+ *          what it displaced: the vendor's own enable at 0x400E0000 will not
+ *          hold its own bit from a payload, so the firmware's mechanism and
+ *          the reachable one are different mechanisms.
  *
  * Provenance markers as elsewhere: [V] verified against the dump,
  * [M] measured on hardware.
@@ -57,6 +63,56 @@ extern "C" {
  * is a few cycles of hardware, and a walk pays the timeout for every miss.
  */
 int sl6806_module_enable(unsigned id);
+
+/*
+ * ===================================================================
+ *  THE SECOND ENABLE, AND THE ORDER BETWEEN THEM
+ * ===================================================================
+ * A module clock gives a peripheral its REGISTERS. It does not give it its
+ * FUNCTION. That distinction cost this project two peripherals and a lot of
+ * bench time, and both failures looked identical from the outside:
+ *
+ *   - the PWM (id 68) took every register write and its counter never ran,
+ *     so the backlight lit but would not dim (14a);
+ *   - the camera front end (id 46) took a full geometry configuration,
+ *     reported it back, and drove no MCLK, so the sensor stayed mute
+ *     through eight pad combinations and sixteen clock settings (7n).
+ *
+ * The functional clock is a bit in 0x400E0000, one per peripheral - the
+ * register 15 recorded as "dead from a payload" after it would not hold a
+ * bit. **It is not dead. It is gated, and its own gate is a module clock.**
+ *
+ * MEASURED 2026-08-13: cold, 0x400E0000 ignores writes. After
+ * sl6806_module_enable(46) it holds them. So the order is
+ *
+ *     sl6806_module_enable(<the module id>);      registers
+ *     sl6806_periph_enable(<the peripheral id>);  function
+ *
+ * and the two ids are from different spaces - 46 and 6 for the camera. Every
+ * sweep that ever wrote 0x400E0000 did it from a cold chip and concluded the
+ * register was unreachable; none had a peripheral awake enough to gate it
+ * open first.
+ *
+ * WHICH BIT IS WHICH PERIPHERAL is known only for the camera, id 6, from
+ * 0x00D98236. The others have to be walked, the same way the module ids were.
+ */
+#define SL6806_PERIPH_ENABLE_REG   0x400E0000u
+#define SL6806_PERIPH_RESET_REG    0x400E0008u
+
+/*
+ * Set a peripheral's functional clock bit and wait the vendor's 10 ms
+ * (0x00D9A734). Returns 1 if the bit read back, 0 if it did not - which
+ * means the register is still gated, not that the id is wrong.
+ */
+int sl6806_periph_enable(unsigned id);
+
+/*
+ * The vendor's reset pulse on the *other* register, 0x400E0008: clear the
+ * bit, wait, set it again (0x00D9A768). Easy to miss - it is a different
+ * address from the enable, and nothing in this tree noticed it until the
+ * camera front end was decoded.
+ */
+void sl6806_periph_reset(unsigned id);
 
 #ifdef __cplusplus
 }

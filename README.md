@@ -47,11 +47,12 @@ so it is worth being precise about which parts are real:
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | Keys — the two volume buttons | **Works.** They are an ADC resistor ladder, not GPIO; driver in [`cores/sl6806/sl6806_adc.c`](cores/sl6806/sl6806_adc.c), board map in the variant, 97 host tests. Verified on hardware. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
-| Backlight | **Works, on/off.** Dimming does not — `sl6806_backlight_begin(100)` lights the panel from cold or warm. The PWM counter does not run, so duty has no effect yet. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
+| Backlight | **Works, on/off.** Dimming does not — `sl6806_backlight_begin(100)` lights the panel from cold or warm. The PWM counter does not run, so duty has no effect yet — but the reason §15 gave for that is now known to be wrong: `0x400E0000` is not dead, it is gated behind a module clock (§7n), and the PWM's bit in it has never been looked for. Worth one walk. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
 | Audio, SD, Bluetooth | **Not yet.** Hardware confirmed present; no drivers. |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
 | I2C on bare pads | **Works — confirmed on hardware.** `examples/CameraDemo` bit-bangs TWI 0 on two pads and reads the FM tuner's chip id: `0x5808`, the exact value the stock driver checks for, on a read-only pass. First device this framework has ever read over I2C, and it needs no TWI controller. |
-| Camera | **The module is fitted and works — under the stock firmware. From a payload, `0x68` is silent, and the cause is now known to be power.** Decoded register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h. The vendor's camera app shows a live preview on this unit, which confirms the pads, the bus, the address and the clock from the other end — `examples/CameraDemo` reaches the same sensor over the same wires and gets nothing. What the vendor does and a payload does not is switch a rail: its `power_on` is only pads, delays and clock channel 6, so the enable happens further up, behind the indexed register file a payload cannot reach. |
+| Camera — the sensor | **The module is fitted and works under the stock firmware; from a payload `0x68` has always been silent, and the missing rail is now reachable — written, not yet run.** Decoded register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h, and the rail in §7m. The vendor's `power_on` is pads, delays and "clock channel 6" — which turns out to be an LDO at 2.8 V, not a clock, and which it switches through the indexed register file. That file was the blocker and is now found: not an MMIO block at all but a chip at I2C `0x30` behind a mailbox at `0x400F7000+0x100`, driven by [`cores/sl6806/sl6806_regfile.c`](cores/sl6806/sl6806_regfile.c). `examples/CameraDemo` performs the vendor's six writes, and then — if the chip id answers — replays the vendor's own 203-pair init table, lifted out of flash by `tools/sl6806-sensortab`. Whether the sensor answers at all is the open question, and it needs a P20 and five minutes. |
+| Camera — the pixel path | **Mapped and enabled; the sensor still will not start.** The DVP front end at `0x400E1000` is decoded in [`cores/sl6806/sl6806_dvp.h`](cores/sl6806/sl6806_dvp.h) (§7n) — geometry, crop, scaler, and the DMA destination register found by mapping the live block. It can be woken: mask ROM module id 46 for its registers, then `0x400E0000` bit 6 for its logic — which is §15's "dead" register, alive once something gates it open. On hardware the block accepts and reads back a full configuration, and the sensor's own output pins still sit high-impedance against a pull-up. Rail, enables, bus, pads, PLL, both clock families and all 64 camera-clock settings have been applied. That is a complete negative, not a missing step; §7n says what would settle it. |
 | FM tuner | **Tunes, on hardware.** RDA5807 family on TWI 0 at `0x10`, chip id `0x5808` (§7i). `examples/FmDemo` enables it and sweeps the band over bit-banged I2C: 41 channels tuned, each setting tune-complete and reading its own channel number back. First peripheral this framework has successfully *written* to. No audio path yet — the proof is the tuner's own status registers, and RSSI stays at the noise floor until headphones are plugged in, since the lead is the aerial. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
@@ -339,7 +340,7 @@ Peripheral blocks identified so far:
 | `0x40070000` | DMA |
 | `0x40080000` | clock & reset ([`sl6806_cru.h`](cores/sl6806/sl6806_cru.h)) |
 | `0x400D9000` | LCD controller ([`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h)) |
-| `0x400F7000` | SD/MMC + SPI flash host |
+| `0x400F7000` | SD/MMC + SPI flash host; `+0x100` is a serial master, and the indexed register file is the chip on it (§7m) |
 
 Flash layout: HLKJ bootloader at `0x0`, partition table at `0xF000`, then
 `FIRM` (application, XIP at `0x00C10000`), `PICS` and `FONT`.
@@ -369,27 +370,39 @@ In rough order of how much they unlock:
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-3. **Where the indexed register file lives.** The camera's own enable writes
-   are now known to the bit — `reg 0x03` field [4:3] = 01 and `reg 0x16` bit 7,
-   from the sensor driver at `0x00D44EA6` / `0x00D44F06` — and the clock
-   driver's channel handling uses the same file. So the camera is fully
-   specified *except* for that one base address. `0x40040000` looked like it
-   and is not (§7l records the failed identification and the write test that
-   disproved it, so nobody repeats either). Finding it finishes the camera and
-   unlocks 140 call sites besides.
-4. **An FM driver**, now the cheapest working device on the board: an
+3. **Run `examples/RegFileProbe`, then `examples/CameraDemo`, and report what
+   they print.** ~~Where the indexed register file lives~~ — found, in §7m, and
+   it is a chip at I2C `0x30` behind a mailbox rather than a base address,
+   which is why five static searches for a base could not have worked. That
+   unlocks the camera's rail and 140 call sites besides, and *none of it has
+   been run*. The probe reads the file and decodes its five LDO channels into
+   millivolts without writing anything: if those come out at recognisable
+   supply voltages, the decode is right, and that is a two-minute test no
+   meter is needed for. `CameraDemo` then does the writes and verifies each
+   one by reading it back.
+4. **Break the `0x400E0000` wall, and two peripherals come with it.** This is
+   the register the application enables most peripherals through, and §15
+   recorded it as dead from a payload. That negative is now worth re-testing,
+   because everything it lacked exists: the camera front end is id 6, there is
+   a *second* register at `0x400E0008` that does a reset pulse rather than an
+   enable (§7n), and there is finally a downstream block — the DVP's size
+   registers at `0x400E1004` — that reads back what was written to it if it is
+   alive and does not if it is not. The recipe is five steps and it is in
+   [`sl6806_dvp.h`](cores/sl6806/sl6806_dvp.h). The backlight's counter is
+   stuck behind the same register, so this is two results for one experiment.
+5. **An FM driver**, now the cheapest working device on the board: an
    RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
    part, published register map, and the id read is done.
-5. **The TWI controller's base address** — demoted, because it is now a speed
+6. **The TWI controller's base address** — demoted, because it is now a speed
    problem rather than an access one. `examples/TouchDemo` bit-bangs bus 1
    and `examples/CameraDemo` bit-bangs bus 0, both on pads alone, and the
    second has read a real device. What the base would buy is throughput,
    which matters for a camera and not much else.
-6. **A DMA driver.** The display pushes pixels 16 bytes at a time because
+7. **A DMA driver.** The display pushes pixels 16 bytes at a time because
    that is the FIFO depth. The vendor uses the DMA controller at
    `0x40070000`; its command-list format is decoded at the bottom of
    [`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
-7. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+8. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
    clock, so this no longer blocks anything; finding the PLL registers would
    still give it exactly. They are *not* at the clock unit's base:
    `0x40080000` has dividers but no multiplier.
@@ -406,14 +419,16 @@ cannot call them. See
 cores/sl6806/     the core: Arduino.h, Print/Stream/String, timing, GPIO HAL,
                   USB serial, startup for both modes, boot ROM ABI,
                   the pad controller (sl6806_padctl.*) and the LCD
-                  controller (sl6806_lcdc.*), clock map (sl6806_cru.h)
+                  controller (sl6806_lcdc.*), clock map (sl6806_cru.h),
+                  the indexed register file and its LDO rails
+                  (sl6806_regfile.*), the camera front end (sl6806_dvp.h)
 cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
 examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, FmDemo,
-                  RegFileProbe, LcdProbe, PadScope, PadSweep, BacklightHunt,
-                  MmioProbe, RomProbe, CallbackProbe
+                  RegFileProbe, DvpProbe, LcdProbe, PadScope, PadSweep,
+                  BacklightHunt, MmioProbe, RomProbe, CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
 docs/             BRINGUP.md, DUMPING.md, FLASHING.md, LCD.md,
                   sl6806_re_notes.md, ACTIONS_CARDREADER.md
