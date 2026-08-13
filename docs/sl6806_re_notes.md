@@ -4876,3 +4876,49 @@ needs is among them.
 
 Run it twice, once with a card and once without; the diff is this board's SD
 pinout and its card-detect pin.
+
+### [M] The pad census: 80 bonded pads, and the boot ROM assigns six
+
+`examples/PadMap`, 2026-08-13, reading every bank's function nibbles with no
+writes at all. The first pad map this project has had:
+
+| bank | base | pads that exist | assigned by the boot ROM |
+|---|---|---|---|
+| 0 | `0x40081000` | pins 0..5 | 0,1,2,3 → function 2 |
+| 1 | `0x40081040` | pins 0..31 | 9 → function 3 |
+| 2 | `0x400F6080` | pins 0..5 | 0,1 → function 2 |
+| 3 | `0x400810C0` | pins 0..12 | none |
+| 4 | `0x40081100` | pins 0..16 | none |
+| 5 | `0x400F6000` | pins 0..5 | none |
+
+Every bank shows the same shape: a contiguous run of **function 15** from pin
+0, and **every pin above that run reads 0 in the function nibble**. Six banks
+independently producing that pattern is not a coincidence, so:
+
+- **`0` in a function nibble means the pin does not exist** — the register
+  file is 32 pins wide per bank and the package bonds fewer;
+- **`15` means a real pad the boot ROM has parked**, which matches §23's
+  finding that the ROM parks the SD pads on function 15 when it tears the SD
+  block down.
+
+**Eighty pads are bonded out and the ROM assigns six of them.** Those six are
+the entire pinout that bootloader mode needs: four on bank 0 and two on bank 2,
+all function 2, plus bank 1 pin 9 on function 3. `[I]` the bank 0 four are the
+SPI flash the bootloader runs from and the bank 2 pair is USB, which would be
+consistent with `0x400F7000` being the flash host — but nothing here
+establishes that, and the pads carrying them are unreadable in an alternate
+function anyway.
+
+This also explains why the sketch's first pull test measured nothing: it
+tested "pads already in function 0", which is to say every pin that is not
+there, and correctly reported that all of them read 0 under both pulls. The
+pads that exist are the parked ones. The test now targets those, and
+configures them properly through `sl6806_pad_configure()` (ROM `0x93C`) rather
+than writing the pull registers of a pad that is still parked — a parked pad
+ignores its pull, which is the second half of why nothing moved.
+
+⚠ **A census is only the boot state on a freshly powered device.** Uploading a
+payload does not reset the chip, so pads an earlier sketch configured stay
+configured: this run showed bank 1 pins 12, 13 and 14 in function 0, which is
+`examples/SdPads` having left them as inputs, not anything the ROM did. Same
+caution as §23's cold-dump correction, and the same fix — power-cycle first.

@@ -418,7 +418,13 @@ In rough order of how much they unlock:
    two inferred bits of the transfer register and the guessed pixel byte
    order are right. [docs/LCD.md](docs/LCD.md) has the checklist. It cannot
    brick anything in payload mode.
-5. **This board's pinout.** The pad controller is done
+5. **This board's pinout.** [M] 2026-08-13, `examples/PadMap`: **80 pads are
+   bonded out and the boot ROM assigns six of them** — bank 0 pins 0–3 and
+   bank 2 pins 0–1 on function 2, bank 1 pin 9 on function 3, everything else
+   parked on function 15. A function nibble of 0 means the pin does not
+   exist; six banks show the same shape. That is the first pad map this
+   project has had, and what is still missing is which *peripheral* each
+   assigned pad belongs to. The pad controller is done
    ([`sl6806_padctl.h`](cores/sl6806/sl6806_padctl.h)); what is missing is
    which pad each button and LED is on. The ids are immediates at the stock
    firmware's 54 GPIO call sites, so this is a reading exercise plus a meter.
