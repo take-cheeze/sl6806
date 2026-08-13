@@ -3,8 +3,8 @@
 | Layer | State |
 |---|---|
 | Hardware | **Present**, per the vendor's own firmware — a full HCI/L2CAP/A2DP/AVRCP/HFP/SPP/OPP stack is linked into FIRM. |
-| Register block | **Candidate found, unread.** `0x400E2000`, identified from the code next to the HCI command dispatcher. Nothing here has been checked against a real device. |
-| Driver | **Not started.** No bit in this block has a confirmed meaning. `examples/BtProbe` is the read-only first step. |
+| Register block | **Candidate found: `0x400E2000`**, identified from the code next to the HCI command dispatcher. Already read once, indirectly: a later pass through this codebase (§14a/§15 of the notes) read it from the host in bootloader mode while chasing an unrelated peripheral and got all zeros — same as everything else behind the PLL/`0x400E0000` gate that section documents. Not yet read from a payload, and no bit's meaning is confirmed. |
+| Driver | **Not started.** `examples/BtProbe` reproduces the zero-read from a payload; the useful next step is the same PLL/gate unlock work §14a/§15 already need for the backlight and the ADC. |
 
 This is an earlier-stage document than `docs/LCD.md`. The LCD controller was
 solved because the HLKJ bootloader carries a plain, disassemblable driver for
@@ -69,11 +69,11 @@ ldr  r4, =0x0082B3A8          ; an SRAM descriptor slot
 movs r1, #0xC0
 strd r3, r0, [r4]             ; descriptor := { base, r0 (a config pointer) }
 movs r0, #42
-bl   0x00D9A7FC                ; unexamined — generic registrar, by call shape
+bl   0x00D9A7FC                ; starts the PLL and spins on its lock bit (§14a)
 movs r0, #0
-bl   0x00D9A734                ; unexamined
+bl   0x00D9A734                ; enables the module through 0x400E0000 (§15) — dead from a payload today
 movs r0, #0
-bl   0x00D9A768                ; unexamined
+bl   0x00D9A768                ; still unexamined
 ldr  r2, =0x400E2214
 ldr  r3, [r2]
 orr  r3, r3, #0x1000000        ; bit 24 set
@@ -119,6 +119,40 @@ Full offset list, with what's known about each, is in
 [`cores/sl6806/sl6806_bt.h`](../cores/sl6806/sl6806_bt.h) — kept as one
 source of truth rather than duplicated here.
 
+## Two of the three unexamined calls are no longer unexamined
+
+The two `bl`s marked "unexamined" above were named independently, by a later
+pass through this codebase chasing the backlight and the ADC rather than
+Bluetooth (`docs/sl6806_re_notes.md` §14a and §15). `0x00D9A7FC` is "the
+first thing the vendor's module bring-up does" — it writes `0xC0000C04` to
+the PLL config register at `0x40080008` and spins on lock bit 28, which in
+bootloader mode never sets. `0x00D9A734` is the routine through which "the
+application enables most peripherals through `0x400E0000`", confirmed dead
+from a payload; its other call sites use arguments 0/1/2/3/4/6, and this
+call's argument — 0 — sits inside that range. `0x00D9A768` is still
+unexamined.
+
+That same section read `0x400E2000` directly, from the host, in bootloader
+mode, while building a table of which blocks are live:
+
+```
+0x40080000 CRU   — live
+0x400D9000 LCDC  — live
+0x400E0000        — all zeros
+0x400E2000        — all zeros
+0x40084000        — all zeros
+```
+
+So this is no longer a hole in this document — the register block is
+already confirmed to read as flat zero in bootloader mode, and the reason is
+not specific to Bluetooth: it is the same unlocked PLL and `0x400E0000` gate
+that keeps the PWM and (until §15b's fix) the ADC dark too, and it answered
+the same way for the host command as it would for a payload. Unlocking it
+means finishing `0x4008011C` (§14a's open item — one bit apart between
+enabled and disabled, so plausibly safe, but untried because it might
+reparent the core or USB clock) or finding whatever `0x00D9A734`'s
+`0x400E0000` gate actually needs.
+
 ## What none of this establishes
 
 - **What any bit means.** The bitfield widths pulled out of the config
@@ -128,11 +162,11 @@ source of truth rather than duplicated here.
   peripheral looks like — but "consistent with" is a shape argument, not a
   decode. Nobody has correlated a single one of these fields against a known
   BT parameter (channel map, clock offset, access code, whatever).
-- **Whether this is readable in payload mode at all.** LCD and GPIO both
-  turned out to need SRAM-resident vendor code that plainly does not exist
-  until the application has booted (`docs/sl6806_re_notes.md` §"vendor SRAM
-  routines are not resident in bootloader mode"). This block may be the
-  same, or it may answer immediately — nobody has read it yet, on any unit.
+- **What unlocks it.** It reads zero today because the PLL and the
+  `0x400E0000` enable gate it depends on are off, the same wall §14a/§15
+  document for the backlight and the ADC. Getting past that wall without
+  reparenting the core or USB clock out from under the session is an open
+  problem shared with those two, not something specific to Bluetooth.
 - **Whether this is the whole story.** A combo SoC with a real radio needs
   more than one register window in general (analog/PHY trim is often
   elsewhere entirely). `0x400E2000` explains the code next to the HCI
@@ -150,20 +184,28 @@ it:
 make SKETCH=examples/BtProbe RUN_MODE=poll run
 ```
 
-Three outcomes, in order of how interesting they'd be:
+Expect flat zero — that is what the host-side read already found, and a
+payload has no more access to the PLL/`0x400E0000` gate than the host does.
+Running it anyway is still worth doing once, both to confirm a payload sees
+the same thing the host command does (nothing in this codebase has checked
+that the two paths agree here) and as the sketch to come back to once the
+gate is unlocked. Three outcomes, in order of how interesting they'd be:
 
-1. **Everything reads `0xFFFFFFFF`** — nothing is decoding this window from
-   a payload. Consistent with the SRAM-veneer story above; does not rule the
-   block out.
-2. **Everything reads `0x00000000`** — gated off (plausible in bootloader
-   mode, as with LCD) or genuinely not decoded. Also inconclusive on its
-   own.
+1. **Everything reads `0x00000000`** — expected, matches the host-side
+   read in `docs/sl6806_re_notes.md` §14a. Confirms a payload sees what the
+   host sees; does not by itself rule the block out.
+2. **Everything reads `0xFFFFFFFF`** — would disagree with the host-side
+   read and be worth a second look at whether payload and host are really
+   addressing the same thing.
 3. **Values are varied, and/or `SL6806_BT_STATUS` (`+0x218`) or
    `SL6806_BT_CTRL` (`+0x200`) changes between the two watch passes without
-   anything having been written** — real, live hardware. This is the one
-   worth following up with a logic analyser or with writes (carefully, on a
-   unit you can afford to lose to a bad register write, which this one is
-   not yet).
+   anything having been written** — would mean the gate is no longer where
+   §14a found it, which would be news on its own.
 
-Report the result the same way `examples/RegFileProbe`'s comment block
-records its hardware run, so nobody has to repeat it to find out.
+The result that actually moves this forward is `examples/BtProbe` re-run
+*after* whatever unlocks the PLL/`0x400E0000` wall for the backlight or the
+ADC — at that point this document's three outstanding questions (bit
+meanings, whether one window is the whole story, and the config struct's
+field layout) become answerable from real values instead of from code shape.
+Report results the same way `examples/RegFileProbe`'s comment block records
+its hardware run, so nobody has to repeat it to find out.

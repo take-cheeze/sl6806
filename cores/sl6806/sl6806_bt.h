@@ -32,17 +32,31 @@
  * It is a module-registration routine: it stores {base=0x400E2000,
  * config_ptr=r0} into a two-word descriptor at SRAM 0x0082B3A8, does a
  * clear-bit31 / delay(10) / set-bit31 reset pulse on +0x228, writes
- * 0xFFFFFFFF to +0x200 during that window, calls three FIRM-resident
- * routines (0x00D9A7FC, 0x00D9A734, 0x00D9A768 - not yet examined), sets
- * bit 24 of +0x214, and then unpacks roughly a dozen narrow bitfields out of
- * the caller's config struct into +0x10, +0x14, +0x20, +0x44, +0x48, +0x4C,
- * +0x50, +0x54, +0x58, +0x70, +0x78 and +0x7C. That shape - a reset
- * handshake through the same veneer used elsewhere (0x00807214 is already
- * documented as "delay" in the notes, 39 call sites), followed by a config
- * struct fanned out into a dozen small register fields - is what every
- * other peripheral bring-up in this codebase looks like (compare the LCD
- * panel init and the CRU divider setters), which is why this reads as real
- * hardware and not a software-only table.
+ * 0xFFFFFFFF to +0x200 during that window, calls 0x00D9A7FC (r0=42),
+ * 0x00D9A734 (r0=0) and 0x00D9A768 (r0=0), sets bit 24 of +0x214, and then
+ * unpacks roughly a dozen narrow bitfields out of the caller's config struct
+ * into +0x10, +0x14, +0x20, +0x44, +0x48, +0x4C, +0x50, +0x54, +0x58, +0x70,
+ * +0x78 and +0x7C. That shape - a reset handshake through the same veneer
+ * used elsewhere (0x00807214 is already documented as "delay" in the notes,
+ * 39 call sites), followed by a config struct fanned out into a dozen small
+ * register fields - is what every other peripheral bring-up in this
+ * codebase looks like (compare the LCD panel init and the CRU divider
+ * setters), which is why this reads as real hardware and not a
+ * software-only table.
+ *
+ * WHAT §14a/§15 SETTLE ABOUT THE OTHER TWO CALLS
+ *
+ * A later pass through this codebase (docs/sl6806_re_notes.md §14a/§15,
+ * chasing the backlight and the ADC) independently named two of the three
+ * calls above: 0x00D9A7FC is "the first thing the vendor's module bring-up
+ * does" - it starts the PLL at 0x40080008 and spins on its lock bit - and
+ * 0x00D9A734 is the routine "the application enables most peripherals
+ * through 0x400E0000" with, confirmed dead from a payload today. Its other
+ * call sites use 0/1/2/3/4/6; this call's argument, 0, is inside that range.
+ * §14a's own host-side read of 0x400E2000 in bootloader mode already came
+ * back all zeros, alongside 0x400E0000 and 0x40084000 - the same wall every
+ * other peripheral behind that gate hits, not evidence against this being
+ * real hardware. 0x00D9A768 is still unexamined.
  *
  * WHAT IS NOT KNOWN
  *
@@ -54,10 +68,11 @@
  *     front end to a companion radio die - "Bluetooth hardware confirmed
  *     present" in the README predates this finding and was not specific
  *     about which.
- *   - Whether any of this is readable/writable at all in payload mode. LCD
- *     and GPIO both needed SRAM-resident vendor code that only exists after
- *     the application has booted; this may be the same. examples/BtProbe
- *     is the read-only test for that.
+ *   - What unlocks the PLL and the 0x400E0000 gate without reparenting the
+ *     core or USB clock out from under the session - the same open item
+ *     §14a/§15 leave for the backlight and ADC's neighbouring wall.
+ *     examples/BtProbe reproduces §14a's zero-read from a payload; it is
+ *     the sketch to re-run once that unlock work lands.
  *
  * Provenance markers as elsewhere: [V] verified against the dump,
  * [I] inferred, [?] unknown. Nothing here is [V] yet.

@@ -9,8 +9,17 @@
  * one literal address anywhere in the 1.8 MB application that is loaded by
  * the code sitting next to the HCI command dispatcher, and that code does a
  * reset-pulse / config-fanout sequence shaped like every other peripheral
- * bring-up in this codebase. None of that has been checked against a real
- * device. This sketch is that check.
+ * bring-up in this codebase.
+ *
+ * EXPECT FLAT ZERO. docs/sl6806_re_notes.md §14a - reached independently,
+ * chasing the backlight - already read this exact address from the host in
+ * bootloader mode and got all zeros, the same as 0x400E0000 and 0x40084000:
+ * the whole block sits behind a PLL and a 0x400E0000 enable gate that
+ * nothing in this codebase has unlocked yet without risking the core or USB
+ * clock. This sketch exists to confirm a payload sees the same thing the
+ * host command does (nobody has checked that the two paths agree here), and
+ * to be ready to re-run the moment that gate opens for any reason - see
+ * "Next actions" item 11 in the notes.
  *
  * ---------------------------------------------------------------------
  *  READ THIS FIRST - the same warning examples/MmioProbe carries
@@ -33,12 +42,13 @@
  *
  *     make SKETCH=examples/BtProbe RUN_MODE=poll run
  *
- * WHAT COUNTS AS A RESULT. Anything other than a flat 0x00000000 or
- * 0xFFFFFFFF across every offset says the block is decoded, which is
- * already more than is known today. If SL6806_BT_STATUS (+0x218) changes
- * between the two watch passes at the end, that is the strongest single
- * signal available without hardware: a status/mode field only a live
- * peripheral would update on its own.
+ * WHAT COUNTS AS A RESULT. Flat 0x00000000 across every offset is the
+ * expected outcome - it matches the host-side read in §14a, and just means
+ * the payload path agrees with the host command. 0xFFFFFFFF would disagree
+ * with that read and be worth a second look. If SL6806_BT_STATUS (+0x218)
+ * changes between the two watch passes at the end, that would mean the PLL/
+ * 0x400E0000 gate is no longer where §14a found it - unexpected, and worth
+ * following up either way.
  */
 
 #include <Arduino.h>

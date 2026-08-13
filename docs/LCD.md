@@ -6,15 +6,30 @@ The display stack is in three layers, and all three now exist.
 |---|---|
 | Drawing — framebuffer, primitives, font, `Display`/`Screen` | **done**, 64 host tests |
 | Panel — geometry, init sequence, windowing, sleep/wake | **done**, recovered from the firmware, 53 host tests |
-| Bus — putting a byte on the wire | **written**, 195 host tests against a model — **on hardware it runs clean and produces no picture** |
+| Bus — putting a byte on the wire | **done**, 198 host tests against a model, and **verified on the panel 2026-08-07** |
 
-Read that last cell before you read anything else. The bus driver was written
-by disassembling the stock bootloader. It has not been run against a panel and
-nobody has put a logic analyser on the pins, so two bits of the transfer
-register are inferred from where the vendor sets them rather than read. And
-before any of that: **the backlight is a separate PWM channel that nothing
-here turns on**, so a dark screen does not yet mean a broken driver. This
-document is half "how it works" and half "what to try when it doesn't".
+**It works.** `examples/GfxDemo` draws shapes and text on the panel, in the
+right colours, and the whole stack from a `Screen.fillRect()` call to a lit
+pixel is verified end to end.
+
+That is worth dwelling on for a moment, because the bus driver was written
+entirely by disassembling the stock bootloader, was never run against a panel
+while it was being written, and had **two bits of the transfer register
+inferred from where the vendor sets them rather than read**. Those two bits are
+right. So is the 33-command init sequence, the window arithmetic, the QSPI
+frame layout and the pixel byte order.
+
+**What had been wrong the whole time was the backlight**, which is not part of
+the LCD path and which nothing here used to turn on. Every "the driver produces
+no picture" result in the history of this repository was taken with the lamp
+off, and none of them meant what they appeared to. Call
+`sl6806_backlight_begin(100)` (`cores/sl6806/sl6806_pwm.h`) — `GfxDemo` does.
+It is on/off only; the PWM counter does not run, so duty has no effect, which
+does not matter here. §14a has that story.
+
+The rest of this document is still "how it works", and its checklist is still
+worth keeping for the next board or the next bug — but it is no longer a list
+of reasons the screen might be dark.
 
 ```cpp
 #include <Arduino.h>
@@ -127,72 +142,38 @@ counts how many polls each transfer takes, and lets you flip the guessed
 values from the monitor without rebuilding. Everything below is a real
 possibility, not a formality.
 
-**0. Is the backlight on?**
+**0. Is the backlight on?** — *solved; turn it on and move to step 1.*
 
-**The backlight is not part of the LCD path.** In the stock firmware it is a
-PWM channel — the image contains `/dev/pwm_ch3`, `brightness percent %d`, a
-48000 Hz period and a `pwmTask` that owns it — driven by a separate task that
-this framework does not implement. Nothing in the display driver turns it on.
-
-So a perfectly working driver still shows a black screen, and "the LCD won't
-show" does not yet distinguish a broken driver from a dark lamp.
-
-Settle it before debugging anything else: shine a bright light at the panel at
-an angle and switch the probe between `w` (fill white) and `k` (fill black). A
-transmissive LCD read by reflection is dim but legible, and full white against
-full black is as big a change as there is. If the panel visibly changes, the
-driver works and the remaining job is the backlight.
-
-**The PWM registers are not recoverable the way the LCD's were.** The
-`/dev/pwm_ch0`..`ch5` name strings are in the image at `0x00C7DE9A`, and the
-consumer at `0x00D10354` opens `ch3` and sets 60% at 48 kHz — but *nothing in
-the image references those name strings*, so the driver that registers them
-lives in SRAM, like the LCD writers used to. Unlike the LCD writers, the HLKJ
-bootloader has no copy: it never touches PWM. So there is no second source to
-disassemble.
-
-That is survivable, because a backlight almost never needs PWM to be *on*.
-These boards put the backlight behind an enable pin and use PWM only to dim
-it, so driving that pin high is full brightness — and the GPIO driver is
-complete.
-
-**Do not sweep the pads to find it.** Driving all 192 freezes the device: one
-of them owns something the USB link needs, and when USB dies the serial ring
-is never polled, so you do not even learn which pad did it. It was tried; it
-cost a reboot and produced no information.
-
-There is no need to guess, because the stock firmware configures every pad it
-uses and the ids are immediates at its call sites:
-
-```sh
-tools/sl6806-padscan dump.bin --outputs --sites
+```c
+#include "sl6806_pwm.h"
+sl6806_backlight_begin(100);      /* examples/GfxDemo already does this */
 ```
 
-Of the 78 pads the firmware touches, exactly seven are plain outputs, and one
-of those is the panel reset line we already know — which is a useful check
-that the scan is reading the right thing. The rest are the candidates:
+It is PWM channel 3 of the block at `0x40084000`, module id 68, output on bank
+1 pin 0 in alternate function 4. On/off only: the counter does not run, so duty
+has no effect, which does not matter here. §14a of the RE notes has the
+bring-up order and the list of things that were wrong on the way.
 
-| pad id | bank/pin | what the firmware calls it |
-|---|---|---|
-| `0x0001A0D0` | 1/20 | **`vcomo`** — named by the console handler at `0x00D0AEE0` |
-| `0x000508C0` | 5/1 | toggled in the display's suspend/resume pair, `0x00D3C9DC`–`0x00D3CC3C` |
-| `0x000300C0` | 3/0 | output, firmware sets it high (`0x00D46432`) |
-| `0x00047080` | 4/14 | power sequencing, `0x00D44AB8` |
-| `0x00047880` | 4/15 | power sequencing, `0x00D44AB8` |
+**This changes what every other step below means.** Until now a dark panel was
+consistent with a perfect driver, so none of the "no picture" results on this
+board distinguished anything. Re-run before believing any of them.
 
-`vcomo` is the one to try first, and it may matter more than the backlight:
-VCOM is an LCD panel supply, so with that rail off the controller accepts
-every command over QSPI and the glass stays blank — exactly the symptom.
+The old advice here — shine a light at the panel at an angle and flip between
+white and black to read it by reflection — is still a decent trick if you ever
+suspect the lamp again, and `examples/LcdProbe`'s `w` and `k` keys still do it.
 
-The probe drives these and nothing else:
+**Still worth trying while you are here: `vcomo`.** VCOM is an LCD panel
+supply, and with that rail off the controller would accept every command over
+QSPI while the glass stayed blank — exactly the symptom this document exists
+for, and unaffected by the backlight. `tools/sl6806-padscan dump.bin --outputs
+--sites` lists the seven plain outputs the firmware drives; the console handler
+at `0x00D0AEE0` names `0x0001A0D0` (bank 1 pin 20) `vcomo`, and `0x000508C0`
+(bank 5 pin 1) is toggled in the display's suspend/resume pair.
 
-    A    all five candidates on - the fast yes/no
-    Z    all five off
-    l    arm the next candidate and name it
-    y/u  drive the armed candidate on / off
-
-`l` announces before `y` drives, deliberately: if the device does freeze, the
-line naming the pad has already reached you.
+`examples/LcdProbe` drives those candidates: `A` turns them all on, `Z` all
+off, `l` arms the next one and names it, `y`/`u` drive the armed one. `l`
+announces before `y` drives, deliberately — if the device freezes, the line
+naming the pad has already reached you.
 
 **1. Is `delay()` being clamped?**
 
@@ -424,6 +405,15 @@ colour << 8` — which settles the question in favour of most-significant-byte
 first. But it is one bit and reds looking blue is the symptom, so it is cheap
 to rule out.
 
+The *application* now says the same thing twice over, which is worth knowing
+because it is the half that used to be missing (§12.5b of the RE notes called
+the byte order unsettled "because the vendor's framebuffer comes from LVGL").
+LVGL is built with `LV_COLOR_16_SWAP = 0`, so the framebuffer at `0x0087B800`
+is little-endian RGB565 — and the window writer at `0x00D3EBD4` does an
+explicit `rev16` on every pixel it pushes through the FIFO. Framebuffer
+low-byte-first, wire high-byte-first, swap in the driver. See
+docs/sl6806_re_notes.md §13.
+
 **6. Is the picture shifted?**
 
 That is the panel's `(0, 12)` offset, and it is applied in
@@ -513,6 +503,48 @@ make -C tests/host
   and interrupt 74. This driver polls. The command-list format that path uses
   is decoded and written down at the bottom of `sl6806_lcdc.h`; what is not
   written is a DMA driver.
+
+  **It is worth writing, and the reason is measured rather than assumed.**
+  `examples/PushRate` on one P20 Player, 2026-08-13:
+
+  | | |
+  |---|---|
+  | full 240x296 frame | 167348 us — 829 KiB/s, 5 fps |
+  | transfers | 8900, no timeouts, **0 busy_waits** |
+  | polls per completion | min 3, max 7 |
+  | one LCDC register read | 312 ns (~20 cycles); the same loop on SRAM is 94 ns |
+
+  `busy_waits == 0` is the load-bearing number. It says the controller was
+  never still busy when the CPU arrived with the next transfer, and a minimum
+  of 3 polls says it finished within a few reads of being asked. **The panel's
+  clock is not the ceiling.** So raising the module clock cannot be the fix,
+  and DMA is not just offloading time the bus would have spent anyway.
+
+  Where the 167 ms actually goes, with `test_bus_traffic` counting the
+  crossings exactly against the model:
+
+  - **~83 ms of register accesses.** 231346 accesses for the frame, 26 per
+    transfer, times the measured 312 ns. The model completes on its first
+    poll where the device takes 3 to 7, so the hardware figure is a few reads
+    per transfer higher than the 72 ms the count alone gives.
+  - **~84 ms of software.** What is left. `bus_pixels()` stages every pixel as
+    two separate `stage()` calls, so a 16-byte transfer is 16 calls through a
+    bounds check and a global before any register is touched — about 75 cycles
+    a pixel.
+
+  Both halves are per-16-bytes CPU work, and both are exactly what a command
+  list removes, which is why the DMA path is the fix rather than a tidy-up.
+
+  Two cheaper things are worth knowing before starting it, because they
+  need no new peripheral:
+
+  - `irq_quiet()` is 8 of the 26 accesses, four read-modify-writes of the
+    interrupt enables, once per transfer. It writes the same constants every
+    time. Hoisting it is ~15% of the frame — but it is `[V]` vendor sequence
+    and `test_lcdc` pins it, so it is a deliberate change, not a cleanup.
+  - Staging pixels a word at a time instead of a byte at a time changes no
+    bus traffic at all, only how the bytes reach `g_pend`. That is most of the
+    software half and it cannot alter what the panel sees.
 - **Backlight.** Identified but not implemented: PWM channel 3 at 48000 Hz,
   duty as a percentage, default 60%. The strings are at `0x00C6854E` and
   `0x00C68585`, and `0x00D10354` opens the device and sets the default. The

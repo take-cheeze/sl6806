@@ -37,14 +37,17 @@ so it is worth being precise about which parts are real:
 | `setup()` / `loop()` | **Works.** Driven from the boot ROM's idle callback so USB stays alive. |
 | `Serial` — bidirectional USB serial | **Works.** Print, printf, String, Stream, and `Serial.read()` from an interactive monitor. Not a UART: see below. |
 | `millis()` / `micros()` / `delay()` | **Works**, on a measured 64 MHz clock. Backed by SysTick, whose 24-bit counter wraps every 262 ms — see the rule below. |
-| Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~38 KB heap in payload mode, ~190 KB in firmware mode. |
+| Heap, C++ runtime, `String`, `new`/`delete` | **Works.** ~650 KB heap in payload mode — SRAM is 1 MiB and only the *loaded* image has to fit in the 64 KB window. `examples/BigBuffer` pattern-tests the region and draws a full-screen framebuffer. |
 | Flash image format (HLKJ, CRC16, partitions) | **Works.** Both CRCs verify and round-trip. |
-| Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM. |
+| Graphics: framebuffer, shapes, text, `Screen.print()` | **Works.** RGB565, fully clipped, 64 host-side tests. Renders into RAM, and now onto glass. |
 | Panel: geometry, vendor init sequence, windowing, sleep/wake | **Works.** Recovered from the firmware, 53 host-side tests. |
-| Getting those pixels onto the glass | **Written; does not work yet.** The panel is a QSPI display and the controller at `0x400D9000` has a driver, checked by 195 host-side tests against a model. On hardware it initialises cleanly, completes every transfer and produces no picture — cause still unknown. See [docs/LCD.md](docs/LCD.md) for what has been ruled out. |
+| Getting those pixels onto the glass | **Works.** Verified on hardware 2026-08-07: `examples/GfxDemo` draws shapes and text on the panel, in the right colours. The bus driver was written entirely from the bootloader's disassembly and had never been seen to run; the two bits of the transfer register that were inferred rather than read turn out to be right. Driver and 198 host tests: [docs/LCD.md](docs/LCD.md). |
+| How fast those pixels arrive | **5 fps, measured.** A full 240x296 frame takes 167 ms — 829 KiB/s. It is not the panel's clock: the controller is always finished before the CPU returns, and the time splits about evenly between register-access latency (312 ns each, 26 per 16-byte transfer) and staging pixels a byte at a time. `examples/PushRate` measures it; [docs/LCD.md](docs/LCD.md) says what to do about it. |
 | `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
-| `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
+| Keys — the two volume buttons | **Works.** They are an ADC resistor ladder, not GPIO; driver in [`cores/sl6806/sl6806_adc.c`](cores/sl6806/sl6806_adc.c), board map in the variant, 97 host tests. Verified on hardware. |
+| `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
+| Backlight | **Works, on/off.** Dimming does not — `sl6806_backlight_begin(100)` lights the panel from cold or warm. The PWM counter does not run, so duty has no effect yet. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
 | Audio, SD | **Not yet.** Hardware confirmed present; no drivers. |
 | Bluetooth | **Candidate register block found, unread.** `0x400E2000` — the single literal reference to that address anywhere in FIRM, sitting next to the application's HCI command dispatcher. No bit in it has been checked against a real device yet. See [docs/BLUETOOTH.md](docs/BLUETOOTH.md) and `examples/BtProbe`. |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
@@ -139,7 +142,7 @@ bytes were lost if polling fell behind — those appear as `[lost output]`
 rather than a silently mangled stream. Typing in the monitor feeds
 `Serial.read()`, so sketches can be interactive.
 
-### The display: written end to end, and not yet seen
+### The display: written end to end, and now seen
 
 `Screen` is a complete graphics stack — framebuffer, primitives, text, and a
 `Print` interface so `Screen.print(x)` works like `Serial.print(x)`. It is
@@ -166,27 +169,27 @@ Screen.fill(SL6806_BLUE);
 Screen.display();
 ```
 
-**It has been run against a screen, and the screen stays dark.** The
-controller initialises, accepts all 226 transfers of the panel init with no
-timeouts, and takes a clock-proportional time per transfer — and the panel
-shows nothing, verified by flashing full white against full black under a
-lamp (the backlight is a separate PWM channel nothing here drives, so an
-unlit panel is not by itself evidence). What has been eliminated is in
-[docs/LCD.md](docs/LCD.md); the short version is that every register reads
-back exactly as the vendor programs it, the pads match the stock firmware's
-own configuration, and all eight combinations of the bits that were inferred
-rather than read have been tried.
+**It has been run against a screen and it draws.** Shapes, text and the right
+colours, verified 2026-08-07 with `examples/GfxDemo`. The two bits of the
+transfer register that were inferred from where the vendor sets them rather
+than read are correct, and so is the pixel byte order.
 
-And one thing to know before concluding anything from a dark panel: **the
-backlight is a separate PWM channel** (`/dev/pwm_ch3`, 48 kHz) that this
-framework does not drive, so a working display driver still shows black.
-`examples/LcdProbe` and [docs/LCD.md](docs/LCD.md) walk through telling the
-failures apart. Payload mode never writes flash, so a failed attempt costs an
-unplug.
+What had been wrong for the entire history of this driver was **the backlight**,
+which is not part of the LCD path and which nothing here turned on. Every
+earlier "the controller runs clean and the panel stays dark" result was
+measuring an unlit lamp. It is one call now:
 
-## Testing
+```cpp
+sl6806_backlight_begin(100);   // cores/sl6806/sl6806_pwm.h
+```
 
-Two suites, neither of which needs a device:
+It is on/off — the PWM counter does not run, so duty has no effect yet.
+[docs/LCD.md](docs/LCD.md) is now a description rather than a list of reasons
+the screen might be dark.
+
+### Tests
+
+Three suites, none of which needs a device:
 
 ```sh
 make test              # all three

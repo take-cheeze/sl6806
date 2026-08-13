@@ -39,7 +39,19 @@ Working log for the `dump.bin` analysis. Everything here was verified against th
 
 - **Flash is memory-mapped (XIP) at `0x00C00000`.** File offset `O` → CPU address
   `0x00C00000 + O`. Confirmed: 11,725 / 13,114 string pointers resolve at this base.
-- **SRAM:** ~`0x00800000`–`0x0083FFFF`.
+- **SRAM: `0x00800000`–`0x008FFFFF`, one megabyte.** Measured on hardware in
+  bootloader mode (2026-08-07): `0x008FFF80` returns data, `0x00900000` and
+  everything above it returns zeros, no address below `0x00900000` aliases any
+  other, and re-reading an address returns the same bytes. The old figure of
+  256 KB was the size of the first `tools/sl6806-dumpram` run, not a measurement.
+  The stock firmware relies on this: its LVGL framebuffer is at `0x0087B800`
+  (§13). So does this framework now — `ld/sl6806_payload.ld` gives a payload's
+  `.bss` and `.heap` everything up to `0x008F0000`, because only the *loaded*
+  bytes have to fit in the ROM's 64 KB window. That is ~650 KB of heap where
+  there used to be 38, and it is what makes a full 240×296 framebuffer
+  (138 KB) possible at all. `examples/BigBuffer` pattern-tests the region
+  before using it, with an address-derived pattern so an aliased region fails
+  rather than passing by luck.
 - Ghidra import: Raw Binary, language **`ARM:LE:32:Cortex`**, base **`0x00C00000`**.
 
 ## 4. HLKJ bootloader header (file 0x0) — FULLY DECODED
@@ -1128,6 +1140,11 @@ used.
 - Scanning raw 32-bit words does NOT work for this: Thumb-2 instruction
   encodings dominate (`0x46202000` is `mov r0,r4; movs r0,#0`). Use
   `tools/sl6806-find-mmio`, which decodes LDR-literal instructions.
+- **And the literal scan has a blind spot worth knowing.** A block whose
+  per-channel base is computed — one literal plus `ch << 5` — appears once
+  and then never again, because every later access goes through a cached
+  table. Both blocks in §14 hid that way, and so did the LCDC (§12b). If a
+  peripheral is "missing", look for the table it is cached in.
 
 **Blocks identified so far.** Doing the same literal scan over the *HLKJ
 bootloader* rather than FIRM is what named most of these: the bootloader is a
@@ -1138,13 +1155,25 @@ are legible where FIRM's are buried.
 |---|---|---|
 | `0x40000000` | pad / pin function mux | `0x00820650` rewrites four byte-lanes of `+0x04` (per-pad function nibbles) and a 5-bit field at `+0x08`, switching one bus between two functions |
 | `0x40009000` | timers | channels at 0x100 stride (`+0x108`, `+0x208`) with write-1-clear flags and per-channel callbacks; register triples at 0x20 stride |
-| `0x40070000` | DMA | per-channel IRQ status at `+0x24`/`+0x2c`, callback table indexed by channel, request routing at `+0x00`/`+0x20`/`+0x28` |
+| `0x40070000` | DMA **control only** | per-channel IRQ status at `+0x24`/`+0x2c`, callback table indexed by channel, request routing at `+0x00`/`+0x20`/`+0x28`. The data path is **not** here — see `0x40001000` below |
+| `0x40001000` | **DMA channel registers** | 8 channels at `+ch*0x40`, `{ctrl, src, dst, len}`; §14b |
+| `0x40084000` | **PWM** | 6 channels at `+0x20 + ch*0x20`; channel 3 is the backlight; §14a |
 | `0x40080000` | **clock & reset unit** | dividers at `+0x40`/`+0x48` with a bit-31 busy poll; module gates at `+0x64`/`+0x74` bit 15; see `cores/sl6806/sl6806_cru.h` |
 | `0x40081000` + `0x400F6000` | **GPIO / pad controller** | six banks, bases in a mask ROM table at `0x00065004`; see §7f and `cores/sl6806/sl6806_padctl.h` |
 | `0x400D9000` | **LCD controller** | the bootloader logs `HAL_lcdc_module_init` from the routine that caches this base; see §12b and `cores/sl6806/sl6806_lcdc.h` |
 | `0x400F7000` | storage host (SD/MMC + SPI flash) | `+0x100`/`+0x104` command registers with a bit-31 start/busy, `+0x108` argument, `+0x10C`/`+0x110` response, `sdio(e):rx error` strings nearby |
 
-## 7d. RAM-resident code — explained: it belongs to the mask ROM
+## 7d. RAM-resident code — ~~explained: it belongs to the mask ROM~~ SUPERSEDED
+
+> **This section's conclusion is wrong; see §13.** The SRAM-resident code *is*
+> in the flash image, at file `0x03B430`, and the application's first-stage
+> loader reads it in. The routines below (`0x0080E842`, `0x00811C7C` and the
+> rest) all disassemble out of `dump.bin` today —
+> `tools/sl6806-sram dump.bin 0x0080E842 --dis 160`. What survives from this
+> section is the *enumeration* method and the call-site tables, which are
+> still correct and still useful; what does not survive is "these belong to
+> the mask ROM" and the three "ruled out" searches, which failed because the
+> copy is a flash *read call*, not a memcpy.
 
 Several drivers live in SRAM and are **not** in the flash image at any linear
 offset. Enumerating every `BL`/`BLX` in FIRM whose target lands in
@@ -1287,15 +1316,22 @@ nothing has installed its drivers.
 
 **So the "call the ROM routines" route is dead for payloads.** Anything that
 jumps to those SRAM addresses from a payload is jumping into uninitialised
-memory.
+memory. That part still holds — and §13 explains why the memory was empty:
+those addresses are filled by the *application's* loader, which never runs in
+bootloader mode. The difference §13 makes is that the code can now be read out
+of flash and transcribed, exactly as the bootloader's LCD driver was.
 
 ### SETTLED, NEGATIVE: the driver blob is not in the ROM either
 
 Same delta search as §7d.2/7d.3, now over the ROM: 251 known entry points
 against 2117 prologue sites. Best delta scores 15/251 against a noise floor of
-13–14. Nothing. The SRAM drivers are not stored verbatim in the mask ROM any
-more than they are in flash, so they are assembled, decompressed or fetched at
-runtime by the application — still unexplained.
+13–14. Nothing.
+
+That result is correct — the drivers are not in the ROM. The inference drawn
+from it, "so they are assembled, decompressed or fetched at runtime — still
+unexplained", is the part §13 closes: they are **fetched at runtime, verbatim,
+from flash**. The same delta search *over flash* did find them; it was
+dismissed as a false positive. See §13 for why that dismissal was wrong.
 
 ### What the ROM does contain
 
@@ -1366,18 +1402,30 @@ is the display, because it has no display driver.
 - Widgets compiled in: btnmatrix, canvas, dropdown, img, label, roller, textarea;
   plus flex layout and chart. (No btn/bar/slider/table.)
 - **Two code clusters:**
-  - Core/widgets: `0x00D1F9A4` .. `0x00D3E34C` (71 fns)
-  - Refresh/render: `0x00C3D7AC` .. `0x00C40AD4` (4 fns) — lines up with the
-    `_cpu1_lcd_notify` / dual-core LCD split **(inferred)**.
+  - Core/widgets: `0x00D1F9A4` .. `0x00D3E34C` (71 fns), running XIP.
+  - Refresh/render: `0x00C3D7AC` .. `0x00C40AD4` — **not a dual-core split.**
+    This is `lv_refr.c` + `lv_draw_label.c` *stored* in flash and *run* from
+    SRAM: it is inside the blob §13 describes, and its run addresses are
+    `0x00807F7C`..`0x0080B2A4`. Subtract `0x435830` from any address in this
+    cluster to get the address the rest of the firmware calls it by.
 - **Key addresses:**
   - `lv_init`            `0x00D21C20`
   - `lv_timer_handler`   `0x00D31F88`
   - `lv_label_set_text`  `0x00D380AC`
   - `lv_disp_get_scr_act``0x00D1F9A4`
-  - `lv_refr_area`       `0x00C3D908` (also `_lv_disp_refr_timer`)
-  - **`lv_lcd_init`      `0x00D3E34C`  ← vendor display porting layer (highest-value target)**
+  - `lv_disp_drv_register` `0x00D2F578`
+  - `lv_disp_drv_init`   `0x00D2F52C`
+  - `lv_disp_draw_buf_init` `0x00D2F55C`
+  - `lv_disp_flush_ready` `0x00D2F7EC`
+  - `_lv_disp_refr_timer` **SRAM `0x008080D8`** (stored at flash `0x00C3D908`)
+  - `lv_lcd_init`        `0x00D3E34C`  ← vendor display porting layer
+  - `lv_port_disp_init`  `0x00D3B928`  ← where the driver is actually filled in
+  - LVGL flush_cb        **SRAM `0x0080B21C`** (stored at flash `0x00C40A4C`)
 - Labeling works 100%: `lv_*` `__func__` strings resolve to function starts (75 fns,
   no collisions after alternate-name handling). xframe handlers: 16 fns.
+
+**How the display is configured — see §13** for the whole path, the draw
+buffer, the colour format and the byte order.
 
 ## 9. Other components
 
@@ -1481,7 +1529,7 @@ pixel stream continues), bit 18 hold CS. `+0x14` bit 31 is transfer-complete,
 write-1-to-clear, and bits `[30:29]` are busy.
 
 Transcribed into `cores/sl6806/sl6806_lcdc.c`, polled rather than DMA, with
-195 host tests in `tests/host/test_lcdc.c` against a model of the controller.
+198 host tests in `tests/host/test_lcdc.c` against a model of the controller.
 **Not yet run against a panel.**
 
 The command list is built by `0x00827E18` (bootloader, signature
@@ -1536,17 +1584,28 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
 5. ~~Dump the mask ROM~~ **DONE** — §7f. It handed over GPIO (the pad
    controller, via a bank table the earlier scan missed) but not the LCD
    writers, which are in the bootloader instead.
-5b. **Run the display on hardware.** This is now the top of the list. The
-   stack is complete and tested against a model, and two things in it are
-   still guesses: `+0x20` bits 17 and 18, inferred from where the vendor sets
-   and clears them, and the pixel byte order, which the firmware does not
-   settle because the vendor's framebuffer comes from LVGL. See docs/LCD.md.
+5b. ~~**Run the display on hardware.**~~ **DONE, and it works** (2026-08-07).
+   `examples/GfxDemo` puts shapes and text on the glass in the right colours.
+   The two guesses are confirmed by that: `+0x20` bits 17 and 18 are right,
+   and so is the byte order §13d derived. The blocker was never the bus
+   driver — it was the backlight (§14a), which nothing turned on, so every
+   earlier "no picture" run was measuring a dark lamp.
 6. ~~**Find the PLL**~~ — largely settled in practice. The clock was
    **measured at 64.000 MHz** (2026-08-06, one P20 Player) by timing the
    device's counter against the host's with `tools/sl6806-calibrate`; the
-   bracket was ±0.06% and contained exactly one whole MHz. Finding the PLL
-   would still give it exactly and for any unit, and it is *not* at the CRU
-   base: `0x40080000` has dividers but no multiplier.
+   bracket was ±0.06% and contained exactly one whole MHz.
+
+   **FOUND, and the "not at the CRU base" claim was wrong.** It is at
+   `0x40080008`. `0x00D9A7FC` writes `0xC0000C04`, spins until bit 28 (lock)
+   is set, then sets bit 16, and only afterwards enables the first module.
+   In bootloader mode the register reads `0x00000801` — stopped — which is
+   why the whole `0x400E****` domain is dark there (§14a). The vendor writes
+   `0x4008011C = 0x31` next; that looks like a clock-source select and has
+   deliberately not been tried, because reparenting the core or USB onto a
+   fresh PLL from a payload would end the session.
+
+   What this does *not* yet give is the multiplier arithmetic, so the 64 MHz
+   figure is still the measured one, not a derived one.
 
    Two hardware facts fell out of that measurement and are worth recording:
    the **DWT cycle counter does not run** on this part (its register reads a
@@ -1561,12 +1620,819 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
    `__act_on_request` dispatcher (turns `method_20` + siblings into named
    methods across all scenes).
 9. **Build a Unicorn harness** to execute functions from the image.
-10. **Run `examples/BtProbe` on hardware.** §13 found a single, exclusively
-    referenced candidate peripheral base for Bluetooth, `0x400E2000`, from
-    the code next to the application's HCI command dispatcher — but nothing
-    in it has been read on a real device yet. See docs/BLUETOOTH.md.
+10. ~~**Re-run every "not in the image" search against the blob**~~ **DONE**
+   for the two that mattered — §14. The PWM (backlight) is at `0x40084000`
+   and the DMA data path at `0x40001000`.
+11. **Turn the backlight on.** §14a gives the registers and the vendor's own
+   period and duty. This is now the top of the list: it is a handful of
+   register writes, it does not wedge USB the way a pad sweep does, and it is
+   the cheaper of the two explanations for a dark panel.
+12. **Find the bulk path's byte swap** (§14c). The remainder path swaps in
+   software; the DMA path must be getting it from a mode bit somewhere.
+13. **Read `0x00D3D094`** to get the device-record layout, which would settle
+   whether the PWM record's `0x00030000` really is the backlight's pad.
+14. **Run `examples/BtProbe` on hardware.** §16 found a single, exclusively
+   referenced candidate peripheral base for Bluetooth, `0x400E2000`, from
+   the code next to the application's HCI command dispatcher — but nothing
+   in it has been read on a real device yet. See docs/BLUETOOTH.md.
 
-## 13. Bluetooth — link-manager code and a candidate register block
+## 13. The SRAM-resident half of the application is in flash — and LVGL
+
+Everything in this section came from `dump.bin` alone, except the memory-size
+measurement, which was taken on hardware in bootloader mode.
+
+### 13a. The blob: where the "missing" drivers live
+
+`tools/sl6806-sram` prints the mapping and re-derives it from the image:
+
+```
+loader pool at file 0x010F30
+  reads flash file 0x03B430 .. 0x052EF4  (0x17AC4 bytes)
+  into SRAM       0x00805C00 .. 0x0081D6C4
+  sram addr  = file offset + 0x7CA7D0
+  flash addr = sram addr   + 0x435830
+```
+
+The boot ROM loads only the first-stage from the FIRM header (file `0x10030`
+→ `0x00804800`; the reset handler is at `0x00804C00`, which is why the header
+names that address). The first stage then calls the flash reader at
+`0x00805A30` with those four literals — destination `0x00805C00`, length
+`end - dst`, source `0x00010030 + 0x0002B400` — and the remaining 94 KB of the
+application lands in SRAM. Then it zeroes `.bss` from `0x0081D6C4` up to the
+stack at `0x0082D63C` and calls `0x00805240`.
+
+**Why three previous searches missed it.** §7d looked for a *memcpy*: a copy
+loop, or an aligned linker-style copy table. There is neither — the transfer is
+a flash read call, the same one the file system uses, and its arguments are
+four ordinary words in a literal pool. §7d.3 *did* find the right answer as its
+best delta ("RAM `0x00800000` to file `0x035830`", 91/251 entry points against
+a noise floor of 25) and rejected it on the grounds that the matched region
+begins exactly where the 157 KB zero run ends. That is not evidence of a false
+positive — a loaded image obviously starts where the padding stops, and a 3.6×
+margin over the noise floor was the signal, not the artefact.
+
+**Four independent confirmations**, any one of which is sufficient:
+
+| # | Check |
+|---|---|
+| 1 | The loader call itself: literals `0x00010030`, `0x00805C00`, `0x0081D6C4`, `0x0002B400` at file `0x010F30`, consumed by the call at SRAM `0x008056B2`. |
+| 2 | `_lv_disp_refr_timer` is registered with `lv_timer_create` at SRAM `0x008080D8`; the `__func__` string `"_lv_disp_refr_timer"` is loaded at flash `0x00C3D956`. Difference: `0x435830`, to the byte. |
+| 3 | The panel descriptor. §7b already recorded "in flash at `0x00C519FC`, copied to SRAM `0x0081C1CC`" — difference `0x435830`. It was never a special-case copy; it is one datum inside the blob. `lv_lcd_init` stores `0x0081C1CC` into its ops table. |
+| 4 | Semantics. `0x0080E842` now disassembles, and it is a structural twin of the bootloader's `lcd_write_cmd` at `0x00821BB2` — same busy poll on `+0x14 & 0x60000000`, same clearing of `+0x08` bit 4, same `+0x20` bit 18 for CS, and the same `cmp #0x2C` special case that clears bit 17 for RAMWR. |
+| 5 | The GPIO entry points land on a table of one-instruction branches into the mask ROM, at exactly the addresses §7f named by number: `0x00811C78 → 0x97C` (read level), `0x00811C7C → 0x99E` (set level), `0x00811C90 → 0xAAE` (set function). Two independently-derived address spaces agreeing to the byte is not a coincidence a shifted base can manufacture. |
+
+That fifth check is worth a second look, because it settles something else.
+The application's GPIO layer is **nothing but thunks into the ROM pad
+controller** — `0x00811C98` and `0x00811CB4` call ROM `0x902` to split the
+packed pin id and then ROM `0x76A` (drive) and `0x736` (pull), the latter
+indexing the 12-entry table from 4 exactly as §7f describes. So §7e's
+tentative pin-id bit assignment is superseded by §7f's for good: the firmware
+and `cores/sl6806/sl6806_padctl.h` are decoding the same field layout.
+
+**What this unlocks.** Every address in §7d's "RAM-resident code" table is now
+readable, including `0x00811C7C`/`0x00811C90` (GPIO), `0x0080E842`/`0x0080E8D8`
+(the LCD writers), `0x0080E5C0` (the FIFO writer) and `0x0080B21C` (LVGL's
+flush). §7f's "the vendor routines are not resident in bootloader mode" is
+still true and still means a payload cannot *call* them — but it can now
+transcribe them, exactly as `sl6806_lcdc.c` transcribes the bootloader's copy.
+
+**One loose end.** The FIRM header declares `0x5862` bytes for the first stage,
+which reaches `0x0080A062` and so overlaps the blob's destination. The loader's
+own code sits below `0x00805C00` and survives, so the overlap is harmless, but
+whether the ROM really transfers all `0x5862` bytes or stops earlier is
+untested.
+
+### 13b. LVGL: version and configuration
+
+Version is **v8, pre-8.2**. Beyond the `gui8\lvgl` build path and the v8/v9
+discriminators in §8, the struct layout dates it: `lv_disp_drv_init`
+(`0x00D2F52C`) memsets `0x44` = 68 bytes, and `lv_disp_drv_register`
+(`0x00D2F578`) tests **bit 0** of the bitfield at `+0x08` for `full_refresh`
+and clears it with `bfc r3,#0,#1`. In 8.2 and later `direct_mode` occupies bit
+0 and `full_refresh` moves to bit 1. Assert/log line numbers in
+`lv_hal_disp.c`, useful for matching an exact tag against upstream: 103 and 116
+(`LV_ASSERT_MALLOC`), 124 (the `full_refresh requires at least screen sized
+draw buffer(s)` warning).
+
+`lv_disp_drv_t` fields recovered from the code that writes them:
+
+| Off | Field | Value here |
+|---|---|---|
+| `+0x00` | `hor_res` (u16) | 240 |
+| `+0x02` | `ver_res` (u16) | 296 |
+| `+0x04` | `draw_buf` | inside the config struct, `0x00827B64` |
+| `+0x08` | bitfield | bit 0 `full_refresh`, bit 1 `sw_rotate`, bit 2 `antialiasing`, bits [4:3] `rotated`, bit 5 `screen_transp`, bits [15:6] `dpi` |
+| `+0x0C` | `flush_cb` | `0x0080B21C` |
+| `+0x24` | a callback slot | `0x0080B1EC`, installed only in mode 1 |
+| `+0x3C` | `color_chroma_key` | `0x07E0` |
+| `+0x40` | `user_data` | |
+
+`lv_disp_drv_init`'s defaults are the stock ones — `hor_res`/`ver_res`
+320×240, `antialiasing` set, `screen_transp` clear — with `dpi` = **60**
+(upstream default is 130) and `sizeof(lv_disp_t)` = `0x158` = 344.
+
+**`LV_COLOR_DEPTH` is 16 and `LV_COLOR_16_SWAP` is 0.** The chroma key settles
+it: upstream defines `LV_COLOR_CHROMA_KEY` as `lv_color_hex(0x00FF00)`, which
+is `0x07E0` with no swap and `0xE007` with swap. The firmware stores `0x07E0`.
+So the framebuffer holds RGB565 as native little-endian `uint16_t` — low byte
+first in memory. **This closes the gap §12.5b named** — "the pixel byte order,
+which the firmware does not settle because the vendor's framebuffer comes from
+LVGL". It comes from LVGL, and now we know what LVGL put there; §13d shows what
+the driver does with it. docs/LCD.md had already reached the same conclusion
+from the bootloader's single-pixel write; this is the independent confirmation
+from the application side.
+
+The driver is registered from **`lv_port_disp_init` at `0x00D3B928`**, called
+once from the display bring-up at `0x00D08ED4` after `lv_init`. It takes a
+config struct at SRAM `0x00827B60`:
+
+| Off | Meaning | Value |
+|---|---|---|
+| `+0x00` | mode | **1** |
+| `+0x04` | the `lv_disp_draw_buf_t` it fills in | |
+| `+0x28` | `buf1` | **`0x0087B800`** |
+| `+0x2C` | `buf2` | 0 — single buffered |
+| `+0x30` | `hor_res` (u16) | 240 |
+| `+0x32` | `ver_res` (u16) | 296 |
+| `+0x34` | buffer height in lines | 296 |
+
+So the draw buffer is `hor_res × 296` = 71,040 pixels = **138.75 KB at
+`0x0087B800`**, one full screen, single buffered. Mode 1 installs the `+0x24`
+callback; mode 3 would set `full_refresh`; mode 2 skips the whole thing.
+
+A *second* draw-buffer object at `0x00827B3C` is re-initialised at runtime with
+three geometries, under a `tbb` switch at `0x00D08D88` — 240×80 (19,200 px) and
+80×296 (23,680 px) both at `0x0086B800`, and 240×296 (71,040 px) at
+`0x0087B800`. Same panel, three orientations: this is the firmware's rotation
+mechanism, and it is where to look if we ever want rotated output.
+
+**The framebuffer address is why §3 had to be re-measured.** `0x0087B800` is
+outside the 256 KB the notes assumed; the part has 1 MiB.
+
+### 13c. The path a pixel takes
+
+```
+lv_timer_handler            0x00D31F88   XIP; its call site is 0x00D08E74
+  _lv_disp_refr_timer       0x008080D8   SRAM (flash 0x00C3D908)
+    ... render into 0x0087B800 ...
+    flush_cb                0x0080B21C   SRAM (flash 0x00C40A4C)
+      -> op dispatch        0x00D3E440   -> ops[+0x18] at 0x008298B8
+        lcd_blit            0x00D3E2E4
+          window write      0x00D3EBD4   (x, y, w, h, buf, flag)
+            set window      0x00D3E518   CASET/RASET
+            begin           0x00D3E5A4   RAMWR
+            DMA             0x00D9982C   bulk path
+            FIFO            0x0080E5C0   remainder path
+      lv_disp_flush_ready   0x00D2F7EC
+```
+
+`flush_cb` is thin. It first dereferences a global pointer at `0x00829820` and,
+if it is non-NULL and its byte at `+0x03` is set, calls `lv_disp_flush_ready`
+and returns without drawing — a "suppress output" path. Otherwise
+it packs the `lv_area_t` into a 36-byte request — `{u8 type=4, u16 x1, u16 y1,
+u16 w, u16 h, ... u8 flag=1}`, computing `w`/`h` in a way that tolerates
+reversed coordinates — and hands it to the op dispatcher. Then, and this is
+the interesting part: **if `drv->[+0x24]` is set it does not call
+`lv_disp_flush_ready`**. The callback at `0x0080B1EC` does, after issuing a
+type-5 (wait) request that blocks until the transfer has drained. So the flush
+is asynchronous, and the acknowledgement is deferred to whenever LVGL next
+calls that slot. The slot is at offset 36 in `lv_disp_drv_t`, which in the v8
+layout is one of `clean_dcache_cb` / `wait_cb` depending on the exact tag —
+**not pinned down**, and it needs the vendor's `lv_hal_disp.h` to settle.
+
+`lv_lcd_init` (`0x00D3E34C`) fills a table at `0x008298B8` — the panel
+descriptor in the first word, then eight function slots:
+
+| Off | Function | Role |
+|---|---|---|
+| `+0x00` | `0x0081C1CC` | the panel descriptor (data, not code) |
+| `+0x04` | `0x00D3E2A4` | LCDC bring-up — the routine §12b transcribed |
+| `+0x08` | `0x00D3E18C` | teardown |
+| `+0x0C` | `0x00D3E1A4` | panel reset — the GPIO pulse in §7g |
+| `+0x10` | `0x00D3E21C` | called as `(10, 0x00D3B840)` from `lv_port_disp_init` |
+| `+0x14` | `0x00D3E188` | |
+| `+0x18` | `0x00D3E2E4` | **blit** — what `flush_cb` reaches |
+| `+0x1C` | `0x00D3E1FC` | |
+| `+0x20` | `0x00D3E1DC` | |
+
+It refuses to run twice: if `+0x04` is already set it logs (line 236 of its
+source file) and returns 1. On success it calls `0x00D3E2A4` (the LCDC
+bring-up) and then an optional hook at panel-descriptor `+0x28` — which is
+**0 on this board**, so nothing runs there. That extends §7b's descriptor map
+by three words: `+0x28 = 0`, `+0x2C = 4`, `+0x30 = 0x0081C1FC`.
+
+### 13d. Byte order on the wire — settled
+
+The window writer at `0x00D3EBD4` has two paths, chosen by whether the
+remaining byte count is a multiple of 8 (RGB565) or 24 (RGB888):
+
+- **bulk**: hand the buffer to the DMA at `0x00D9982C` with the QSPI quad
+  opcode `0x32` and the DCS command RAMWR, both read out of the panel
+  descriptor at `+0x0C` and `+0x0F`.
+- **remainder**: read each pixel with `ldrh`, **`rev16`**, and push it out
+  through the FIFO writer.
+
+`rev16` is the answer. LVGL keeps RGB565 little-endian in the framebuffer
+(13b), and the driver byte-swaps on the way out, so the panel receives
+**high byte first** — which is what MIPI DCS wants. Any driver we write that
+feeds `0x400D9000` from an LVGL-style RGB565 buffer must do the same swap, in
+software or by whatever descriptor bit the DMA path uses. The bulk path's swap
+has not been located; it is presumably a mode bit in the DMA or LCDC setup, and
+that is worth finding before trusting the fast path.
+
+Also worth noting from the same routine: the transfer is refused outright while
+a previous one is in flight (`state->[+0x04] == 2`), and the colour mode comes
+from panel descriptor `+0x08` — 1 for RGB565 (2 bytes/pixel), 2 for RGB888
+(3 bytes/pixel).
+
+### 13e. The backlight, re-opened
+
+§7b concluded that the PWM driver "is not recoverable from these dumps". It is
+worth re-running that search now that 94 KB more of the application is
+readable. Two concrete leads:
+
+- A device record at flash `0x00C7DE88`: `{0x00D452A1, 0x00030000,
+  ptr-to-"/dev/pwm_ch3", 00 01 02 03 04 05}`. `0x00D452A0` is code; `0x00030000`
+  decodes as bank 3 pin 0 under §7f's pin-id encoding, which §7g already lists
+  as an output driven high at `0x00D46432`.
+- The open at `0x00D10354` logs `-pwm open /dev/timer failed except!` on
+  failure, so the backlight PWM is built on the **timer block at
+  `0x40009000`** (§7c), not on a dedicated PWM peripheral. That is a much
+  narrower target than "find the PWM registers", and the timer block's layout
+  is already partly known.
+
+Both have now been followed through — **§14 has the registers.** The second
+lead was half wrong: the backlight is a PWM peripheral, just not the one §7c
+found, and not at `0x40009000`.
+
+## 13f. What state a payload actually starts in
+
+Measured from the host in bootloader mode on a cold chip (2026-08-07). Read
+this before assuming any peripheral is available: **almost nothing is.**
+
+CRU at `0x40080000`, every non-zero register:
+
+| Off | Value | Reading |
+|---|---|---|
+| `+0x000` | `0xD0010802` | core PLL, **locked** (bit 28) |
+| `+0x008` | `0x00000801` | CPU PLL, **stopped** — §12.6 |
+| `+0x010` | `0x02103AB4` | |
+| `+0x018` | `0x02206060` | |
+| `+0x01C` | `0x00010000` | |
+| `+0x030` | `0x00000070` | |
+| `+0x040` | `0x00000009` | divider A (§`sl6806_cru.h`) |
+| `+0x048` | `0x00000051` | divider B |
+| `+0x060`/`+0x070` | `0x00000002` | |
+| `+0x064`/`+0x074` | `0x00000008` | module gates. **Only bit 3.** The LCDC's bit 15 is *off* until something calls `Screen.begin()` |
+| `+0x068`/`+0x078` | `0x01000160` | more gates; bit 4 here is the PWM (§14a) |
+| `+0x0A0` | `0x00000101` | gate-shaped, **unexamined** |
+| `+0x0B0`, `+0x0DC`, `+0x0FC` | `0x00000001` | gate-shaped, **unexamined** |
+| `+0x0EC` | `0x00000700` | gate-shaped, **unexamined** |
+| `+0x100` | `0x00001701` | |
+| `+0x108` | `0x007C7C00` | |
+| `+0x10C` | `0` | the LCD module clock, until the LCD driver sets `0x911` |
+| `+0x11C` | `0` | the clock enable §14a writes `0x31` to |
+
+Power domains at `0x40000070` read `0x03FF03FF` — all ten requested and all
+ten acknowledged — so `0x00D9A7AC`'s handshake is already done. That is the
+one thing that *is* set up for you.
+
+> ⚠ **Do not assume state survives between runs.** It sometimes does — a
+> payload upload does not by itself reset the clock tree, and one run saw the
+> PWM still gated and configured from the previous one. But a replug (which is
+> how you get back into bootloader mode) resets everything, and the table above
+> is what you get afterwards. Treat every run as cold, write every step
+> unconditionally, and print a before/after readback. A stale chip and a
+> negative result look identical otherwise, and one run was lost to exactly
+> that.
+
+**The consequence worth internalising:** a peripheral that reads as zeros is
+gated, and a peripheral that reads structured values but ignores writes is
+*also* gated — `0x40096000` (the ADC) does the second. The only reliable test
+is write-then-read-back. Three runs of the backlight hunt were spent reading
+correct-looking values as though they meant the block was working.
+
+## 14. The PWM (backlight) and the DMA, both found
+
+Two blocks that no previous scan located, because neither is addressed as
+`base + offset` from a literal — both compute a per-channel base from one
+literal and a shift, so `tools/sl6806-find-mmio` had nothing to see.
+
+### 14a. PWM at `0x40084000` — this is the backlight
+
+`0x00D99C34` initialises one channel and is where the base falls out:
+
+```
+r0 = 0x40084020 + (ch << 5)              ; the channel's registers
+[0x0082B3F8 + (ch + 4) * 4] = r0         ; cached in a table
+[0x0082B3F8 + (ch >> 1) * 4 + 4] = 0x40084010 + (ch >> 1) * 4
+[0x0082B3F8] = 0x40084000
+```
+
+So: **block base `0x40084000`, six channels at `0x40084020 + ch * 0x20`**, a
+global register at `0x40084000`, and a per-pair register at
+`0x40084010 + (ch >> 1) * 4`. Everything else reaches a channel through the
+table at `0x0082B3F8`, which is why the base appears exactly twice.
+
+Channel registers, from the accessors in the blob at `0x00811E48`–`0x00811EC0`:
+
+| Off | Role |
+|---|---|
+| `+0x00` | control. bit 4 = **run**; bit 8 = update trigger, and the same bit is polled until clear; bit 28 polled as busy; `0x40` written at init; `0x00811EC0` writes `src \| (div << 8)` |
+| `+0x04` | **`(period << 16) \| duty`** — written by `0x00811D04`, which returns without writing unless `period >= duty` |
+| `+0x10` | bit 0 = enable; `0x00811E9A` writes `(x << 16) \| (mode << 1) \| bit0`, and forces bit 0 low first if bits [3:1] change |
+| `+0x14`, `+0x18`, `+0x1C` | three more `(hi << 16) \| lo` pairs |
+
+Entry points, all in the blob: `0x00811CE4` run/stop (`+0x00` bit 4),
+`0x00811CF4` enable (`+0x10` bit 0), `0x00811D04` set period/duty,
+`0x00811D2C`/`0x00811D3C` trigger and wait.
+
+**The backlight is PWM channel 3, and the numbers are exact.** `0x00D102F4`
+is `set_brightness(percent)`:
+
+```c
+if (pct > 100) pct = 100;
+req.op     = 3;
+req.period = 48000;              // a count, not a frequency
+req.duty   = pct * 480;          // rsb r3,r0,r0 lsl #4 ; lsls #5  ->  pct*15*32
+ioctl(pwm_dev, 0, &req);         // 0x00D3D374
+```
+
+`0x00D10354` opens `/dev/pwm_ch3` through the driver framework
+(`open` = `0x00D3D1E8`), with an initial period/duty of 48000/24000 and a
+completion callback at `0x00D102D4`, then immediately calls
+`set_brightness(60)` — which is where §7b's "default is 60%" comes from.
+
+The driver itself is registered from a table of ~21 device records at
+`0x00D3CF40`, each handed to `0x00D3D094`. The PWM record is at flash
+`0x00C7DE88`; its constructor `0x00D452A0` allocates 80 bytes and installs
+ops at `0x00D452F0`, `0x00D45394` (configure), `0x00D4534C` (stop) and
+`0x00D45200`.
+
+**What is still missing is the pad.** The record carries `0x00030000`, which
+decodes under §7f as bank 3 pin 0 — and §7g independently lists
+`0x000300C0`, the same pad as an output driven high at `0x00D46432`. That is
+suggestive, not established: the record's field order has not been read out
+of `0x00D3D094`, so `0x00030000` may be something else entirely. It also sits
+badly with §7b's result that driving every pad high lights nothing — although
+a backlight that wants a pulse train rather than a level would explain both.
+
+**TRIED ON HARDWARE, 2026-08-07 — no light, and the reason is upstream.**
+`examples/Backlight` ran all six channels. Every register read back zero,
+*including the module gate itself*: `modctl 0x0 -> 0x0`. The write did not
+stick, so nothing downstream of it could, and the gate bit was never the
+question.
+
+Reading the same addresses from the host, over the vendor read command, in
+the same bootloader mode, says the same thing and settles what it means:
+
+| Block | Reads |
+|---|---|
+| `0x40080000` CRU | live — `020801d0 00000000 01080000 …` |
+| `0x400D9000` LCDC | live — `99990000 48000000 01000000 …` |
+| `0x400E0000` | all zeros |
+| `0x400E2000` | all zeros |
+| `0x40084000` | all zeros |
+
+So MMIO is fine, the addresses are not obviously wrong, and the whole
+`0x400E****` region is simply **unclocked** — for the host as much as for a
+payload, which rules out anything payload-specific.
+
+**And the firmware says why: the PLL is off.** `0x00D9A7FC`, the first thing
+the vendor's module bring-up does, starts a PLL and spins on a lock bit
+*before* the first call into `0x400E0000`. That register reads `0x00000801`
+in bootloader mode, lock bit clear. See §12.6, which this also answers.
+
+**The bit-2 claim is retracted.** It was read off `0x00D99C14` calling
+`0x00D9A74C(2)` — but that teardown belongs to the module whose init ends at
+`0x00D99C0C`, not to the PWM channel init that happens to start `0x20` later.
+Across the eleven call sites of `0x00D9A734` the numbers used are 0, 1, 2, 3,
+4 and 6, and none is tied to the PWM. It is now a thing to find by experiment.
+
+**Then the gate was found by sweeping: CRU `0x40080068` / `0x40080078`, bit 4.**
+With it set the block answers — CTRL took `0x7F` and read back `0x1000007F`,
+period/duty took `(48000 << 16) | 28800` exactly. So §14a's register map is
+right and every write lands.
+
+**And the panel still does not light, because the counter has no clock.** Read
+back from the host afterwards, channel 3 holds its period and duty exactly,
+and **CTRL bit 28 is stuck set** — the busy flag `0x00811E74` spins on before
+every write. In a working system that must clear or the vendor's own setter
+would hang. Programmed is not running. The pair registers at `0x40084010` are
+zero, but nothing in flash or in the blob ever writes them, so they are not it.
+
+**The pad was a real missing step and was not enough on its own.** The vendor's
+configure op calls ROM `0x93C` with the id its constructor stores at `dev+0x48`
+— `0x00010200`, bank 1 pin 0 function 4. Muxing it changed nothing while the
+counter was stopped, but it is required and no earlier work had it: this is why
+`examples/BacklightHunt` could not have succeeded, since it drove candidates as
+function 1 and skipped bank 1's low pins as the panel's bus (true of pins 1–8,
+not pin 0).
+
+**Open: `0x4008011C`.** The vendor writes `0x31` after the PLL locks and `0x30`
+on the way down — one bit apart, so bit 0 is an *enable*, not the clock-source
+reparent it was first taken for, and an enable cannot carry the core or USB off
+with it. It is the last unwritten step of `0x00D9A7FC` and the leading
+explanation for both a stalled counter and a permanently dead `0x400E0000`.
+
+> ⚠ **CRU state survives a payload upload.** Uploading does not reset the clock
+> tree, so a PLL left locked by one run is still locked for the next. One run
+> was lost to a sketch that returned early on "already locked" and thereby
+> skipped the step it existed to test. **Probes must write every step
+> unconditionally**, and print a before/after readback, or a stale device looks
+> like a negative result.
+
+**The module walk was run properly and came back empty — a real negative.**
+All 128 ids, in the mask ROM's order, with the acknowledgement waited for:
+CTRL bit 28 never cleared. So the counter does not want a second module clock,
+and this is the first negative in this section that was reached with the right
+method rather than the wrong one.
+
+**The pair clock register was swept too, and is not the answer.** Sixteen
+sources against six dividers into `0x40084014`: the counter stayed stopped. The
+sweep did measure the register's shape, which is worth keeping — it only
+retains `0x10F`, so `src` is `[3:0]` and the divider is a single bit at `[8]`,
+not the eight-bit field `div << 8` in `0x00811EC0` implied.
+
+Also checked and eliminated: FIRM's `HAL_timer_*` is at `0x40099000`, a
+different block, so the PWM is not the timer and its clock is not the timer's.
+
+### RESOLVED — the backlight works. The missing bit was `0x40084014` bit 8
+
+Verified on hardware 2026-08-07, after twelve runs that were not. The recipe:
+
+1. `sl6806_module_enable(68)` — CRU `+0x78` shadow, then `+0x68` gate, bit 4,
+   then poll the gate. Order matters (§15b).
+2. Mux the pad `0x00010200` — bank 1 pin 0, function 4.
+3. `CTRL` ← `0x40`, then OR `0x3F`.
+4. Period and duty: `(48000 << 16) | percent * 480`.
+5. `MODE` bit 0.
+6. **`0x40084010 + (ch>>1)*4` bit 8** — the pair's clock enable.
+
+Step 6 is the whole story. **Nothing in flash or in the SRAM blob ever writes
+that register**, so no amount of reading the vendor's code could have produced
+it; it was found by holding each of the 32 settings the register accepts and
+watching the panel. The light came on at `0x100` and stayed on through `0x10F`,
+so bits `[3:0]` — what `0x00811EC0` assembles as a source select — make no
+difference to whether it runs. The writable mask is `0x10F`, so the "divider"
+implied by `div << 8` is that single enable bit.
+
+**The instrument was the problem, not the map.** CTRL bit 28 stays set while
+the backlight runs perfectly. Three separate "the counter never starts"
+conclusions in this section came from using it as a success test, including one
+that closed the investigation. `0x00811E74` does spin on it before writing
+period and duty, so it means *something* — but it is not a busy flag, and
+nothing should test it.
+
+Driver in `cores/sl6806/sl6806_pwm.[ch]` (`sl6806_backlight_begin`,
+`sl6806_backlight_set`), 16 host tests in `tests/host/test_pwm.c` aimed
+squarely at the pair-register write, because a reader checking this driver
+against the disassembly would find no vendor code for it and reasonably
+conclude it was spurious.
+
+**It lights, and it does not dim — the counter is not running.** Duty 0 and
+duty 100 are indistinguishable, CTRL bit 8 (the commit the vendor's own
+accessors pulse) never self-clears once set, and CTRL bit 28 is permanently
+set. So bit 8 of the pair register is driving the pad to a **static level**,
+not making a waveform. This is an on/off backlight until the counter's clock is
+found, which is enough to unblock the display and not enough to dim it.
+
+> ⚠ **Every sweep in this section that used CTRL bit 28 as its success test is
+> void** — including the walk over all 128 module ids, which is otherwise the
+> most thorough negative here. They were interrogating a bit that never
+> answers. A valid test is `sl6806_pwm_counter_ticking()`: read the channel
+> block twice and see whether anything moved. A running counter ticks; a
+> stopped one does not. `examples/Backlight` will redo the walk with it if you
+> press `h`.
+
+**The walk was redone with that detector and came back empty** — all 128 ids,
+twice, nothing ticked. That is the first negative in this section reached with
+a test that can answer, so it stands. One caveat worth stating: the detector
+watches `+0x00`..`+0x1C`, so strictly it shows no register visibly moves rather
+than that the counter is stopped. Taken with duty having no effect, the
+conclusion holds.
+
+**So the backlight is on/off and that is where it rests.** It is enough to
+unblock the display, which is what it was blocking.
+
+*Bring-up failed on the second upload* with "the module clock refused", on a
+board that was visibly working. That was a bug in the driver, not the chip:
+it wrote `CTRL = 0x40` and compared the read-back for equality, and CTRL
+carries read-only status (bit 28 among them), so on a warm chip it read
+`0x10000040` and the check failed. It now probes period/duty, which has no
+status bits. **Any writable test on this chip has to pick a register that is
+purely writable** — the same trap in a different costume.
+
+### Superseded — the state before the panel lit
+
+**The backlight came on**, blinking, while the pair-register sweep ran, and
+went dark for good once it finished (2026-08-07). First light out of this board
+from a payload.
+
+Two things follow, and the first invalidates the run above.
+
+**CTRL bit 28 is not a usable "counter stopped" indicator.** It stayed set
+throughout, while the backlight was visibly blinking. So every "still busy" in
+that log, and its closing "no clock source started the counter", measured
+something else. Whatever bit 28 means — `0x00811E74` does spin on it before
+writing period/duty — it is not "the counter is not running", and no negative
+in this section that used it as a test should be trusted.
+
+**And the sweep destroyed its own result.** It wrote the pair register back to
+zero at the end of each divider row, so a setting that lit the panel was
+extinguished a moment later. "Blinks, then dark" is precisely that.
+
+The register's writable mask is `0x10F`, so the real search space is 16 sources
+against a **one-bit** divider — 32 settings, not the 96 the sweep believed it
+was covering. `examples/Backlight` now holds one setting per tick, never resets
+the register, and freezes on any keypress, so the operator is the detector and
+the log line names the answer.
+
+### Superseded — the state when this was thought closed
+
+Everything reachable has been tried, most of it twice and the second time
+correctly. Established and verified on hardware:
+
+| | |
+|---|---|
+| PWM block | `0x40084000`, channels at `+0x20 + ch*0x20` |
+| Module id | 68 — CRU `+0x68` gate, `+0x78` shadow, bit 4 |
+| Backlight channel | 3 |
+| Pad | `0x00010200` — bank 1 pin 0, function 4; confirmed by reading the bank's function register back as `0x12222224` |
+| Registers | CTRL takes `0x7F`, period/duty takes `(48000 << 16) \| duty` exactly |
+| CTRL bit 28 | busy, and permanently set |
+
+Eliminated, each by measurement: the PLL (locks, changes nothing); the ten
+power domains (already acknowledged before a payload starts); `0x4008011C`
+(takes `0x31`, changes nothing); all 128 module ids in the ROM's own order with
+the acknowledgement waited for; every bit of the eleven gate-shaped CRU
+registers; every module-clock register `+0x100`–`+0x13C`; the pair clock
+select; the pad; the register contents.
+
+So the counter's clock is not in the address space a payload can reach, and no
+further register guess is worth a run. **The next move is ground truth**: read
+the CRU and the PWM while the stock firmware is running and diff against §13f's
+cold state. `read_mem` is refused in card-reader mode (§7d.1), so that needs a
+way in first — the likeliest being a patched FIRM, which §4 and §6 make
+repackable and which the mask ROM makes recoverable.
+
+**Background — the gate is module id 68.** §15b's `module_clock_enable` says ids 64–95
+gate through CRU `+0x68` with `+0x78` as the shadow, so "bit 4 of `0x68`" is
+module 68. The sweep that found it wrote both registers at once, which happens
+to be survivable for this peripheral and is not in general — the ADC's correct
+bit was recorded as dead by exactly that mistake. `examples/Backlight` now
+enables module 68 properly and then walks 0–127 for a second id, with CTRL bit
+28 going clear as the test. Everything below this line predates that.
+
+**Parked after seven runs. The counter clock was not found by sweeping.**
+`0x4008011C` took `0x31` and changed nothing — modctl still zero, busy still
+set. Then, with the known gate bit held, every other bit of all three CRU gate
+pairs was tried on top of it and **nothing cleared busy**. Two assumptions were
+checked from the host rather than assumed: bank 1's function register reads
+`0x12222224`, so pin 0 really is on function 4, and reading the channel twice
+gives identical words, so nothing counts.
+
+What is eliminated: the PLL, the ten power domains, the `0x4008011C` enable,
+all 96 CRU gate bits, the pair registers (nothing in flash or the blob writes
+them), the pad, and the register contents. What is left is a functional clock
+that nothing in the reachable address space turns on.
+
+**The next move is ground truth, not more register guesses.** Diff a working
+configuration against ours — read the CRU and PWM blocks while the *stock
+firmware* runs. `read_mem` is refused in card-reader mode (§7d.1), so that
+needs another way in, and §13 supplies the likeliest one: the application's
+SRAM image can be loaded out of flash by a payload, so the vendor's own driver
+stack could be brought up and called rather than reimplemented.
+
+### 14b. DMA — the channel registers are at `0x40001000`
+
+§7c lists `0x40070000` as "DMA". That block is real but it is only the
+request router and interrupt controller; the data path is somewhere else.
+The bootloader's channel allocator at `0x00829768` gives it away:
+
+```
+r2 = 64 * ch + 0x40001000        ; smlabb
+[handle + 8]  = r2               ; the channel's registers
+[handle + 12] = ch
+```
+
+**Eight channels at `0x40001000 + ch * 0x40`.** Handles are 16-byte records
+in a table (`0x0082EE00` in the bootloader), with `+0x0D` as the in-use flag.
+
+Channel registers, from the blob's API at `0x0080DA74`ff:
+
+| Off | Role |
+|---|---|
+| `+0x00` | control. bit 30 = start, bit 29 = cleared to arm / cleared again to abort, bit 31 = enable, bit 25 = a mode bit set by the allocator |
+| `+0x04` | **source** |
+| `+0x08` | **destination** |
+| `+0x0C` | `[17:0]` = length in bytes, `[31:18]` preserved config. Reading it back gives the remaining count (`0x0080DAFC`) |
+
+Eighteen bits of length means **256 KB per transfer** — a whole 240×296
+RGB565 frame (138.75 KB) goes in one.
+
+API in the blob: `0x0080DA74` start, `0x0080DAC8` abort, `0x0080DADE`
+enable/disable, `0x0080DAFC` remaining.
+
+The `0x40070000` block is the other half:
+
+| Off | Role |
+|---|---|
+| `+0x00` | request routing, 4 bits per channel |
+| `+0x20`, `+0x28` | request routing, 2 bits per channel each |
+| `+0x24` | interrupt status for the write direction, **write-1-to-clear** |
+| `+0x2C` | interrupt status for the read direction, W1C |
+
+Each channel occupies bits `2n` and `2n+1` of a status word. The two ISRs are
+`0x00806394` (`+0x24`) and `0x008063E0` (`+0x2C`); both read the status,
+write it straight back, then dispatch on bits 0, 2, 4 and 6 to callback slots
+at `0x008273D0 + 8` .. `+36`. The bootloader has a byte-identical pair at
+`0x00821DBC` — same silicon, same SDK code, so either copy can be read.
+
+Routing is allocated by `0x00CC6E34`, which walks four slots and then sets a
+regular pattern: channel `c` uses `+0x00` bits `4c` and `4c+4` (one for each
+direction), and bits `[2c+1:2c]` of `+0x20` and `+0x28`.
+
+### 14c. How the display uses the DMA
+
+`0x00D9982C` is the application's LCDC transfer, and it is worth comparing
+against `cores/sl6806/sl6806_lcdc.c` because it differs from the polled
+transcription in ways that matter:
+
+- it waits on `+0x14 & 0x60000000` before touching anything;
+- `+0x24` gets the QSPI opcode and `+0x2C` the DCS command, both read from
+  the panel descriptor (`0x32` and RAMWR);
+- **`+0x28[15:0]` is the pixel count minus one, not the byte count** — the
+  element width comes from `+0x20[21:20]`;
+- for the pixel stream both command-field lengths are zero, so `+0x20[3:2]`
+  is set to 2 (FIFO only) and **no command frame is emitted at all**; RAMWR
+  was already sent separately by `0x00D3E5A4`. A driver that re-sends RAMWR
+  with every chunk is not doing what the vendor does;
+- `+0x08` bit 4 is explicitly cleared — register mode, not command-list mode,
+  which matches the measurement in §12b;
+- then `0x0080DA74(handle, LCDC + 0x30, src, len)` hands the buffer to a DMA
+  channel writing into the LCDC FIFO, and `+0x20` bit 0 starts it.
+
+The remainder that does not divide by 8 goes out through `0x0080E5C0` with
+the `rev16` per pixel described in §13d. **Where the bulk path gets its byte
+swap is still unknown** — presumably a mode bit in the DMA or in
+`+0x20[21:20]`, and worth finding before trusting it.
+
+## 15. The keys, and the same wall as the backlight
+
+**What is established, from the dump alone.** The key manager at `0x00D1DA20`
+opens two devices and hands each a map; both maps are in the SRAM blob (§13):
+
+| Device | Map | Contents |
+|---|---|---|
+| `/dev/key_io` | `0x0081C044` | 16-byte records `{pad_id, 0, key_id, 0x101}` — bank 1 pin 17 → key `0x3E`, bank 1 pin 12 → key `0x3C` |
+| `/dev/kadc_ch0` | `0x0081C02C` | 12-byte records `{level, key_id, 0}` — `0x0200` → key `0x42`, `0x0E60` → key `0x40` |
+
+Both opens pass a count of 2, so those are all the entries. Four keys, plus
+power through the PMU.
+
+**The ADC is at `0x40096000`**, from the only MMIO literal in its HAL
+(`0x00D994F8`). Channels are `0x10` apart from `+0x20` (`0x00D993A0` dispatches
+ten of them). This board's key channel is 0, on **bank 1 pin 9, function 15** —
+the kadc constructor `0x00D3DB50` stores pad `0x00014800` with pad value
+`0x780`. `adc_init` is `0x00D994EC`: `+0x10`, `+0x18`, `+0x0C` ← 0,
+`+0x04` ← `0x0002A800`, `+0x00` ← `0x80180000`.
+
+**MEASURED, NEGATIVE — the GPIO keys are not the buttons.** Neither
+`/dev/key_io` pad moves when a button is pressed. Pin 12 idles at 1; pin 17
+sits at a steady 0, which confirms §7g's note that something external drives
+it. Nor does any of §7g's "likely button group" (bank 1 pins 22–27, 30, 31).
+Given the firmware also has `pwm_is_jack_exist` and `pwm_is_sd_exist`, these
+two are most likely detects rather than user keys — **untested**, and cheap to
+test by inserting a jack or an SD card and watching `examples/Buttons`.
+
+### RESOLVED — the keys read, and here is the whole recipe
+
+Working on hardware 2026-08-07. In order:
+
+1. **Enable module id 84** the way the mask ROM's `module_clock_enable`
+   (`0x00001C5C`) does — CRU `+0x78` (shadow) first, then `+0x68` (gate), bit
+   20, then poll `+0x68` until the bit reads back. Order matters; see §15b.
+2. **Mux the pad**: `0x00014F80` — bank 1 pin 9, function 15 (analog).
+3. **`adc_init`**, transcribed from `0x00D994EC`: `+0x10`, `+0x18`, `+0x0C` ← 0,
+   `+0x04` ← `0x0002A800`, `+0x00` ← `0x80180000`.
+4. **Enable the channel**, which `adc_init` has just switched off and which
+   nothing else turns back on: `+0x00 |= (1 << ch)` (`0x00D994BC`) and
+   `+0x0C |= (1 << ch)` (`0x00D9948C`).
+5. **Read the result** at `+0x24` for channel 0 — i.e. `+0x04` inside the
+   channel block at `+0x20 + ch*0x10`.
+
+Measured plateaus, jittering about 5 LSB:
+
+| ADC | Meaning |
+|---|---|
+| ~`0xFE9`–`0xFEE` | nothing pressed |
+| ~`0xD54`–`0xD5B` | key `0x40` |
+| ~`0x1B`–`0x2C` | key `0x42` |
+
+**The vendor's map is a list of ascending thresholds, not exact values.**
+`0x0081C02C` holds `{0x0200, 0x42}` then `{0x0E60, 0x40}`, and all three
+measured plateaus land where "below `0x200` → `0x42`, below `0x0E60` → `0x40`,
+else nothing" predicts. `examples/Buttons` decodes it that way.
+
+Still open: which physical button is which. The ids are `0x40` and `0x42`;
+mapping those to volume up and down needs one press each with someone
+watching, or the key-id enum out of the scene framework.
+
+**Superseded — the ADC is readable but not writable.** It reads
+structured values in a cold chip (`+0x00 = 0x00100000`, `+0x04 = 0x00000800`,
+`+0x08 = 0x000001E0`, `0x10` in the first two channel words) and **ignores
+every write**: `adc_init` leaves the block byte-identical. It is not an alias
+— `0x40095000` reads zeros and `0x40097000` is a different live block — so it
+decodes on its own and is simply gated.
+
+Tried and failed to open it: all 32 bits of each of the eleven gate-shaped CRU
+registers (`+0x60`, `+0x64`, `+0x68`, `+0x70`, `+0x74`, `+0x78`, `+0xA0`,
+`+0xB0`, `+0xDC`, `+0xEC`, `+0xFC`), and every module-clock register
+`+0x100`–`+0x13C` with enable set and each plausible source.
+
+**This is the same wall as §14a**, and it is worth stating as one problem
+rather than two. The application enables most peripherals through
+`0x400E0000` (`0x00D9A734`), and that register is dead from a payload. The CRU
+gates are a second, partial mechanism — they cover the LCDC completely, and
+the PWM's registers but not its counter. Nothing reachable turns on the rest.
+
+**So the useful next step is not another register sweep.** It is either to get
+the vendor's own driver stack running — §13 shows the app's SRAM image is in
+flash and loadable by a payload — or to observe a working configuration
+directly, which needs a way to read memory while the stock firmware runs
+(§7d.1 says `read_mem` is refused in card-reader mode).
+
+### 15a. The module clock register shape — decoded
+
+Worth recording because it was learned the hard way. `0x00D44690` writes
+`0x40080118` as: `[7:4]` ← one argument, `[11:8]` ← another, then bit 0 set.
+So CRU `+0x100`–`+0x13C` are per-module clocks with
+
+    bit 0 = enable,  [7:4] = source,  [11:8] = divider
+
+which fits both known values: the LCD's `+0x10C` = `0x911` (enabled, source 1,
+divider 9) and `+0x11C` = `0x31` (enabled, source 3). A peripheral needs *both*
+a gate bit and a module clock — the LCD driver sets both, and every sweep
+before this one only ever touched gates.
+
+### 15b. The mask ROM has a module_clock_enable, and it changes the map
+
+`0x00001C5C` is `module_clock_enable(id)` and `0x00001CE8` is its disable.
+They settle what the gate registers actually are, and they are not what §14a
+and §15 assumed:
+
+| Module id | Gate | Shadow |
+|---|---|---|
+| 0–31 | CRU `+0x60` | CRU `+0x70` |
+| 32–63 | CRU `+0x64` | CRU `+0x74` |
+| 64–95 | CRU `+0x68` | CRU `+0x78` |
+| **96–127** | **`0x400F1000 +0x20`** | **`0x400F1000 +0x30`** |
+
+Three things follow, and each invalidates part of an earlier sweep.
+
+**There is a fourth register pair, at `0x400F1000`.** §7c files that base as a
+storage controller — it is that as well, but `+0x20`/`+0x30` are module gates
+for ids 96–127. No sweep in this repository has ever touched them, so a
+quarter of the module space was unreachable, and "all 96 CRU gate bits" in
+§14a was 96 of 128.
+
+**The `0x60`/`0x64`/`0x68` registers are the gates and `0x70`/`0x74`/`0x78`
+are their shadows** — not two independent banks, which is how the backlight
+hunt treated them.
+
+**The order is part of the operation.** The ROM writes the shadow, then the
+gate, then spins until the gate reads the bit back. Every sweep here wrote
+both at once and moved on without waiting for the acknowledgement.
+
+`examples/Buttons` now walks ids 0–127 through a transcription of that
+routine. It is transcribed rather than called because the ROM's poll is
+unbounded: an id nothing implements would spin forever inside the boot ROM's
+USB handler and take the device off the bus.
+
+**IT WORKS. The ADC is module id 84** (2026-08-07) — the third pair, CRU
+`+0x68` gate / `+0x78` shadow, **bit 20**. With it enabled the block takes
+writes and holds them: `+0x00` reads back `0x80180000` and `+0x04` reads
+`0x0002A800`, exactly what `adc_init` wrote.
+
+Read that against §15's negative, which tried *that very bit* and failed. The
+difference is entirely the order — the old sweep set gate and shadow together
+and moved on, where the ROM sets the shadow, then the gate, then waits for the
+gate to read the bit back. **Shadow first, then gate, then poll: the order is
+the operation**, and a sweep that skips the acknowledgement will report a
+working bit as dead.
+
+The walk also has to be paced. The first attempt ran all 128 ids inside
+`setup()` with a 100000-iteration poll each, spent over a second in the boot
+ROM's USB handler, and took the device off the bus — with no log, because the
+console is a ring in the device's own RAM read over the link that died. Four
+ids per `loop()` call and a 200-iteration poll fixes both halves.
+
+**This is worth re-running for the PWM too.** The backlight's functional clock
+was hunted across three register pairs with the wrong write order and without
+the fourth pair, so §14a's negative is not as complete as it reads.
+
+## 16. Bluetooth — link-manager code and a candidate register block
 
 **Confirmed:** the application embeds a complete Bluetooth stack, not a
 stub. String evidence: a full `BT_EVENT_*` enum (stack open/close, inquiry,
@@ -1592,7 +2458,8 @@ routine a few hundred bytes from the HCI dispatch table (`0x00DA0000`
 That routine (`0x00D98C9C`) does a clear-bit31 / delay(10, via the
 already-documented delay veneer `0x00807214`) / set-bit31 reset pulse on
 `+0x228`, writes `0xFFFFFFFF` to `+0x200` during the window, registers
-`{base=0x400E2000, config_ptr}` into an SRAM descriptor at `0x0082B3A8`, sets
+`{base=0x400E2000, config_ptr}` into an SRAM descriptor at `0x0082B3A8`,
+calls `0x00D9A7FC` (r0=42), `0x00D9A734` (r0=0) and `0x00D9A768` (r0=0), sets
 bit 24 of `+0x214`, then fans a caller-supplied config struct out into
 roughly a dozen narrow bitfields at `+0x10, +0x14, +0x20, +0x44, +0x48,
 +0x4C, +0x50, +0x54, +0x58, +0x70, +0x78, +0x7C`. A separate accessor
@@ -1607,10 +2474,26 @@ data table. Full offset list and citations: `cores/sl6806/sl6806_bt.h`.
 Writeup with the reproduction commands and what to check on hardware next:
 `docs/BLUETOOTH.md`.
 
+**§14a/§15 land on top of this and explain why a payload will currently see
+nothing.** Both `0x00D9A7FC` and `0x00D9A734` are named there, independent
+of this section: `0x00D9A7FC` is "the first thing the vendor's module
+bring-up does" — it starts the PLL at `0x40080008` and spins on its lock bit
+— and `0x00D9A734` is the routine through which "the application enables
+most peripherals through `0x400E0000`", confirmed dead from a payload, with
+call-site arguments 0/1/2/3/4/6 elsewhere (this routine's argument here, 0,
+falls inside that range). §14a's own host-side read of `0x400E2000` in
+bootloader mode already came back **all zeros**, alongside `0x400E0000` and
+`0x40084000` — consistent with this block sharing the same unlocked PLL and
+`0x400E0000` gate as everything else behind that wall, not evidence against
+it being real hardware. `0x00D9A768` remains unexamined; it sits in the same
+small cluster of bring-up helpers as `0x00D9A7FC`/`0x00D9A734`/`0x00D9A74C`.
+
 **Not established:** what any bit means (the mixed 7/8/10/12/14/16/18-bit
 field widths are consistent with radio/link timing parameters but that is a
-shape argument, not a decode); whether the block is even readable from a
-payload (LCD and GPIO both needed SRAM-resident vendor code absent in
-bootloader mode — this may be the same); whether one register window is the
-whole story for a part with an actual radio. `examples/BtProbe` is the
-read-only hardware test for the first of those.
+shape argument, not a decode); whether one register window is the whole
+story for a part with an actual radio; and — now the same open item as
+§14a/§15's PWM and ADC work — what unlocks the PLL and the `0x400E0000` gate
+without reparenting the core or USB clock out from under the session.
+`examples/BtProbe` reproduces §14a's zero-read from a payload rather than
+the host command, and is the sketch to re-run once that unlock work (Next
+actions item 11) lands.
