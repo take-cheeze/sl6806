@@ -3999,3 +3999,44 @@ EXTRA_FLAGS=-DTONEDEMO_EQ_HOLD=1` tries it, with the same completion-time
 witness. If that does not move the number either, the next thing to read is
 the application's EQ path — `HAL_eq_open`, `hardware EQ open success` — which
 is the one part of the audio subsystem nobody has followed.
+
+### MEASURED — the EQ hold moves the register window, and that is the lever
+
+`examples/ToneDemo` with `-DTONEDEMO_EQ_HOLD=1`, holding module clock 32,
+romclk 45 and bit 2 of `0x40000020`. **The first thing this session to change
+the audio block's behaviour at all**, and every change points away from a fix:
+
+| | before | after |
+|---|---|---|
+| `+0x400` | `0x00000000` | `0x003378B1` |
+| `+0x108` | `0x12BC0910` | `0x00BC1F7A` |
+| `+0x008` route 0 | `0x20832083` | `0x00832083` |
+| mean completion | 10 µs | 3 µs |
+
+The two register changes are one change. The length field at `+0x108 [31:16]`
+is written `0x12BC` and reads back `0x00BC`; `+0x008`'s channel-1 half loses
+bit 13, which is register bit 29. **Bits [31:24] stop accepting writes across
+both registers.** A length truncated from 4796 to 188 bytes is why the
+transfer got faster rather than slower — 3 µs is a shorter transfer, not a
+better one.
+
+So §20's last candidate is ruled out: holding those enables is harmful, and
+the vendor's init borrows them for the length of a memset for a reason.
+
+**What it buys instead** is the only lever the block has responded to in five
+runs. Something among those three moves the register window, and
+`examples/AudioWindow` separates them: all eight combinations, a known value
+written into the length field each time, reporting whether the top byte
+survives and what `+0x400` reads.
+
+The interesting outcome would be the pad-mux bit alone. `0x40000020` is the
+pad/pin function mux (§7c), not a clock, and a mux bit that changes which
+register bits are implemented is a **window switch** — which would make
+`+0x400` a second view of the same address space rather than a coefficient
+RAM, and would explain both why the vendor holds it so briefly and why
+`+0x400` reads `0x003378B1` while it is held.
+
+This needed `sl6806_module_disable()` — ROM `0x1CE8`, whose order is the
+reverse of the enable's: **gate first, then shadow**. Turning a clock off is
+the dangerous direction, so the sketch only switches off an id it switched on
+itself.

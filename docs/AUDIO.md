@@ -142,8 +142,41 @@ streaming rather than borrowed for an init. Nothing in the vendor's code holds
 them, but nothing in the vendor's code needed to: the application configures
 an EQ preset and the vendor's own path may take them again there.
 
-That is testable with the same witness — `sl6806_audio_eq_hold()` and
-`examples/ToneDemo` — and is the next thing to run.
+`sl6806_audio_eq_hold()` does it, and it was run.
+
+## MEASURED — the EQ hold changes the block, in the wrong direction
+
+`ToneDemo` with `-DTONEDEMO_EQ_HOLD=1`. The first thing all session to change
+the block's behaviour at all, and every change points away from a fix:
+
+| | before | after |
+|---|---|---|
+| `+0x400` | `0x00000000` | `0x003378B1` — the sub-block wakes |
+| `+0x108` | `0x12BC0910` | `0x00BC1F7A` |
+| `+0x008` route 0 | `0x20832083` | `0x00832083` |
+| mean completion | 10 µs | 3 µs |
+
+**The two register changes are the same change.** The length field at `+0x108
+[31:16]` is written 4796 = `0x12BC` and reads back `0x00BC` — the top byte of
+the register stopped holding. `+0x008`'s channel-1 half lost bit 13, which is
+register bit 29 — also the top byte. **Bits [31:24] stopped accepting writes
+across two registers**, and a length truncated from 4796 to 188 bytes is
+exactly why the transfer got *faster*.
+
+So the EQ hypothesis is dead: holding those enables makes it worse, and the
+vendor borrows them briefly for a reason. But something in there moves the
+register window, and that is the only lever the block has responded to at all.
+
+`examples/AudioWindow` separates the three — module clock 32, romclk 45, and
+bit 2 of `0x40000020` — across all eight combinations, writing a known value
+into the length field each time and reporting whether the top byte survives.
+If it is the pad-mux bit alone, `+0x400` is a second *view* of the same
+address space rather than a coefficient RAM, which would explain why the
+vendor only ever holds it for the length of a memset.
+
+That needed `sl6806_module_disable()` (ROM `0x1CE8`, whose order is the
+reverse of the enable's: gate first, then shadow). It is the dangerous
+direction, so the sketch only ever switches off an id it switched on.
 
 ## MEASURED, third run — the routes take, and the DMA is still not paced
 

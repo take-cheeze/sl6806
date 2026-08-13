@@ -74,6 +74,16 @@ int sl6806_module_enable(unsigned id);
 int sl6806_module_enabled(unsigned id);
 
 /*
+ * Turn one off. ROM 0x1CE8, whose order is the reverse of the enable's: gate
+ * first, then shadow.
+ *
+ * This is the dangerous direction - a functional clock something else is
+ * using, the USB the console rides on for instance, is not yours to switch
+ * off. Call it only on an id you enabled yourself, in the same sketch.
+ */
+void sl6806_module_disable(unsigned id);
+
+/*
  * ===================================================================
  *  THE SECOND ENABLE, AND THE ORDER BETWEEN THEM
  * ===================================================================

@@ -38,6 +38,35 @@ int sl6806_module_enable(unsigned id)
 }
 
 /*
+ * ROM 0x1CE8, transcribed. Note the order is the REVERSE of the enable: gate
+ * first, then shadow. The ROM does it that way and there is no reason to
+ * guess differently on a chip where the enable's order turned out to be the
+ * whole operation (see the header).
+ *
+ * Added for examples/AudioWindow, which has to turn a module clock off again
+ * to tell which of three enables changes the audio block's register window.
+ * Turning off a clock is the dangerous direction - do not call this on an id
+ * you have not just enabled yourself.
+ */
+void sl6806_module_disable(unsigned id)
+{
+    uint32_t base, gate, shadow, bit;
+
+    if (id >= 128)
+        return;
+
+    if (id < 32)        { base = CRU_BASE;    gate = 0x60; shadow = 0x70; }
+    else if (id < 64)   { base = CRU_BASE;    gate = 0x64; shadow = 0x74; id -= 32; }
+    else if (id < 96)   { base = CRU_BASE;    gate = 0x68; shadow = 0x78; id -= 64; }
+    else                { base = MOD_BASE_HI; gate = 0x20; shadow = 0x30; id -= 96; }
+
+    bit = 1u << id;
+
+    sl6806_mmio_clr(base + gate, bit);
+    sl6806_mmio_clr(base + shadow, bit);
+}
+
+/*
  * ROM 0x1E54, transcribed: the shadow AND the gate, in that order, across the
  * same four banks. The ROM tests both because setting only one leaves a
  * module that reads enabled and is not - which is the failure sl6806_module.h
