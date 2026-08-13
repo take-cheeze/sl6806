@@ -358,14 +358,17 @@ In rough order of how much they unlock:
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-3. **Clock channel 6, which is MCLK — the camera's real blocker.** With the
-   bus proven against the FM tuner, `0x68` staying silent points at the
-   sensor having no clock. The vendor programs the channel through a
-   dispatcher at `0x00CC769C` that *is* in flash and does decode (§7h):
-   channel 6 lands in `0x00CC7334`, which reaches the hardware through an
-   indexed register file at `0x00804EAC` / `0x00804E44` and accepts one of
-   six fixed frequencies. An indexed register file with six legal values is a
-   much smaller thing to find than an arbitrary peripheral.
+3. **The indexed register file at `0x00804EAC` / `0x00804E44`.** Not just the
+   camera's problem: it is read 90 times and written 50 times across the
+   firmware, with register numbers spread over `0x00`..`0x82` and values
+   masked as bytes — a ~130-entry file addressed by index rather than by
+   address, which is the shape of a PMU / analog register bank rather than an
+   MMIO block. Clock channel 6 (MCLK) goes through it, and so, most likely,
+   does whatever switches the camera's supply. It is **not** in the flash
+   image at any alignment (§7h records that search so nobody repeats it), so
+   `maskrom.bin` is where to look — the same place the pad controller turned
+   out to be. Whoever finds how `0x00804E44` reaches the hardware unlocks 140
+   call sites at once.
 4. **An FM driver**, now the cheapest working device on the board: an
    RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
    part, published register map, and the id read is done.
