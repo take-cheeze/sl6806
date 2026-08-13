@@ -938,6 +938,42 @@ means writing an index and seeing the data register change - and writing to a
 suspected power/clock file is exactly what should not be done casually. That
 is the wall this line of attack reaches.
 
+## 7k. PSMP — the settings partition, decoded
+
+The last partition, `PSMP` at `0x3FC000` (`0x4000` bytes), is a key/value store
+of the device's own runtime state. Records are appended, so a key appears many
+times and the last one wins - which is why a 16 KB partition holds only 27
+distinct keys across 128 records.
+
+```
+55 AA | crc32? (4) | flags (2) | index (2) | keylen (2) | key | value
+```
+
+The keys, in first-seen order:
+
+```
+restore_factory  bt_addr     device_id    freq_drift   bt_inqname
+bt_showname      bright      clock_type   bluetooch_status (sic)
+bt_name          set_screen_time          screen_saver start_screen_time
+on_lang_sel      spk_switch  language     volume       MUSIC
+voltage          power_on_step            language_name
+bt_relink        btlinknum   btlinkinfo   le_addr
+alarm_clock_info FM
+```
+
+`device_id` on this unit reads
+`BJTXKJMP3---P20-------D30-------------F7B2F5D6674A218152--------`, which is
+the only SKU-like string on the device - vendor code, model `P20`, a variant
+field `D30`, then a serial.
+
+**Relevant to whether this unit has a camera:** there is a persisted `FM` key
+(64 bytes of preset stations) for a device we have proved is fitted, and *no
+camera key of any kind*. That is suggestive rather than conclusive - a camera
+app need not persist anything - and it sits against the fact that the `camerca`
+scene is fully wired into the UI, with 26 references and its own dedicated key
+(§7h). The firmware offers a camera; the settings have never recorded one being
+used.
+
 ## 7c. Peripheral map
 
 - **Peripheral MMIO region is `0x40000000`.** Established by decoding every
