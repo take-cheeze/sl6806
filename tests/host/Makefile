@@ -11,7 +11,7 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
 TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
-         test_regfile
+         test_regfile test_audio test_bt
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -35,6 +35,12 @@ run-test_pwm: test_pwm
 	./$<
 
 run-test_regfile: test_regfile
+	./$<
+
+run-test_audio: test_audio
+	./$<
+
+run-test_bt: test_bt
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -73,6 +79,20 @@ test_pwm: test_pwm.c $(CORE)/sl6806_pwm.c $(CORE)/sl6806_module.c
 # transfer order, the direction byte, the bounded poll, and the two voltage
 # scales, in both directions.
 test_regfile: test_regfile.c $(CORE)/sl6806_regfile.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
+
+# The audio controller against a model of the block, its module gate and the
+# CRU in front of both. Like test_regfile this driver has never run, so what
+# these check is that the transcription performs the vendor's sequence: the
+# descriptor order, the three-quarter watermark, the 8000 Hz rate split, and
+# a gate test that writes rather than trusting a plausible read.
+test_audio: test_audio.c $(CORE)/sl6806_audio.c $(CORE)/sl6806_module.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
+
+# The Bluetooth gate. This is the one sequence in the tree that starts a PLL,
+# so the order is the whole content and every poll in it has to be bounded -
+# the PLL's lock bit is known not to set in bootloader mode.
+test_bt: test_bt.c $(CORE)/sl6806_bt.c $(CORE)/sl6806_module.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:

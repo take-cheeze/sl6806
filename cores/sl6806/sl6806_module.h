@@ -65,6 +65,15 @@ extern "C" {
 int sl6806_module_enable(unsigned id);
 
 /*
+ * Is a module's clock already on? Both the shadow and the gate, which is what
+ * ROM 0x1E54 tests and what "enabled" has to mean given the order above.
+ *
+ * The vendor uses exactly this as a once-guard: 0x00D9A7FC checks module 46
+ * and returns without starting the PLL if it is already up.
+ */
+int sl6806_module_enabled(unsigned id);
+
+/*
  * ===================================================================
  *  THE SECOND ENABLE, AND THE ORDER BETWEEN THEM
  * ===================================================================
@@ -98,6 +107,50 @@ int sl6806_module_enable(unsigned id);
  */
 #define SL6806_PERIPH_ENABLE_REG   0x400E0000u
 #define SL6806_PERIPH_RESET_REG    0x400E0008u
+
+/*
+ * ===================================================================
+ *  OPENING THE GATE IN FRONT OF 0x400E0000
+ * ===================================================================
+ * [M] 2026-08-13, examples/BtProbe: the vendor's own group bring-up
+ * (0x00D9A7FC) runs from a payload, the PLL locks - 0x40080008 written
+ * 0xC0000C04 comes back 0xD0010C04 with bit 28 set - and 0x400E0000 holds
+ * 0x21 afterwards. The console survives it. That closes two open items §14a
+ * left: the PLL was only ever seen stopped before, and 0x4008011C = 0x31 was
+ * flagged "plausibly safe but untried".
+ *
+ * This used to live in sl6806_bt.c, which was the wrong home: module 46 gates
+ * the whole 0x400Exxxx window, not Bluetooth, and every peripheral in the
+ * group calls the same routine first.
+ *
+ * Returns 1 if module 46 acknowledged. Guarded like the vendor's: does
+ * nothing if module 46 is already up, so a second call is cheap and does not
+ * restart a PLL something else may be using.
+ */
+#define SL6806_PERIPH_GROUP_MODULE_ID  46   /* [V] gates 0x400E0000 itself */
+#define SL6806_PERIPH_GROUP_PERIPH_ID  5    /* [V] taken by the shared path */
+
+/*
+ * [V] The power-domain handshake the group bring-up does before the PLL
+ * (0x00D9A7AC), and it is at the pad-mux base, not the CRU:
+ *
+ *     for (i = 0; i < 10; i++)
+ *         if (!(0x40000070 & (1 << (16 + i)))) {
+ *             0x40000070 |= (1 << i);
+ *             while (!(0x40000070 & (1 << (16 + i)))) ;
+ *         }
+ *     0x40000074 = 0;
+ *
+ * Ten request bits in [9:0], ten acknowledgements in [25:16]. [?] what the
+ * ten domains are - this is the only code in the dump that touches either
+ * register, so there is nothing to cross-reference it against.
+ */
+#define SL6806_PWR_REQ                 0x40000070u
+#define SL6806_PWR_ACK_SHIFT           16
+#define SL6806_PWR_DOMAINS             10
+#define SL6806_PWR_RELEASE             0x40000074u
+
+int sl6806_periph_group_begin(void);
 
 /*
  * Set a peripheral's functional clock bit and wait the vendor's 10 ms

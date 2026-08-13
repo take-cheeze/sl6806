@@ -77,6 +77,12 @@
  *
  * The firmware agrees: 0x00D9A7FC brings the PLL up and only then makes the
  * first call into 0x400E0000. See SL6806_PLL_* below.
+ *
+ * [M] SUPERSEDED 2026-08-13. 0x400E0000 is reachable now: after
+ * sl6806_periph_group_begin() - the vendor's own sequence, module 46 and all
+ * - it holds bits from a payload and the PLL locks (0x40080008 reads back
+ * 0xD0010C04). examples/AudioWall walked all 32 of its bits. So "dead
+ * forever" is retired; what is still true is that the PWM does not need it.
  * ---------------------------------------------------------------------
  */
 #define SL6806_MODCTL_BASE      0x400E0000u
@@ -151,10 +157,12 @@
  * matters, because a reparent could have taken the core or USB with it and a
  * plain enable cannot.
  *
- * It is the last step of the vendor's PLL sequence that nothing here performs,
- * and it is the leading explanation for two things at once: a PWM whose
- * registers answer but whose counter never runs, and a 0x400E0000 that reads
- * zero forever.
+ * [M] 2026-08-13: performed, twice, and survivable - examples/BtProbe and
+ * examples/AudioWall both run it and the console lives. It is no longer "the
+ * last step nothing here performs", and it is no longer a candidate
+ * explanation for the stalled PWM counter either: 0x400E0000 opens and the
+ * counter is still not the thing this unlocked. §18 has a better lead - the
+ * vendor's system clock init at 0x00806800, which a payload never runs.
  */
 #define SL6806_CRU_CLK_ENABLE   0x4008011Cu
 #define SL6806_CRU_CLK_ON       0x31u
@@ -183,6 +191,16 @@
  * [M] The writable mask is 0x10F. Writing 0x3F0F reads back 0x10F, so the
  * "divider" implied by `div << 8` in 0x00811EC0 is a single bit, and that
  * bit is this enable.
+ *
+ * [V] CONFIRMED 2026-08-13, against docs/sl6806_re_notes.md §14a, which files
+ * that same write under the channel's +0x00 control register instead. It is
+ * this one. Every PWM accessor fetches its target from a cached pointer table
+ * at SRAM 0x0082B3F8, and they index it differently: the update trigger takes
+ * T[ch + 4], the src|div<<8 writer takes T[ch + 1]. Three slots apart, so
+ * different registers - and with six channels and three pairs the layout is
+ * T[0] global, T[1..3] the pair registers, T[4..9] the channel controls, so
+ * the src|div<<8 caller is indexed by PAIR. §18 has the working; §14a's row
+ * is struck through there.
  *
  * Nothing in flash or in the SRAM blob writes this register. It reads 0 on a
  * cold chip and stays 0, which is why reading the vendor's code was never
