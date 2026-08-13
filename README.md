@@ -45,7 +45,9 @@ so it is worth being precise about which parts are real:
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
 | Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
-| Camera | **Not yet, but fully decoded.** Documented register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h, pads included. It is on TWI 0 and needs a real bus — a 1 MP sensor is not something to bit-bang — so the TWI controller base still blocks it. |
+| I2C on bare pads | **Works — confirmed on hardware.** `examples/CameraDemo` bit-bangs TWI 0 on two pads and reads the FM tuner's chip id: `0x5808`, the exact value the stock driver checks for, on a read-only pass. First device this framework has ever read over I2C, and it needs no TWI controller. |
+| Camera | **Run on hardware; `0x68` answers nothing on a bus that works.** Decoded register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h. `examples/CameraDemo` runs the vendor's power-up, scans the whole address range under eight combinations, and proves the bus against the tuner before concluding anything — so the pads, the SDA/SCL assignment and the pull-ups are all cleared, and what is left is **MCLK** (clock channel 6, registers unknown — there is now a lead, §7h) and **sensor power**. Pixels are a further problem again: the DVP/CSI front end and the JPEG/H.264 encoders are undecoded. |
+| FM tuner | **Identified, no driver.** RDA5807 family on TWI 0 at `0x10` (`0x11` and `0x60` alias it), chip id `0x5808`, documented in §7i. The bus is done and the part is a standard one, so this is now the easiest device on the board to write. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
 Two honest caveats worth reading before you trust output:
@@ -214,7 +216,7 @@ peripheral behind them. See `tests/emu/sl6806_emu.py`.
 hardware says back — mode detection from a SCSI inquiry, for instance. Those
 are pure functions, and `--help` in CI cannot check them.
 
-CI runs all three on every push and pull request, plus a build of seven
+CI runs all three on every push and pull request, plus a build of eight
 sketches in both modes with `-Werror`.
 
 ## Getting started
@@ -356,19 +358,27 @@ In rough order of how much they unlock:
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-3. **The TWI controller's base address.** Two decoded devices are waiting on
-   it: a CST816 touch panel on bus 1 and a 1 MP camera on bus 0, both with
-   their registers, init tables and pads already written down (§7h). The
-   firmware reaches them only through mask-ROM routines that a payload
-   cannot call, so this is the same kind of hunt §12b did for the LCDC. The
-   touch panel no longer waits on it — `examples/TouchDemo` bit-bangs bus 1
-   on the pads, which is plenty for seven bytes per touch — so what the base
-   would buy is the camera, and speed.
-4. **A DMA driver.** The display pushes pixels 16 bytes at a time because
+3. **Clock channel 6, which is MCLK — the camera's real blocker.** With the
+   bus proven against the FM tuner, `0x68` staying silent points at the
+   sensor having no clock. The vendor programs the channel through a
+   dispatcher at `0x00CC769C` that *is* in flash and does decode (§7h):
+   channel 6 lands in `0x00CC7334`, which reaches the hardware through an
+   indexed register file at `0x00804EAC` / `0x00804E44` and accepts one of
+   six fixed frequencies. An indexed register file with six legal values is a
+   much smaller thing to find than an arbitrary peripheral.
+4. **An FM driver**, now the cheapest working device on the board: an
+   RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
+   part, published register map, and the id read is done.
+5. **The TWI controller's base address** — demoted, because it is now a speed
+   problem rather than an access one. `examples/TouchDemo` bit-bangs bus 1
+   and `examples/CameraDemo` bit-bangs bus 0, both on pads alone, and the
+   second has read a real device. What the base would buy is throughput,
+   which matters for a camera and not much else.
+6. **A DMA driver.** The display pushes pixels 16 bytes at a time because
    that is the FIFO depth. The vendor uses the DMA controller at
    `0x40070000`; its command-list format is decoded at the bottom of
    [`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
-5. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+7. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
    clock, so this no longer blocks anything; finding the PLL registers would
    still give it exactly. They are *not* at the clock unit's base:
    `0x40080000` has dividers but no multiplier.
@@ -390,8 +400,9 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, TouchDemo, LcdProbe, PadScope,
-                  PadSweep, BacklightHunt, MmioProbe, RomProbe, CallbackProbe
+examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, LcdProbe,
+                  PadScope, PadSweep, BacklightHunt, MmioProbe, RomProbe,
+                  CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
 docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
 3rd/              smartlink_flash submodule

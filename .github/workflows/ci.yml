@@ -40,7 +40,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        sketch: [Hello, Blink, GfxDemo, TouchDemo, MmioProbe, RomProbe, CallbackProbe]
+        sketch: [Hello, Blink, GfxDemo, TouchDemo, CameraDemo, MmioProbe, RomProbe, CallbackProbe]
         mode: [payload, firmware]
     steps:
       - uses: actions/checkout@v4
