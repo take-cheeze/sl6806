@@ -23,6 +23,8 @@ make SKETCH=examples/Hello upload
 make SKETCH=examples/Hello monitor
 ```
 
+Bringing a real device up for the first time: **[docs/BRINGUP.md](docs/BRINGUP.md)**.
+
 ## What actually works
 
 This chip has no datasheet. Everything here was built from a firmware dump and
@@ -410,8 +412,8 @@ examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, FmDemo,
                   RegFileProbe, LcdProbe, PadScope, PadSweep, BacklightHunt,
                   MmioProbe, RomProbe, CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
-docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md,
-                  ACTIONS_CARDREADER.md
+docs/             BRINGUP.md, DUMPING.md, FLASHING.md, LCD.md,
+                  sl6806_re_notes.md, ACTIONS_CARDREADER.md
 3rd/              smartlink_flash submodule, actions_flash submodule
                   (for a different, non-SL6806 device - see
                   docs/ACTIONS_CARDREADER.md)
