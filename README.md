@@ -43,11 +43,11 @@ so it is worth being precise about which parts are real:
 | `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
-| Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
+| Audio, SD, Bluetooth | **Not yet.** Hardware confirmed present; no drivers. |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
 | I2C on bare pads | **Works — confirmed on hardware.** `examples/CameraDemo` bit-bangs TWI 0 on two pads and reads the FM tuner's chip id: `0x5808`, the exact value the stock driver checks for, on a read-only pass. First device this framework has ever read over I2C, and it needs no TWI controller. |
 | Camera | **The module is fitted and works — under the stock firmware. From a payload, `0x68` is silent, and the cause is now known to be power.** Decoded register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h. The vendor's camera app shows a live preview on this unit, which confirms the pads, the bus, the address and the clock from the other end — `examples/CameraDemo` reaches the same sensor over the same wires and gets nothing. What the vendor does and a payload does not is switch a rail: its `power_on` is only pads, delays and clock channel 6, so the enable happens further up, behind the indexed register file a payload cannot reach. |
-| FM tuner | **Identified, no driver.** RDA5807 family on TWI 0 at `0x10` (`0x11` and `0x60` alias it), chip id `0x5808`, documented in §7i. The bus is done and the part is a standard one, so this is now the easiest device on the board to write. |
+| FM tuner | **Tunes, on hardware.** RDA5807 family on TWI 0 at `0x10`, chip id `0x5808` (§7i). `examples/FmDemo` enables it and sweeps the band over bit-banged I2C: 41 channels tuned, each setting tune-complete and reading its own channel number back. First peripheral this framework has successfully *written* to. No audio path yet — the proof is the tuner's own status registers, and RSSI stays at the noise floor until headphones are plugged in, since the lead is the aerial. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
 Two honest caveats worth reading before you trust output:
@@ -216,7 +216,7 @@ peripheral behind them. See `tests/emu/sl6806_emu.py`.
 hardware says back — mode detection from a SCSI inquiry, for instance. Those
 are pure functions, and `--help` in CI cannot check them.
 
-CI runs all three on every push and pull request, plus a build of nine
+CI runs all three on every push and pull request, plus a build of ten
 sketches in both modes with `-Werror`.
 
 ## Getting started
@@ -400,9 +400,9 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, RegFileProbe,
-                  LcdProbe, PadScope, PadSweep, BacklightHunt, MmioProbe,
-                  RomProbe, CallbackProbe
+examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, FmDemo,
+                  RegFileProbe, LcdProbe, PadScope, PadSweep, BacklightHunt,
+                  MmioProbe, RomProbe, CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
 docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
 3rd/              smartlink_flash submodule

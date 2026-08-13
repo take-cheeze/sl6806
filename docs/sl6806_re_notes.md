@@ -913,9 +913,20 @@ checks for. Any other silent address on this bus is silent for its own
 reasons - which is exactly how the camera's remaining suspects were narrowed
 to two, neither of them on the bus.
 
-An FM driver is now a small job - the bus is done, the addresses are known,
-and what is left is the register map of a well-documented part. Note it needs
-headphones plugged in as an antenna (the UI says so in five languages).
+**DRIVEN ON HARDWARE.** `examples/FmDemo` enables the tuner and sweeps the
+band over the same bit-banged bus, and it works: 41 channels tuned, every one
+setting tune-complete and reading its own channel number back out of the
+status register. That is the first time this framework has *written* to a
+peripheral device rather than reading one or driving a pad.
+
+RSSI comes back at 9 across the lower band and 0 across the upper, with no
+peaks - which is the aerial missing rather than the driver failing, since on
+this device the aerial is the headphone lead. The registers used for the tune
+are the published RDA5807 ones (`0x02` enable/mute, `0x03` channel and tune,
+`0x0A`/`0x0B` status), not anything from the dump - the vendor driver only
+ever reads the id and writes the enable.
+
+An FM driver is now a small job
 
 ## 7j. The peripheral map, read on hardware
 
