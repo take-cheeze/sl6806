@@ -6,7 +6,7 @@ The display stack is in three layers, and all three now exist.
 |---|---|
 | Drawing — framebuffer, primitives, font, `Display`/`Screen` | **done**, 64 host tests |
 | Panel — geometry, init sequence, windowing, sleep/wake | **done**, recovered from the firmware, 53 host tests |
-| Bus — putting a byte on the wire | **done**, 195 host tests against a model, and **verified on the panel 2026-08-07** |
+| Bus — putting a byte on the wire | **done**, 198 host tests against a model, and **verified on the panel 2026-08-07** |
 
 **It works.** `examples/GfxDemo` draws shapes and text on the panel, in the
 right colours, and the whole stack from a `Screen.fillRect()` call to a lit
@@ -355,6 +355,27 @@ descriptor is 320x385, which is not this panel, and it configures bank 4 pads
 where the application uses bank 1. It may be generic SDK code that the vendor
 never ran here. The register semantics it implies could be right in general
 and wrong in some detail this board depends on.
+
+Two later findings sharpen that doubt into something close to a conclusion,
+and both are in notes 7b and 7h:
+
+- **The two paths name different controllers.** The bootloader's init routine
+  is `st7388_lcd_init`; the application's is `nv3030b_lcd_init`. They share no
+  vendor registers - the bootloader opens with an `F0`/`F2` unlock and
+  `B0`-`B4`, the application with `FD`, `61`-`68`, `E0`-`EC`. These are not two
+  revisions of one sequence; they are two different parts.
+- **Bank 4 is the camera.** The camera's I2C, its MCLK and its DVP data bus
+  are all bank 4 function-2 pads. So the bootloader's LCD setup is programming
+  what is, on this board, the camera bus - which is about as clear a signal as
+  one can get from a dump that this code was written for a different layout.
+
+What survives intact is the part that never touched the panel:
+`HAL_lcdc_module_init` copies a 14-byte config into LCDC registers and reads
+nothing from the panel descriptor, and both paths use the same QSPI opcodes
+(`0x02`, `0x32`, `0x0B`). So the *controller* semantics in `sl6806_lcdc.c`
+stand. What does not carry over is anything about pads, timing or panel
+behaviour inferred from the bootloader - including the `0x310` module clock
+suggested below, which is that board's number, not necessarily this one's.
 
 **4. Is the screen dark but the sketch healthy?**
 
