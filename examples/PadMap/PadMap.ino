@@ -16,6 +16,36 @@
  * 0, a plain input, where a pull is visible and an external driver wins.
  *
  * ===================================================================
+ *  [M] THE CENSUS, 2026-08-13 - AND WHAT 0 IN A FUNCTION NIBBLE MEANS
+ * ===================================================================
+ * The first run of this sketch produced the board's pad map, and it decides
+ * which pads the pull test should be aimed at:
+ *
+ *     bank 0   pins 0..5    0,1,2,3 on function 2; 4,5 parked
+ *     bank 1   pins 0..31   9 on function 3; the rest parked
+ *     bank 2   pins 0..5    0,1 on function 2; 2..5 parked
+ *     bank 3   pins 0..12   all parked
+ *     bank 4   pins 0..16   all parked
+ *     bank 5   pins 0..5    all parked
+ *
+ * Every bank has a contiguous run of function 15 from pin 0, and **every pin
+ * above that run reads 0 in the function nibble**. Six banks all showing the
+ * same shape is not a coincidence: `0` means the pin does not exist, `15`
+ * means a real pad the boot ROM has parked. **Eighty pads are bonded out**,
+ * and the ROM assigns exactly six of them.
+ *
+ * That is why the first version of this test measured nothing. It tested
+ * "pads already in function 0" - which is to say, every pin that is not
+ * there - and dutifully reported that all of them read 0 under both pulls.
+ * The pads that exist are the parked ones, and those are what it tests now.
+ *
+ * ⚠ **The census is only the boot state on a freshly powered device.**
+ * Uploading a payload does not reset the chip, so pads an earlier sketch
+ * configured stay configured: the first run showed bank 1 pins 12, 13 and 14
+ * in function 0, which is examples/SdPads having left them as inputs, not
+ * anything the ROM did. Power-cycle before trusting a census.
+ *
+ * ===================================================================
  *  WHAT IT DOES
  * ===================================================================
  *   1. **A census, with no writes at all.** For all six banks, every pin's
@@ -24,10 +54,11 @@
  *      and it is the missing half of README item 5 - the pad controller is
  *      done, the pinout is not.
  *
- *   2. **A pull test on pads that are already inputs.** For each pin whose
- *      function nibble is 0 - so nothing is driving it from inside the chip -
- *      apply a pull-up, read, apply a pull-down, read, then put the pad's
- *      original pull back. Three outcomes per pin:
+ *   2. **A pull test on the pads the boot ROM has parked.** For each pin in
+ *      function 15 - a real pad the ROM has switched off, so nothing inside
+ *      the chip is driving it - configure it as a plain input with a pull-up,
+ *      read, with a pull-down, read, then park it again and put its pull
+ *      back. Three outcomes per pin:
  *
  *        follows the pull    nothing is connected, or a high-impedance load
  *        stuck high          something outside drives it high
@@ -54,13 +85,14 @@
  * ===================================================================
  *  WHAT IT WILL NOT DO
  * ===================================================================
- * **It never drives a pad, and it never touches a pad that is in a function
- * other than 0.** The notes are explicit about why: driving all 192 pads
- * wedges the device, because something USB needs is among them, and a wedged
- * device takes its own console with it. A pad already in input mode is
- * driving nothing, and changing its pull for a few microseconds is the
- * weakest intervention that can still answer the question. Every pull is
- * saved and restored.
+ * **It never drives a pad, and it never touches a pad the boot ROM has
+ * assigned to a peripheral** - six of them on this board, listed below. The
+ * notes are explicit about why: driving all 192 pads wedges the device,
+ * because something USB needs is among them, and a wedged device takes its
+ * own console with it. A parked pad is driving nothing, and making it an
+ * input with a pull for a few microseconds is the weakest intervention that
+ * can still answer the question. Every pad is parked again afterwards and
+ * every pull is restored.
  *
  * Output is paced one section per USB poll so nothing is lost.
  *
@@ -144,25 +176,15 @@ static void pull_restore(uint32_t base, unsigned pin, uint32_t saved)
     sl6806_mmio_field(PULLB_REG(base, pin), sh, 2, (saved >> 16) & 3u);
 }
 
-static void pull_apply(uint32_t base, unsigned pin, unsigned selector)
-{
-    /* The two selectors this sketch uses, from the table in the header. */
-    unsigned a = (selector == PULL_UP) ? 2u : 1u;
-    unsigned b = 2u;
-    unsigned sh = (pin & 15u) * 2u;
-
-    sl6806_mmio_field(PULLA_REG(base, pin), sh, 2, a);
-    sl6806_mmio_field(PULLB_REG(base, pin), sh, 2, b);
-}
-
 void setup()
 {
     Serial.begin(115200);
     Serial.println();
     Serial.println("=== SL6806 pad census ===");
-    Serial.println("No pad is driven and no pad outside function 0 is");
+    Serial.println("No pad is driven, and no pad the boot ROM assigned is");
     Serial.println("touched. Run once with an empty slot and once with a");
-    Serial.println("card, and diff the two logs.");
+    Serial.println("card, and diff the two logs. Power-cycle first: pads a");
+    Serial.println("previous sketch configured are still configured.");
     Serial.flush();
 
     phase = 0;
@@ -223,15 +245,14 @@ void loop()
     /* --- the pull test, one bank per poll ------------------------- */
     case 1: {
         uint32_t base = sl6806_pad_bank_base[bank];
-        unsigned n_tested = 0;
+        unsigned n_tested = 0, n_absent = 0, n_follows = 0;
 
         if (bank == 0) {
             Serial.println();
-            Serial.println("--- pads already in function 0, pulled both ways ---");
-            Serial.println("  'follows' = floating, 'HIGH'/'LOW' = driven");
-            Serial.println("  from outside. A pin that reads LOW with a card");
-            Serial.println("  in the slot and follows with it out is the");
-            Serial.println("  card-detect contact.");
+            Serial.println("--- parked pads (function 15), pulled both ways ---");
+            Serial.println("  'follows' = floating, 'HIGH'/'LOW' = driven from");
+            Serial.println("  outside. A pin that follows with an empty slot");
+            Serial.println("  and reads LOW with a card in it is card detect.");
         }
 
         Serial.print("  bank ");
@@ -239,24 +260,44 @@ void loop()
         Serial.print(": ");
 
         for (unsigned pin = 0; pin < 32u; pin++) {
-            uint32_t saved;
+            unsigned func = pad_func(base, pin);
+            uint32_t saved_pull;
             unsigned up, down;
 
-            if (pad_func(base, pin) != 0u)
-                continue;           /* not an input: not ours to touch */
+            /* Function 0 above a bank's bonded run is a pin that does not
+             * exist - see the header. Counted, not tested. */
+            if (func == 0u) {
+                n_absent++;
+                continue;
+            }
+            /* Anything the boot ROM has actually assigned is off limits:
+             * six pads on this board, and something USB needs is among
+             * them. Only parked pads are ours. */
+            if (func != 15u)
+                continue;
 
-            saved = pull_save(base, pin);
+            saved_pull = pull_save(base, pin);
 
-            pull_apply(base, pin, PULL_UP);
+            /* Configure properly rather than poking the pull registers of a
+             * parked pad: sl6806_pad_configure() is ROM 0x93C, and it sets
+             * the function nibble, the drive and both pull fields. Writing
+             * the pull alone leaves a parked pad parked, which is what the
+             * first version of this sketch did and why it measured nothing.
+             */
+            sl6806_pad_configure(SL6806_PAD_ID(bank, pin, 0) | PULL_UP);
             up = pad_level(base, pin);
-            pull_apply(base, pin, PULL_DOWN);
+            sl6806_pad_configure(SL6806_PAD_ID(bank, pin, 0) | PULL_DOWN);
             down = pad_level(base, pin);
 
-            pull_restore(base, pin, saved);
+            /* Park it again, exactly as found, and put its pull back. */
+            sl6806_pad_set_func(SL6806_PAD_ID(bank, pin, 15), 15u);
+            pull_restore(base, pin, saved_pull);
 
             n_tested++;
-            if (up == 1u && down == 0u)
-                continue;           /* follows the pull: nothing there */
+            if (up == 1u && down == 0u) {
+                n_follows++;
+                continue;           /* floating: nothing connected */
+            }
 
             Serial.print("pin ");
             Serial.print(pin);
@@ -270,7 +311,11 @@ void loop()
 
         Serial.print("  [");
         Serial.print(n_tested);
-        Serial.println(" pads in function 0, the rest untouched]");
+        Serial.print(" parked pads tested, ");
+        Serial.print(n_follows);
+        Serial.print(" floating, ");
+        Serial.print(n_absent);
+        Serial.println(" pins absent]");
 
         if (++bank >= SL6806_PAD_NBANKS)
             phase++;

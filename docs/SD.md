@@ -547,10 +547,17 @@ the pad census and card detect, which `examples/PadMap` covers:
 make SKETCH=examples/PadMap RUN_MODE=poll run     # empty slot, then with a card
 ```
 
-It never drives a pad and never touches one outside function 0. For each pad
-already in function 0 it applies a pull-up, reads, applies a pull-down, reads,
-and restores — so a pin that follows its pull is floating and one that ignores
-it is driven from outside. A microSD socket's card-detect contact is a switch
+It never drives a pad and never touches one the boot ROM has assigned. For
+each **parked** pad — function 15 — it configures a plain input with a pull-up,
+reads, with a pull-down, reads, then parks it again and restores its pull. A
+pin that follows its pull is floating; one that ignores it is driven from
+outside.
+
+The first run of it aimed at the wrong pads and taught the board's pad map
+instead: every bank has a contiguous run of function 15 from pin 0 and reads
+`0` above it, across all six banks, so **`0` means the pin does not exist and
+`15` means a real pad the ROM has parked**. Eighty pads are bonded out; the
+ROM assigns six. The notes have the table. A microSD socket's card-detect contact is a switch
 to ground, so **a pin that follows the pull with an empty slot and reads low
 with a card in it is card detect**, which the driver currently has to
 substitute with a pair of command timeouts.
