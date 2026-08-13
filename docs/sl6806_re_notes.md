@@ -5054,3 +5054,58 @@ card in, nothing else changed:
 | follows the pull with no card, LOW with one | card detect, and it goes straight into `sl6806_sd.h` |
 | the same both ways | the earlier difference was the settling bug, and the card-detect pin is still unknown |
 | `UNSTABLE` either way | something is driving it actively — the boot ROM's own interrupt path is the first suspect |
+
+### [M] The first clean census — and why diffing across a power cycle is useless
+
+Fourth run of `examples/PadMap`, and the first from a genuinely fresh
+power-up: bank 1 reads function 15 at pins 12, 13 and 14 with the input
+register at zero, so `examples/SdPads`' leftovers are gone. **This is the boot
+state**, and it confirms two things the earlier runs could only suggest:
+
+- **the ROM parks the SD pads on function 15**, as §23 read out of ROM
+  `0x0003D2F0` — pins 12/13/14 are parked, not unassigned;
+- **bank 1 has 32 real pads.** Zero pins in function 0, where the other five
+  banks have 15 to 26 of them. So `0` really is "not bonded" and bank 1 really
+  is the wide bank.
+
+Against the previous run, **ten pins differ**:
+
+```
+bank 1 pin 10   driven high  ->  UNSTABLE
+bank 1 pin 11   floating     ->  UNSTABLE
+bank 3 pin 1    floating     ->  LOW
+bank 4 pins 0, 5, 6, 7, 8, 9, 10, 11   floating -> LOW
+```
+
+None of that is a card. **A power cycle changes the board's state**, and the
+previous run was taken from a session in which earlier payloads had been
+running. Diffing across a power cycle answers a question nobody asked, and the
+instruction to "power-cycle first" — correct for a census — silently broke the
+comparison it was meant to serve.
+
+The protocol is now in the sketch's banner and header:
+
+1. power off, hold the boot key, plug in — **once, at the start**;
+2. run with the slot **empty**;
+3. insert a microSD, **do not unplug and do not reset**;
+4. run again.
+
+Step 3 is safe for exactly the reason leftover pad state is a nuisance
+elsewhere: the device stays in bootloader mode across an upload.
+
+### UNSTABLE on both boot inputs, and what that is
+
+The two pads that would not settle at 500 µs are **bank 1 pins 10 and 11** —
+precisely the two the boot ROM waits for an edge on (§"the boot ROM's two mode
+inputs"). Nothing else on the board came back unstable.
+
+That is what a **button with a debounce capacitor** looks like to an internal
+pull. A pull on the order of 100 kΩ into a cap on the order of 100 nF is about
+ten milliseconds, and the fast pass allows 500 µs plus 160 µs of sampling — so
+the level is still moving when it is read, every time. It is a positive
+identification rather than a nuisance: the two pins the ROM polls as keys are
+the two pins with debounce hardware on them.
+
+`pad_settled()` now retries a pad that fails the fast pass with a 40 ms
+settle — four RC constants of that estimate — and only pads that failed pay
+for it.

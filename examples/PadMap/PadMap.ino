@@ -122,12 +122,27 @@
  *      pair of command timeouts.
  *
  * ===================================================================
- *  RUN IT TWICE AND DIFF
+ *  THE PROTOCOL, WHICH MATTERS MORE THAN THE SKETCH
  * ===================================================================
- *     make SKETCH=examples/PadMap RUN_MODE=poll run      (empty slot)
- *     ... insert a microSD, then run it again
+ * The card has to be the ONLY thing that differs between the two runs, and
+ * that is harder than it sounds because **a power cycle changes the board's
+ * state too**. Measured: a run taken after a power cycle differed from the
+ * previous one in TEN pins - eight of bank 4, one of bank 3, and the two boot
+ * inputs - none of which had anything to do with a card. Diffing across a
+ * power cycle answers a question nobody asked.
  *
- * Any pin that differs between the two logs is wired to the slot. That is
+ * So, in this order, and do not power-cycle in the middle:
+ *
+ *     1. power off, hold the boot key, plug in            <- once, at the start
+ *     2. make SKETCH=examples/PadMap RUN_MODE=poll run    <- slot EMPTY
+ *     3. insert a microSD. Do not unplug, do not reset.
+ *     4. make SKETCH=examples/PadMap RUN_MODE=poll run    <- slot FULL
+ *
+ * Step 3 is safe: the device stays in bootloader mode across an upload, which
+ * is the same property that makes leftover pad state a nuisance elsewhere.
+ * Here it is exactly what is wanted.
+ *
+ * Any pin that differs between those two logs is wired to the slot. That is
  * this board's SD pinout, and the card-detect contact, neither of which is
  * known. It is also the only card-presence test available, since the pads
  * carrying the bus are unreadable while they are muxed to the controller.
@@ -186,6 +201,11 @@ extern "C" {
  * far longer than that needs and still imperceptible across 69 pads. */
 #define SETTLE_US  500u
 
+/* And for the pads that do not settle in that: 40 ms is four RC constants of
+ * a 100 kohm pull into a 100 nF debounce capacitor. Only pads that failed the
+ * fast pass pay it. */
+#define SETTLE_SLOW_US 40000u
+
 static int  phase;
 static int  bank;
 static bool done;
@@ -226,11 +246,11 @@ static unsigned pad_level(uint32_t base, unsigned pin)
  * appeared on the second run of this sketch. An internal pull is a weak
  * resistor; it needs microseconds, not nanoseconds.
  */
-static unsigned pad_settled(uint32_t base, unsigned pin)
+static unsigned pad_settled_for(uint32_t base, unsigned pin, unsigned us)
 {
     unsigned first, i;
 
-    delayMicroseconds(SETTLE_US);
+    delayMicroseconds(us);
     first = pad_level(base, pin);
     for (i = 0; i < 8u; i++) {
         delayMicroseconds(20);
@@ -238,6 +258,27 @@ static unsigned pad_settled(uint32_t base, unsigned pin)
             return 2u;              /* still moving, or bouncing */
     }
     return first;
+}
+
+/*
+ * The two-stage version. Most pads settle in microseconds; a pad with a
+ * debounce capacitor on it does not, and reports UNSTABLE forever at this
+ * timescale. An internal pull is on the order of 100 kohm and a debounce cap
+ * on the order of 100 nF, which is ten milliseconds - twenty times longer
+ * than the fast pass waits.
+ *
+ * [M] Exactly two pads on this board came back UNSTABLE at 500 us: bank 1
+ * pins 10 and 11, which are the two the boot ROM waits for an edge on. A
+ * button with a debounce capacitor is precisely what those should be, so the
+ * slow retry is not a workaround here - it is the measurement.
+ */
+static unsigned pad_settled(uint32_t base, unsigned pin)
+{
+    unsigned v = pad_settled_for(base, pin, SETTLE_US);
+
+    if (v != 2u)
+        return v;
+    return pad_settled_for(base, pin, SETTLE_SLOW_US);
 }
 
 /* Save and restore the two 2-bit pull fields, so a pad is left as found. */
@@ -263,9 +304,11 @@ void setup()
     Serial.println();
     Serial.println("=== SL6806 pad census ===");
     Serial.println("No pad is driven, and no pad the boot ROM assigned is");
-    Serial.println("touched. Run once with an empty slot and once with a");
-    Serial.println("card, and diff the two logs. Power-cycle first: pads a");
-    Serial.println("previous sketch configured are still configured.");
+    Serial.println("touched.");
+    Serial.println("PROTOCOL: power-cycle ONCE, run with the slot empty,");
+    Serial.println("then insert a card WITHOUT unplugging and run again.");
+    Serial.println("A power cycle between the two runs moves ten pins that");
+    Serial.println("have nothing to do with the card - measured.");
     Serial.flush();
 
     phase = 0;
