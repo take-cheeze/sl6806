@@ -5512,3 +5512,53 @@ The unknown is the register map beyond `+0x10` and `+0x14`: where the data
 register is, and what the status bits are. Both images configure the block and
 then hand it to ROM code, so the ROM at `0x0000023D` and whatever it calls is
 where the rest of the map is, and that is a contained read.
+
+## 27. The bootloader inventoried — 340 functions, and two more blocks named
+
+`tools/sl6806-boot --map` now reduces the whole image to something readable:
+**340 call targets, 140 mask-ROM entry points, 1552 call sites**, of which
+**81 functions carry an MMIO base or a string**. The annotated result is
+[docs/BOOTLOADER.md](BOOTLOADER.md); this section records what the sweep
+turned up that was not already known.
+
+### `0x400A0000` is a hardware mutex `[I]`
+
+`0x00820D90` spins while `[0x400A0010 + id*4]` is non-zero; `0x00820DA8`
+writes zero to the same word. Eleven and ten call sites, and the callers are
+the code that guards the TWI mailbox below. A lock array in MMIO — a hardware
+mutex or semaphore block, which is a thing a chip with a boot ROM, a
+bootloader and an RTOS all sharing one I²C master would want.
+
+Nothing names it, so `[I]`. New to §7c's map either way.
+
+### The register-file mailbox is called TWI by the vendor
+
+`0x00820BF0` and `0x00820C58`, §7m's mailbox accessors, take a mutex through
+`0x00822260` / `0x0082228C` — and those two log **`rtwi op in isr`**.
+
+§7m deduced the block was an I²C master from `0x60`/`0x61` differing by one,
+being an address and its R/W bit. **The bootloader says so in a string.** That
+also bears on the README's standing question, "the TWI controller's base
+address": at least one TWI master on this chip is `0x400F7000+0x100`, it is
+decoded, and `cores/sl6806/sl6806_regfile.c` already drives it. What remains
+open is whether the *bit-banged* buses in `examples/CameraDemo` and
+`examples/FmDemo` have a controller of their own somewhere else.
+
+### What the sweep says about the rest
+
+The bootloader carries FreeRTOS, an OAL allocator, FatFs and a small device
+layer — which is why its `sdupdate` path can mount a card. 259 of the 340
+targets carry neither an MMIO base nor a string, and those are that
+infrastructure. **A peripheral needs a base address and a base address is a
+literal**, so the 81 that do carry one are a complete list of the hardware
+this image touches, not a sample of it.
+
+That list is in BOOTLOADER.md §7 and holds no other surprises: the pad mux,
+both DMA halves, the SD host, the CRU, GPIO bank 0, the LCD controller, the
+flash host, plus the two above and the console at `0x40091000` from §26.
+
+### Still unread, and named so nobody re-derives the list
+
+`0x00820DF8(24)` and `0x00820284`, both in `hardware_init`; ROM `0x3BFC`,
+which it calls before either; and the console block's register map beyond
+`+0x10`/`+0x14`, which is behind ROM `0x0000023D`.

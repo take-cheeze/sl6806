@@ -357,6 +357,7 @@ Peripheral blocks identified so far:
 | `0x40009000` | **audio controller** ([`sl6806_audio.h`](cores/sl6806/sl6806_audio.h), [docs/AUDIO.md](docs/AUDIO.md)). §7c filed this as "timers" from the shape of `+0x108`/`+0x208`; those are its two DMA directions, and the timers are at `0x40099000` |
 | `0x40070000` | DMA |
 | `0x40080000` | clock & reset ([`sl6806_cru.h`](cores/sl6806/sl6806_cru.h)) |
+| `0x400A0000` | **[I] a hardware mutex** (§27). `+0x10 + id*4` is a lock array — spin while non-zero, write zero to release; the code guarding the TWI mailbox uses it |
 | `0x400D9000` | LCD controller ([`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h)) |
 | `0x400E0000` | peripheral **functional** clocks, one bit each: camera 6, Bluetooth 0, the `0x400E2300` cluster 1, and 5 taken by the group's own bring-up. Resets are the matching bits of `+0x08`. Gated behind module clock 46, which is why §15 read it as dead (§7n) |
 | `0x400E1000` | camera front end / DVP ([`sl6806_dvp.h`](cores/sl6806/sl6806_dvp.h)) |
@@ -364,7 +365,7 @@ Peripheral blocks identified so far:
 | `0x40091000` | **[I] a UART — the bootloader's printf sink** (§26). Module clock id 73, ROM clock id 22, pad bank 1 pin 2 function 6, configured for 1,500,000 against a 48 MHz clock. FIRM brings it up with the same routine. Building a `Serial1` on it would end the console-truncation problem every hardware session has had |
 | `0x40099000` | timers (`HAL_timer_*`) |
 | `0x40003000` | **SD/MMC host** ([`sl6806_sd.h`](cores/sl6806/sl6806_sd.h), [docs/SD.md](docs/SD.md)). §7c filed the SD host at `0x400F7000` on the strength of a mailbox that turned out to be §7m's; the real base appears once per image, cached in a driver handle (§23) |
-| `0x400F7000` | SPI flash host; `+0x100` is a serial master, and the indexed register file is the chip on it (§7m). **Not** the SD host |
+| `0x400F7000` | SPI flash host; `+0x100` is a **TWI master** — the vendor's own name, from the `rtwi op in isr` string on its mutex (§27) — and the indexed register file is the chip on it (§7m). **Not** the SD host |
 
 Flash layout: HLKJ bootloader at `0x0`, partition table at `0xF000`, then
 `FIRM` (application, XIP at `0x00C10000`), `PICS` and `FONT`.
