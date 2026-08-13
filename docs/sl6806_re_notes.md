@@ -1631,6 +1631,10 @@ Full map in `cores/sl6806/sl6806_lcdc.h`.
    software; the DMA path must be getting it from a mode bit somewhere.
 13. **Read `0x00D3D094`** to get the device-record layout, which would settle
    whether the PWM record's `0x00030000` really is the backlight's pad.
+14. **Run `examples/BtProbe` on hardware.** §16 found a single, exclusively
+   referenced candidate peripheral base for Bluetooth, `0x400E2000`, from
+   the code next to the application's HCI command dispatcher — but nothing
+   in it has been read on a real device yet. See docs/BLUETOOTH.md.
 
 ## 13. The SRAM-resident half of the application is in flash — and LVGL
 
@@ -2427,3 +2431,69 @@ ids per `loop()` call and a 200-iteration poll fixes both halves.
 **This is worth re-running for the PWM too.** The backlight's functional clock
 was hunted across three register pairs with the wrong write order and without
 the fourth pair, so §14a's negative is not as complete as it reads.
+
+## 16. Bluetooth — link-manager code and a candidate register block
+
+**Confirmed:** the application embeds a complete Bluetooth stack, not a
+stub. String evidence: a full `BT_EVENT_*` enum (stack open/close, inquiry,
+pairing, A2DP/AVRCP/HFP/SPP/OPP open/close/stream), profile name strings
+(`l2cap`, `rfcomm`, `a2dp`, `avrcp`), and 27 persisted keys in the `PSMP`
+partition including `bt_addr`, `bt_name`, `bt_relink`, `le_addr` (§7k) — this
+unit has paired with something. No external-chip transport is visible: no
+vendor strings (Airoha/Jieli/Beken/Realtek/CSR/RDA), no AT-command text, no
+`hci_h4`/`hci_uart` layer. The naming (`lm`/`llm` — link manager / lower
+link manager) and a 64-entry HCI opcode dispatch table that logs
+`"-hci cmd0x%x"` for unimplemented opcodes read as an HCI stack terminating
+on this CPU against local hardware, not a UART bridge to a separate radio.
+
+**Candidate register block: `0x400E2000`.** Already listed as an
+unidentified block in the whole-firmware scan (§7c). What ties it to
+Bluetooth: it is the **single** literal load of that exact constant anywhere
+in the 1.8 MB FIRM image (`tools/sl6806-xref dump.bin 0x400E2000`), and the
+instruction that loads it, `0x00D98C9E`, sits inside a module-registration
+routine a few hundred bytes from the HCI dispatch table (`0x00DA0000`
+.. `0x00DA9BCA`, found via
+`tools/sl6806-xref dump.bin --string="-hci cmd0x%x" --context 12`).
+
+That routine (`0x00D98C9C`) does a clear-bit31 / delay(10, via the
+already-documented delay veneer `0x00807214`) / set-bit31 reset pulse on
+`+0x228`, writes `0xFFFFFFFF` to `+0x200` during the window, registers
+`{base=0x400E2000, config_ptr}` into an SRAM descriptor at `0x0082B3A8`,
+calls `0x00D9A7FC` (r0=42), `0x00D9A734` (r0=0) and `0x00D9A768` (r0=0), sets
+bit 24 of `+0x214`, then fans a caller-supplied config struct out into
+roughly a dozen narrow bitfields at `+0x10, +0x14, +0x20, +0x44, +0x48,
++0x4C, +0x50, +0x54, +0x58, +0x70, +0x78, +0x7C`. A separate accessor
+cluster (`0x00D98B18`..`0x00D98C58`) reads `+0x200`, `+0x218` and `+0x228`
+back through the same descriptor; `+0x218`'s top nibble gates a small table
+lookup, the shape of a status/mode field.
+
+Reset-then-config-fanout is the same two-part shape every other confirmed
+peripheral bring-up in this codebase has (CRU divider setters, LCD panel
+init), which is the basis for treating this as real hardware rather than a
+data table. Full offset list and citations: `cores/sl6806/sl6806_bt.h`.
+Writeup with the reproduction commands and what to check on hardware next:
+`docs/BLUETOOTH.md`.
+
+**§14a/§15 land on top of this and explain why a payload will currently see
+nothing.** Both `0x00D9A7FC` and `0x00D9A734` are named there, independent
+of this section: `0x00D9A7FC` is "the first thing the vendor's module
+bring-up does" — it starts the PLL at `0x40080008` and spins on its lock bit
+— and `0x00D9A734` is the routine through which "the application enables
+most peripherals through `0x400E0000`", confirmed dead from a payload, with
+call-site arguments 0/1/2/3/4/6 elsewhere (this routine's argument here, 0,
+falls inside that range). §14a's own host-side read of `0x400E2000` in
+bootloader mode already came back **all zeros**, alongside `0x400E0000` and
+`0x40084000` — consistent with this block sharing the same unlocked PLL and
+`0x400E0000` gate as everything else behind that wall, not evidence against
+it being real hardware. `0x00D9A768` remains unexamined; it sits in the same
+small cluster of bring-up helpers as `0x00D9A7FC`/`0x00D9A734`/`0x00D9A74C`.
+
+**Not established:** what any bit means (the mixed 7/8/10/12/14/16/18-bit
+field widths are consistent with radio/link timing parameters but that is a
+shape argument, not a decode); whether one register window is the whole
+story for a part with an actual radio; and — now the same open item as
+§14a/§15's PWM and ADC work — what unlocks the PLL and the `0x400E0000` gate
+without reparenting the core or USB clock out from under the session.
+`examples/BtProbe` reproduces §14a's zero-read from a payload rather than
+the host command, and is the sketch to re-run once that unlock work (Next
+actions item 11) lands.
