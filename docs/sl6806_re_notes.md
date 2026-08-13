@@ -5433,3 +5433,82 @@ a struct whose first two words are 48,000,000 and 1,500,000. A 48 MHz clock
 and a 1.5 MHz something is the shape of a serial bus, and it runs in the
 bootloader's very first init phase, before the display or storage. Worth a
 look.
+
+## 26. `0x40091000` — the bootloader's printf goes here, and it looks like a UART
+
+Continuing through `hardware_init`'s call list. This is the step after the
+PLL, and it is the most immediately useful thing in the bootloader.
+
+### The chain
+
+```
+0x00820378  hardware_init
+    ...
+    pad_configure(0x00011300)     bank 1 pin 2, function 6, no pull
+    0x0082A220(&{ [0]=1500000, [8]=48000000, [16]=1, rest 0 })
+    0x0082356C(1)
+```
+
+`0x0082A220` is:
+
+```
+module_clock_enable(73)                      ROM 0x1EC0
+clock_source_select(22, [cfg+8]==24000000 ? 10 : 9)
+romclk_enable(22)                            ROM 0x20EC
+descriptor[+0x44] = 0x40091000               the base
+descriptor[+0x4C] = cfg[0]   = 1500000
+descriptor[+0x48] = cfg[8]   = 48000000
+descriptor[+0x60] = 3   [+0x64] = 0x301   [+0x68] = 0x60   [+0x84] = 17
+[0x40091000 + 0x10] |= 0xB0
+[0x40091000 + 0x14] |= 3
+```
+
+and `0x0082356C(1)` tail-calls **ROM 0x260**, which stores four words into a
+table at `0x0080082C` — one of them the ROM function pointer `0x0000023D`, and
+the ROM code immediately after it is an integer-to-string converter. **ROM
+0x260 installs the sink that the ROM's printf writes to**, and the descriptor
+it is given is the one `0x0082A220` just filled in.
+
+So the bootloader's own logging — every `boot--->` and `sdio(i):` message in
+this file — comes out of the block at `0x40091000`.
+
+### It is very probably a UART, and the application agrees
+
+`[V]` The application does the same thing with the same numbers. `0x00D9A4C0`
+in FIRM is the same routine instruction for instruction: `module_enable(73)`,
+clock id 22, base `0x40091000`, the same descriptor layout. Both images bring
+this block up the same way, which is what a debug console looks like.
+
+`[I]` A configuration of **1,500,000 against a 48,000,000 clock**, a single
+output pad, and a printf sink is a UART at 1.5 Mbaud. Nothing here proves the
+framing, and no string in either image names the block.
+
+| what | value | provenance |
+|---|---|---|
+| base | `0x40091000` | [V] both images |
+| module clock id | **73** | [V] `0x0082A220`, and FIRM `0x00D9A4C0` |
+| ROM clock id | **22** | [V] same |
+| pad | bank 1 pin 2, **function 6** | [V] configured immediately before |
+| clock | 48 MHz, or 24 MHz selecting a different source | [V] |
+| rate | 1,500,000 | [V] the number; [I] that it is a baud |
+| registers | `+0x10 \|= 0xB0`, `+0x14 \|= 3` | [V] |
+
+### Why this is worth building
+
+Every hardware session in this project has lost output. Nine runs in this
+investigation alone opened with `[lost output - device outran the poll rate]`,
+and the fix so far has been to pace sketches around a 2 KB ring that the host
+drains only between `loop()` calls (§"the console loses the head of a long
+report"). That is a workaround for not having a serial port.
+
+**This is the serial port.** It needs one pad, two clock ids that are already
+understood mechanisms, and two register writes that are written down above. A
+`Serial1` on `0x40091000` would give this framework a console that does not
+depend on USB polling, does not lose the head of a register dump, and keeps
+working when a payload wedges the USB handler — which is the failure mode
+every bounded poll in `cores/` exists to avoid.
+
+The unknown is the register map beyond `+0x10` and `+0x14`: where the data
+register is, and what the status bits are. Both images configure the block and
+then hand it to ROM code, so the ROM at `0x0000023D` and whatever it calls is
+where the rest of the map is, and that is a contained read.
