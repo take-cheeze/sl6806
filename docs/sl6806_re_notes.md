@@ -3898,3 +3898,51 @@ and SRAM; `0x00806800`+ is where the vendor's firmware configures the rest of
 the tree, and nothing in this framework has ever executed it or transcribed
 it. That region is worth a section of its own, and is a better lead for the
 PWM counter than anything §14a has left.
+
+## 19. The vendor's system clock init, read — and it is not the answer either
+
+Static, from the SRAM blob. Followed up because §18 found that every call site
+for all three mask ROM clock families lives in one region, `0x00806800`–
+`0x00807100`, which a payload never executes — a promising-looking explanation
+for both the stalled PWM counter and the unpaced audio DMA.
+
+**It is a clock-tree *reconfiguration* path, not a bring-up.** The shape:
+
+```
+romclk_off  17 65 18 19 56 57 20 44 51 48 37 22 36 23 24 50 25 26 34 27 35
+            28 29 30 32 40 38 52 54 61 63    (and a second, shorter sweep)
+module_off  39, 37, 88
+set         id 5 = 1, id 4 = 1, id 6 = 1, id 64 = 1
+...
+module_on   39, 37, 88
+romclk_on   0, 63, 39, 21, 2, 38, 41
+set         id 3 = 1, id 4 = 1, id 5 = 1, id 6 = 1
+```
+
+Disable a long list, change some dividers, put it back. That is a
+frequency-change or suspend/resume routine, and it reveals no enable that this
+framework is missing. Ids 3..6 and 64 are core/bus dividers set to 1.
+
+Two things worth keeping out of it:
+
+- **Module 37 (audio) and 39 and 88 are cycled here as a group**, which is at
+  least consistent with 37 being a real module id for a real block.
+- **romclk 44 — the audio bit clock divider — is in the disable sweep**, so
+  the id is genuine and known to the vendor's clock manager.
+
+Neither changes what a payload has to do. **This lead is closed.**
+
+### And a caveat on §5's capture test, which was overstated
+
+The run recorded "0 of 64 words changed" as showing the DMA engine cannot
+touch memory. `sl6806_audio_begin()` performs the vendor's *playback*
+bring-up: it sets `+0x100` bit 0 and never opens the capture direction the way
+the mode-1 open does. The codec dispatcher's only writes to `+0x200` are bits
+6, 7, 14 and 15 — no analogue of the TX enable — but "RX was never opened the
+way the vendor opens it" is still true, so the test corroborates rather than
+proves.
+
+**The load-bearing evidence is the timing, and it stands alone.** 4796 bytes
+in 10 µs is 480 MB/s; 100 MB/s would be 48 µs and 25 MB/s 192 µs. A 64 MHz AHB
+does not move half a gigabyte a second. Whatever `+0x108` retires in 10 µs, it
+is not 4796 bytes of memory.

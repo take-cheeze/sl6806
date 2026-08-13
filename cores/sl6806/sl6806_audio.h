@@ -66,10 +66,17 @@
  *
  *     0 of 64 words changed
  *
- * **The engine does not touch memory.** So the completion flag is not a
+ * [!] That test is weaker than it first read. begin() performs the vendor's
+ * PLAYBACK bring-up and never opens the capture direction, so it shows "RX
+ * moved nothing while unopened" rather than "the engine cannot move memory".
+ *
+ * The load-bearing evidence is the timing, and it stands alone: 4796 bytes in
+ * 10 us is 480 MB/s, which a 64 MHz AHB does not do. Whatever +0x108 retires
+ * in 10 us is not 4796 bytes of memory. So the completion flag is not a
  * transfer, and everything above it is a descriptor being accepted and
- * retired - which is exactly as consistent with a transfer that never
- * happened. SL6806_AUD_IRQ_DONE is very likely not "done" at all; an error or
+ * retired - as consistent with a transfer that never happened.
+ *
+ * SL6806_AUD_IRQ_DONE is therefore very likely not "done" at all; an error or
  * abort flag that raises instantly on a block with no data path fits every
  * observation better.
  *
@@ -94,7 +101,8 @@
  *
  * So the honest state is:
  *
- *   - measured, the engine moves no memory (examples/AudioWall);
+ *   - the playback path moves no memory - inferred from 480 MB/s being
+ *     impossible here, corroborated by the capture test;
  *   - measured, 0x400E0000 is not audio's gate, all 32 bits walked;
  *   - the general DMA controller exists, is used by at least the LCDC, and
  *     needs module clock 33 - all true, and none of it evidence about audio;

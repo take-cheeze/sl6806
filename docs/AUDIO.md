@@ -52,18 +52,35 @@ has no name, and `+0x100` resets with `[10:8]` set.
 five hundred times running. This document called that "the DMA path confirmed
 end to end".
 
-`examples/AudioWall` then asked the question that reading could not. It
-pre-filled a capture buffer with a pattern, handed it to the RX descriptor,
-waited 100 ms and counted:
+`examples/AudioWall` then pre-filled a capture buffer with a pattern, handed
+it to the RX descriptor, waited 100 ms and counted:
 
 ```
 after 100015 us: 0 of 64 words changed
 memory untouched - the completion flag is not a transfer
 ```
 
-**The engine does not move a byte.** So the completion flag is not completion;
-a descriptor is being accepted and retired, which is exactly as consistent
-with a transfer that never happened. `SL6806_AUD_IRQ_DONE` is probably not
+**That test is weaker than it was first written up as**, and the weakness is
+worth stating before the conclusion. `sl6806_audio_begin()` performs the
+vendor's *playback* bring-up; it sets `+0x100` bit 0 and never opens the
+capture direction the way the vendor's mode-1 open does. So what the capture
+test actually shows is "with playback configured and RX never opened, a
+capture descriptor moved nothing" — not "the engine cannot move memory".
+
+**The load-bearing evidence is the timing, and it stands on its own.** 4796
+bytes in 10 µs is 480 MB/s:
+
+| rate | 4796 bytes takes |
+|---|---|
+| 480 MB/s | 10 µs ← measured |
+| 100 MB/s | 48 µs |
+| 25 MB/s | 192 µs |
+| 191 KB/s (real time at 48 kHz) | 25 ms |
+
+480 MB/s is not a transfer a 64 MHz AHB performs. Whatever `+0x108` retires in
+10 µs, it is not 4796 bytes of memory. So the completion flag is not
+completion — a descriptor is accepted and retired, which is exactly as
+consistent with a transfer that never happened. `SL6806_AUD_IRQ_DONE` is probably not
 "done" — an error or abort flag raising instantly on a block with no data path
 fits every observation better, and the header now marks it `[?]`.
 
@@ -100,7 +117,7 @@ What stands, and what does not:
 
 | | |
 |---|---|
-| The engine moves no memory | **Measured.** 0 of 64 words. |
+| The playback path moves no memory | **Inferred, strongly.** 4796 bytes in 10 µs is 480 MB/s. The capture test agrees but had RX unopened, so it is corroboration rather than proof. |
 | `0x400E0000` is not audio's gate | **Measured.** All 32 bits, no effect. |
 | A DMA controller exists at `0x40001000`, module clock 33 | **True**, and used by at least the LCDC. |
 | Audio is fed by that controller | **Unknown.** No evidence either way. |
