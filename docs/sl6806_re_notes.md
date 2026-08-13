@@ -670,9 +670,28 @@ What is left, in the order the evidence now supports:
   sits further up the stack than the sensor driver. The likeliest home is the
   byte-wide indexed register file behind the clock driver (below): a ~130-entry
   file of the kind SoCs use for LDO and power-domain control, reached through
-  SRAM routines a payload cannot call. Note the camera driver *reads* two of
-  its registers - indices `0x03` and `0x16`, at `0x00D44EA8` and `0x00D44F08` -
-  but writes none, so if a rail is switched for it, someone else does it.
+  SRAM routines a payload cannot call.
+
+  **And the sensor driver writes it - the enable is not further up the stack
+  after all.** An earlier revision of this note said the camera driver only
+  read registers `0x03` and `0x16` and wrote none. That was wrong: it came
+  from a tool-assisted search that missed both write sites. Disassembling the
+  region directly finds two read-modify-writes, and they are the missing step:
+
+  ```
+  0x00D44EA6   v = read(0x03);  write(0x03, (v & 0xE7) | 0x08)   ; field [4:3] = 01
+  0x00D44F06   v = read(0x16);  write(0x16, (v | 0x80) & 0xFF)   ; set bit 7
+  ```
+
+  Register `0x03` is shared - the clock driver masks it with `0x5D` and sets
+  bit 1, the camera clears bits 3-4 and sets bit 3 - so one control register,
+  different fields.
+
+  **Everything about this camera is now specified except one address.** Pads,
+  bus, sensor registers, power-up order, clock channel and now the two enable
+  writes are all known to the bit. What is missing is where the indexed
+  register file sits in the memory map; with that, a payload could run the
+  whole sequence itself.
 - ~~**No module fitted.**~~ Ruled out: the stock camera app previews live.
 
 Both readings of which power pad is RESET were tried, and neither helps -
