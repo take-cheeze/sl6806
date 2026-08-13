@@ -416,11 +416,11 @@ a poll loop that prints as it goes), and a sweep of the five CLKCR bits **no
 bring-up in the dump ever writes**: the vendor's read-modify-write clears
 `0x7FFF0FFF`, so bits 12..15 and 31 have never been set by anything.
 
-**Run it twice — once with a card in the slot, once without.** CMD0 needs no
-card in principle, but a host with a card-detect input may decline to run its
-clock into a slot it knows is empty, and every run so far has been
-uncontrolled for this. The card-detect pin is unknown, so it cannot be
-checked in software; two runs and a microSD check it in a minute.
+**[M] Run with and without a card: it makes no difference.** `SdScope` and
+`PadMap` were both taken both ways. The card-detect theory — that a host might
+decline to clock a slot it knows is empty — is not supported: no pad on the
+board changes when a card goes in, so if the controller knows, it is not
+finding out through any pin software can see.
 
 ## [M] It discards commands in under a microsecond, 2026-08-13
 
@@ -666,11 +666,14 @@ Three readings of its output:
 - **Multi-block reads.** CMD18 needs CMD12 to stop it and its own status
   handling. `sl6806_sd_read_blocks()` issues one CMD17 per block instead,
   which is slower and cannot leave the card mid-transfer.
-- **Card detect.** Nothing in the dump reads a card-detect bit in this block.
-  The bootloader configures a bank-2 pad as an input with a pull
-  (`0x0002280B`, at `0x00822310`) next to code that touches the *other*
-  storage host, and that is a guess. "No card" is currently a pair of
-  timeouts, not a pin.
+- **Card detect.** Nothing in the dump reads a card-detect bit in this block,
+  and **[M] 2026-08-13 nothing on the board responds to card insertion
+  either**: `examples/PadMap`, run with one power cycle and a card inserted
+  between the two passes, produced two identical logs across all six banks and
+  all sixty-nine parked pads. Card detect is therefore on one of the six pads
+  the boot ROM has assigned, on a pin that is not bonded, or absent. "No card"
+  stays a pair of command timeouts, and that is now a measured limitation
+  rather than an unexamined gap.
 - **MMC.** The ROM branches to CMD1 when CMD55 times out. This driver reports
   "no card (or an MMC)" and stops, because with nothing ever having answered
   in this slot there would be no way to tell a working transcription of the

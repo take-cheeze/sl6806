@@ -48,7 +48,36 @@
  * inside a bank's configured run is the signature of exactly that.
  *
  * ===================================================================
- *  [M] TWO RUNS, AND EXACTLY ONE PIN DIFFERS
+ *  [M] THE RESULT: A CARD CHANGES NOTHING SOFTWARE CAN SEE
+ * ===================================================================
+ * Run properly at last - one power cycle, slot empty, then a card inserted
+ * without unplugging - the two logs are **identical, byte for byte**. Same
+ * census across all six banks, same verdict on all sixty-nine parked pads,
+ * same counts.
+ *
+ * So there is no card-detect pin among the pads this test can reach, and the
+ * "one pin differed" result from the earlier pair was the settling bug and a
+ * power cycle between runs, not a card. Retracted.
+ *
+ * Where card detect could still be, none of which this sketch may touch:
+ *
+ *   - one of the six pads the boot ROM has assigned (bank 0 pins 0..3 and
+ *     bank 2 pins 0..1 on function 2, bank 1 pin 9 on function 3);
+ *   - a pin in function 0, which is to say not bonded out at all;
+ *   - nowhere - plenty of microSD sockets have no detect contact, or have one
+ *     the board does not route.
+ *
+ * There is a second reading worth keeping in view, because it is not settled:
+ * **the SD bus pads showed nothing either.** Bank 1 pins 12, 13 and 14 follow
+ * their pull with a card in the slot exactly as they do with it out, and a
+ * card holds CMD and DAT up through its own pull-ups. Either those pull-ups
+ * are weaker than this chip's internal ones - they are the same order of
+ * magnitude, so quite possible - or [?] bank 1 pins 12..14 are the chip
+ * vendor's default SD pads and not the ones this board routes to the socket.
+ * The mask ROM is generic to the part; the board is not.
+ *
+ * ===================================================================
+ *  [M] AN EARLIER PAIR OF RUNS, AND WHY THEY MISLED
  * ===================================================================
  * Second and third runs, identical in every respect except one pin:
  *

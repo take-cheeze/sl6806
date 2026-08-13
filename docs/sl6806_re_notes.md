@@ -5109,3 +5109,48 @@ the two pins with debounce hardware on them.
 `pad_settled()` now retries a pad that fails the fast pass with a 40 ms
 settle — four RC constants of that estimate — and only pads that failed pay
 for it.
+
+### [M] RESULT: inserting a card changes nothing software can see
+
+The card-detect test, run to its own protocol at last — one power cycle, slot
+empty, then a card inserted without unplugging. **The two logs are identical
+byte for byte**: same census across all six banks, same verdict on all
+sixty-nine parked pads, same counts.
+
+Two things follow.
+
+**There is no card-detect pin among the pads this test can reach.** It could
+still be one of the six the boot ROM has assigned (bank 0 pins 0..3 and bank 2
+pins 0..1 on function 2, bank 1 pin 9 on function 3), which are off limits
+because something USB needs is among them; or a pin in function 0, which is to
+say not bonded; or nowhere at all, since plenty of microSD sockets have no
+detect contact or have one the board does not route. `sl6806_sd.h` keeps
+reporting card presence as a pair of command timeouts, and that is now a
+measured limitation rather than an unexamined gap.
+
+**The earlier "one pin differed" result is retracted.** Bank 1 pin 10 moved
+between two runs that also differed by a power cycle, and it was measured by
+the build that read a pad before it settled. Neither the pin nor the card had
+anything to do with it. The finding that survives from those runs is the one
+that came from the ROM rather than the meter: pins 10 and 11 are the boot
+ROM's two mode inputs (§"the boot ROM's two mode inputs"), and they are the
+only two pads on the board that will not settle under an internal pull even
+after 40 ms — which is what a debounced button looks like, and corroborates
+them from the other side.
+
+**And the SD bus pads showed nothing either**, which is worth stating because
+it was not the question and may be the more useful answer. Bank 1 pins 12, 13
+and 14 follow their pull with a card in the slot exactly as they do with it
+out. A card holds CMD and DAT up through its own pull-ups, so either those are
+weaker than this chip's internal pulls — they are the same order of magnitude,
+so quite possible — or **[?] bank 1 pins 12..14 are the chip vendor's default
+SD pads rather than the ones this board routes to its socket.** The mask ROM
+is generic to the part; the board is not. Nothing in the dump can settle that,
+because the dump is the same for every board built on this chip. A photograph
+of the socket's traces would.
+
+That last possibility deserves weight in proportion to §23's open problem. The
+SD host accepts a command and discards it in under a microsecond with its
+datapath demonstrably clocked; a controller wired to pads that go nowhere is
+one of the few explanations left standing that does not require the block to
+be broken.
