@@ -152,8 +152,15 @@
 
 #define FM_STEP_KHZ     100
 
-/* Which frequencies to sweep, and how long to give each one to tune. */
-#define SWEEP_STEP_CH   5        /* every 500 kHz */
+/*
+ * How coarsely to sweep, in 100 kHz channels, and how long to give each tune.
+ * The default of 5 is every 500 kHz, which is quick and walks straight past
+ * stations: allocations sit on 100 kHz boundaries in Japan. Override it
+ * without editing:  EXTRA_FLAGS="-DFM_BAND=1 -DSWEEP_STEP_CH=1"
+ */
+#ifndef SWEEP_STEP_CH
+#define SWEEP_STEP_CH   5
+#endif
 #define TUNE_TIMEOUT_MS 60
 
 #define I2C_HALF_US     5

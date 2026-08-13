@@ -926,12 +926,14 @@ setting tune-complete and reading its own channel number back out of the
 status register. That is the first time this framework has *written* to a
 peripheral device rather than reading one or driving a pad.
 
-RSSI comes back at 9 across the lower band and 0 across the upper, with no
-peaks - which is the aerial missing rather than the driver failing, since on
-this device the aerial is the headphone lead. The registers used for the tune
-are the published RDA5807 ones (`0x02` enable/mute, `0x03` channel and tune,
-`0x0A`/`0x0B` status), not anything from the dump - the vendor driver only
-ever reads the id and writes the enable.
+RSSI stays at the noise floor - 0 to 5 out of 127 - and, importantly, **its
+peaks do not reproduce between runs**. A 500 kHz sweep of the Japanese band
+showed 77.5, 79.0, 82.0 and 88.0 MHz standing out of zeros, which looked like
+stations; re-running at 100 kHz put nothing at those frequencies and scattered
+2s elsewhere. So the structure is noise, not reception, and the aerial - which
+on this device is the headphone lead - has not been connected during any run so
+far. The tuner is demonstrably being driven; that it can *receive* is still
+unproven
 
 An FM driver is now a small job
 
