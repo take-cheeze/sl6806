@@ -843,6 +843,66 @@ An FM driver is now a small job - the bus is done, the addresses are known,
 and what is left is the register map of a well-documented part. Note it needs
 headphones plugged in as an antenna (the UI says so in five languages).
 
+## 7j. The peripheral map, read on hardware
+
+`examples/RegFileProbe` reads `0x00`..`0x82` at word stride from six candidate
+bases in payload mode. Read-only, and the clock and reset unit goes first as a
+control - it is known real, so if it did not read back sensibly the probe
+would be wrong rather than the chip interesting.
+
+| base | result | |
+|---|---|---|
+| `0x40080000` | varied, 8+ distinct values | the control - clock and reset unit |
+| **`0x40040000`** | **varied, 8+ distinct values** | **live peripheral, confirmed** |
+| `0x40036000` | all zero | |
+| `0x4010E000` | all zero | |
+| `0x40030000` | all zero | FIRM uses it heavily, so this is "gated off", not "absent" |
+| `0x40020000` | all zero | |
+
+**Nothing faulted at any address.** An all-zero window in bootloader mode is at
+least as easily a gated-off peripheral as an empty one, so none of the zeros
+is evidence of absence.
+
+**`0x40040000` is now confirmed on hardware**, which §7c only had as a
+candidate - and had partly discounted, since its one apparent appearance near
+the touch/camera drivers turned out to be a float constant pool. It is the
+mask ROM's most referenced base (125 literals) and it reads structured data:
+
+```
++0x00  00004102 000F0000 0F00000E 0001058E   +0x20  00040200 00010200 00000FFF BB000000
++0x40  00000FFF BB000000 0043031E 00494943   ...
++0x28  DA5580F1 5AA2A94A                     random-looking - efuse or chip id?
++0x110 00040200 00010200 00000FFF BB000000   the +0x10 group repeating
++0x120 40000300 400000C0 00000FF8 BB000000   again, with different values
+```
+
+The four-register group `{..., ..., 0x00000FFF, 0xBB000000}` repeating at
+three offsets is the shape of a multi-channel block rather than a flat
+register file.
+
+### The indexed register file is probably not direct MMIO at all
+
+This probe did not find it, and the reason is worth writing down rather than
+continuing to look the same way. Two things argue that the file is reached
+*indirectly* - an index register and a data register - rather than as
+`base + index * 4`:
+
+- The vendor calls a **function** for every access, even a single read. Direct
+  word-strided MMIO would be inlined; an indirect sequence has to be a
+  function because it is several ordered writes.
+- Values are masked as **bytes** (`uxtb`, `and #0x5d`, `orn #0x7f`) across
+  ~131 registers, which is a serial/analog register bank convention, not a
+  32-bit MMIO block.
+
+That also fits §7c finding no `0x4xxxxxxx` constants anywhere near the drivers
+that use it: they reach it through the SRAM veneers, and the base lives in
+whatever code the veneers point at.
+
+**A read-only probe cannot confirm an indirect interface**, because proving it
+means writing an index and seeing the data register change - and writing to a
+suspected power/clock file is exactly what should not be done casually. That
+is the wall this line of attack reaches.
+
 ## 7c. Peripheral map
 
 - **Peripheral MMIO region is `0x40000000`.** Established by decoding every

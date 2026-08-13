@@ -76,14 +76,45 @@ typedef struct {
  * than the chip being interesting.
  */
 static const candidate_t candidates[] = {
-    { 0x40036000u, "92 ROM refs, absent from the FIRM-derived map" },
-    { 0x4010E000u, "65 ROM refs, absent from the FIRM-derived map" },
-    { 0x40040000u, "125 ROM refs, the most used of all"           },
-    { 0x40030000u, "87 ROM refs; FIRM's heavily-used 16-bit block" },
-    { 0x40020000u, "70 ROM refs"                                   },
-    { 0x40080000u, "the clock and reset unit - the control"        },
+    { 0x40080000u, "the clock and reset unit - the CONTROL, known real" },
+    { 0x40036000u, "92 ROM refs, absent from the FIRM-derived map"      },
+    { 0x4010E000u, "65 ROM refs, absent from the FIRM-derived map"      },
+    { 0x40040000u, "125 ROM refs, the most used of all"                 },
+    { 0x40030000u, "87 ROM refs; FIRM's heavily-used 16-bit block"      },
+    { 0x40020000u, "70 ROM refs"                                        },
 };
 #define NCANDIDATES ((int)(sizeof(candidates) / sizeof(candidates[0])))
+
+/*
+ * ===================================================================
+ *  BUILD THIS WITH RUN_MODE=poll
+ * ===================================================================
+ *     make SKETCH=examples/RegFileProbe RUN_MODE=poll run
+ *
+ * Not optional advice. This probe is deliberately made of very small steps -
+ * one address announced per loop() call, one read block per call - and in the
+ * default run mode loop() is driven by the boot ROM's idle callback, which on
+ * this unit has been measured as low as a fraction of a call per second. The
+ * first two attempts at this scan looked exactly like a BusFault: output
+ * stopped after the banner and the device went quiet. It was not a fault. It
+ * was a probe needing a hundred calls being given about one a second, and a
+ * monitor giving up after ten seconds of silence. In poll mode loop() runs at
+ * the USB poll rate and the whole scan finishes in seconds.
+ *
+ * WHAT THE HARDWARE SAID, so nobody re-runs it to find out:
+ *
+ *   0x40080000  clock and reset unit, the control - varied, plausible
+ *   0x40036000  reads all-zero
+ *   0x4010E000  reads all-zero
+ *   0x40040000  VARIED AND LIVE - a real peripheral, confirmed
+ *   0x40030000  reads all-zero
+ *   0x40020000  reads all-zero
+ *
+ * Nothing faulted. All-zero means gated off in bootloader mode at least as
+ * plausibly as absent, so a zero here is not evidence that a peripheral does
+ * not exist - 0x40030000 in particular is heavily used by FIRM (§7c).
+ */
+#define START_AT 0
 
 static int      cand;          /* which candidate                     */
 static unsigned idx;           /* register index within it            */
@@ -180,6 +211,24 @@ void setup()
     beginCandidate();
 }
 
+/*
+ * ANNOUNCING AN ADDRESS IS NOT THE SAME AS DELIVERING IT.
+ *
+ * The first version printed the address, called Serial.flush(), and read. It
+ * lost the address anyway: flush() cannot make the host poll, so the line was
+ * still sitting in the ring when the fault killed USB, and the run came back
+ * naming the base but not the offset.
+ *
+ * Waiting for the ring to drain cannot be done by spinning either - in the
+ * default run mode loop() *is* the ROM's idle callback, so blocking here
+ * stops the USB service that would drain it, and the wait would deadlock.
+ *
+ * So the wait is a state instead: print, return, and only do the read on a
+ * later call once the ring has actually emptied. Then a fault leaves the
+ * exact address as the last line the host received.
+ */
+static bool announced;
+
 void loop()
 {
     unsigned n;
@@ -187,14 +236,22 @@ void loop()
     if (done)
         return;
 
-    if (!roomToPrint())
+    if (!announced) {
+        if (!roomToPrint())
+            return;
+        Serial.print("  +0x");
+        Serial.print(idx * 4, HEX);
+        Serial.println(" ..");
+        announced = true;
+        return;                  /* let the host collect it */
+    }
+
+    /* Ring empty means the host has taken everything, including the line
+     * above. Only now is it safe to touch an address that may not decode. */
+    if (sl6806_console_space() < (int)SL6806_CONSOLE_SIZE)
         return;
 
-    Serial.print("  +0x");
-    Serial.print(idx * 4, HEX);
-    Serial.print(" ..");
-    Serial.println();
-    Serial.flush();          /* the address is out before the read happens */
+    announced = false;
 
     for (n = 0; n < REGS_PER_PASS && idx < REG_COUNT; n++, idx++) {
         uint32_t v = *(volatile uint32_t *)(candidates[cand].base + idx * 4);
