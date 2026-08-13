@@ -977,6 +977,73 @@ means writing an index and seeing the data register change - and writing to a
 suspected power/clock file is exactly what should not be done casually. That
 is the wall this line of attack reaches.
 
+## 7l. FOUND: the indexed register file is at `0x40040000`, one byte per register
+
+Register **N is at `0x40040000 + N`**. Not `base + N*4`, and not an index/data
+pair - the reason it looked indirect is that the vendor's *veneer* takes an
+index at run time, while the mask ROM, knowing the register at build time,
+loads its absolute address as a literal.
+
+That is what gives it away. A sweep of the ROM for byte read-modify-writes
+through a `0x4xxxxxxx` literal finds a cluster at `0x04E00`-`0x05800` working
+on `0x40040001`, `0x40040004`, `0x4004000A`, `0x4004000B`, `0x4004000E` and
+`0x40040060` - every one of them `0x40040000` plus a number inside the file's
+`0x00`..`0x82` index range. One of them is a plain bit setter:
+
+```
+0x00004E38   ldrb r3, [r2]        ; r2 = 0x4004000B
+             uxtb r3, r3
+             cbz  r0, clear
+             orr  r3, r3, #8      ; set bit 3
+   strb:     strb r3, [r2]
+             bx lr
+   clear:    and  r3, r3, #0xF7
+             b    strb
+```
+
+`uxtb` on a byte load, one bit set or cleared, written back - the same idiom
+the veneer callers use, and the reason the values are masked to bytes
+everywhere.
+
+### Confirmed against the live chip
+
+`examples/RegFileProbe` reads the window as bytes in bootloader mode, where the
+camera is off and some clocks are running. Four registers whose meaning is
+known independently all agree:
+
+| reg | reads | expected, camera off | |
+|---|---|---|---|
+| `0x03` | `0x00` | field [4:3] clear | ✓ camera not enabled |
+| `0x16` | `0x01` | bit 7 clear | ✓ camera enable off |
+| `0x2C` | `0x4A` = `01001010` | clock driver sets bit (channel-2) | ✓ channels 3 and 5 on, **bit 4 clear - channel 6, the camera's MCLK, is off** |
+| `0x0B` | `0x0F` | ROM's bit-3 setter | ✓ bit 3 set |
+
+The `0x2C` reading is the strongest: the one clock channel known to belong to
+the camera is the one that is off, on a device where the camera is off.
+
+### What a payload now has to do to power the camera
+
+Every step is known, and all of it is `0x40040000 + N`:
+
+```
+reg 0x03 = (reg 0x03 & 0x5D) | 0x20      ; clock channel frequency = 2800
+reg 0x2C |= 1 << (6 - 2)                 ; start clock channel 6
+reg 0x03 = (reg 0x03 & 0xE7) | 0x08      ; camera field [4:3] = 01
+reg 0x16 |= 0x80                         ; camera enable
+                                         ; then the pad and reset sequence
+                                         ; examples/CameraDemo already runs
+```
+
+Register `0x03` carrying both the clock frequency selector and the camera field
+is why the two drivers mask it differently - `0x5D` for the clock, `0xE7` for
+the camera.
+
+**Untested.** Writing these is the experiment that would confirm the whole
+chain, and it is a write into a register file that plausibly carries rail
+control, so it wants deliberate consent rather than curiosity. Every value
+above is a read-modify-write with the vendor's own mask, so nothing is touched
+that the stock firmware does not touch.
+
 ## 7k. PSMP — the settings partition, decoded
 
 The last partition, `PSMP` at `0x3FC000` (`0x4000` bytes), is a key/value store

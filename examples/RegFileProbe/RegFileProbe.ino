@@ -120,6 +120,19 @@ static int      cand;          /* which candidate                     */
 static unsigned idx;           /* register index within it            */
 static bool     done;
 
+/*
+ * Two passes per base, because the access width is itself a guess.
+ *
+ * Pass 0 reads 32 bits at base + index*4. Pass 1 reads 8 bits at base + index,
+ * which is what a byte-wide file addressed by index would actually be - and
+ * the firmware masks every value it handles to a byte. This matters more than
+ * it sounds: four of the six bases read as flat zero in pass 0, and a
+ * peripheral that only decodes byte accesses is one of the things that looks
+ * exactly like that. A window that is dead to words and alive to bytes is the
+ * signature worth hunting.
+ */
+static uint8_t  pass;
+
 /* Per-candidate tallies, for the verdict at the end. */
 static unsigned n_zero, n_ones, n_bytes, n_distinct;
 static uint32_t first_seen[8];
@@ -136,6 +149,7 @@ static void beginCandidate(void)
     Serial.flush();
 
     idx = 0;
+    pass = 0;
     n_zero = n_ones = n_bytes = n_distinct = n_first = 0;
 }
 
@@ -254,7 +268,9 @@ void loop()
     announced = false;
 
     for (n = 0; n < REGS_PER_PASS && idx < REG_COUNT; n++, idx++) {
-        uint32_t v = *(volatile uint32_t *)(candidates[cand].base + idx * 4);
+        uint32_t v = pass == 0
+            ? *(volatile uint32_t *)(candidates[cand].base + idx * 4)
+            : *(volatile uint8_t  *)(candidates[cand].base + idx);
 
         tally(v);
         Serial.print(" 0x");
@@ -264,7 +280,13 @@ void loop()
 
     if (idx >= REG_COUNT) {
         verdict();
-        if (++cand < NCANDIDATES) {
+        if (pass == 0) {
+            /* Same window, byte accesses. */
+            pass = 1;
+            idx = 0;
+            n_zero = n_ones = n_bytes = n_distinct = n_first = 0;
+            Serial.println("  -- again, as bytes at base + index --");
+        } else if (++cand < NCANDIDATES) {
             beginCandidate();
         } else {
             Serial.println();

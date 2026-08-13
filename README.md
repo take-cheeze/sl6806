@@ -358,21 +358,13 @@ In rough order of how much they unlock:
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-3. **The indexed register file at `0x00804EAC` / `0x00804E44`.** Not just the
-   camera's problem: it is read 90 times and written 50 times across the
-   firmware, with register numbers spread over `0x00`..`0x82` and values
-   masked as bytes — a ~130-entry file addressed by index rather than by
-   address, which is the shape of a PMU / analog register bank rather than an
-   MMIO block. Clock channel 6 (MCLK) goes through it, and so, most likely,
-   does whatever switches the camera's supply. Whoever finds how
-   `0x00804E44` reaches the hardware unlocks 140 call sites at once — but
-   **not from these dumps**: those addresses are veneers whose targets are
-   written at run time, and §7h records the five searches across `dump.bin`,
-   `maskrom.bin` and `sram.bin` that establish it, so nobody repeats them.
-   What would work is reading SRAM while the stock firmware runs, which needs
-   SWD. Failing that, `0x40036000` and `0x4010E000` are the mask ROM's two
-   heavily-used bases that §7c never saw, and one of them is a plausible home
-   for the register file.
+3. **Power the camera from a payload.** The indexed register file behind the
+   clock and camera drivers has been found: it is at **`0x40040000`, one byte
+   per register** (§7l), and the four writes that enable the sensor's clock
+   and rail are known to the bit. Everything else in the chain is already
+   built and verified on hardware. What is left is to write them and re-run
+   `examples/CameraDemo` — a write into a register file that plausibly carries
+   rail control, so do it deliberately, with a verified dump in hand.
 4. **An FM driver**, now the cheapest working device on the board: an
    RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
    part, published register map, and the id read is done.
