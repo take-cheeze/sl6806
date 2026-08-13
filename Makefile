@@ -44,7 +44,7 @@ CORE_C   := $(CORE_DIR)/wiring_time.c $(CORE_DIR)/wiring_digital.c \
             $(CORE_DIR)/hal_gpio.c $(CORE_DIR)/sl6806_console.c \
             $(CORE_DIR)/sl6806_padctl.c $(CORE_DIR)/sl6806_lcdc.c \
             $(CORE_DIR)/sl6806_adc.c $(CORE_DIR)/sl6806_module.c \
-            $(CORE_DIR)/sl6806_pwm.c \
+            $(CORE_DIR)/sl6806_pwm.c $(CORE_DIR)/sl6806_regfile.c \
             $(CORE_DIR)/syscalls.c \
             $(CORE_DIR)/gfx/Framebuffer.c $(CORE_DIR)/gfx/font5x7.c \
             $(CORE_DIR)/gfx/LcdBus.c

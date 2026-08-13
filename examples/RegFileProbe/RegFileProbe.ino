@@ -1,319 +1,301 @@
 /*
- * RegFileProbe - hunt the SL6806's indexed register file on hardware.
+ * RegFileProbe - read the SL6806's indexed register file, now that it is found.
  *
- * WHAT THIS IS LOOKING FOR
+ * ===================================================================
+ *  THE HUNT IS OVER. THIS SKETCH CONFIRMS RATHER THAN SEARCHES.
+ * ===================================================================
+ * The file is not an MMIO window at all, which is why six of them were
+ * scanned here and none of them was it. The vendor's two accessors - write at
+ * SRAM 0x00804E44, read at 0x00804EAC - drive a four-register mailbox at
+ * 0x400F7000+0x100, and the byte they put in the low half of the command word
+ * differs by exactly one between the two directions. That is an 8-bit I2C
+ * address and its R/W bit: the register file is a chip on a serial bus, at
+ * device address 0x30. See cores/sl6806/sl6806_regfile.h and notes 7l.
  *
- * The vendor firmware reaches a byte-wide register file through two SRAM
- * veneers - `read(index)` at 0x00804EAC and `write(index, value)` at
- * 0x00804E44 - which between them account for 140 call sites, including
- * every clock channel and, most likely, whatever switches the camera's
- * supply. Register numbers run 0x00..0x82 and values are masked as bytes
- * (`uxtb`, `and #0x5d`, `orn #0x7f`), which is the shape of a PMU or analog
- * register bank rather than an ordinary MMIO block.
+ * WHAT THIS SKETCH DOES, in three phases and without a single write:
  *
- * Where it is cannot be answered from the dumps. Those two addresses are
- * veneers whose targets are written at run time, and docs/sl6806_re_notes.md
- * §7h records the five searches across dump.bin, maskrom.bin and sram.bin
- * that establish there is nothing static to find. So the question moves to
- * hardware: read the candidates and see which one answers like a register
- * file.
+ *   1. Dump all 131 registers the firmware is known to use, 0x00..0x82.
+ *   2. Sample eight of them repeatedly, and say which hold still. This is
+ *      the phase that exists because of a specific mistake: 7l's wrong
+ *      identification rested entirely on one reading of one register that
+ *      turned out to change on every read. A register file that is really a
+ *      register file should be mostly stable.
+ *   3. Decode the five LDO channels and print their voltages in millivolts.
+ *      This is the real test, and it is a prediction rather than an
+ *      observation: the vendor's setters encode 1700..3300 mV in 50 mV steps
+ *      in five bits, so if this is the right block, the decoded rails come
+ *      out at recognisable supply voltages - and if it is not, they come out
+ *      as noise. Getting 2.8 V and 3.3 V and 1.8 V from a byte that had no
+ *      reason to produce them is worth more than any amount of "looks live".
  *
- * THE CANDIDATES, and where they come from
+ * NOT ONE WRITE, and that is a deliberate limit rather than caution for its
+ * own sake. Channels 2..6 are five power rails, only one of which is known to
+ * be the camera's. The others may well be the core, the SRAM this payload is
+ * running from, or the USB PHY carrying the console. examples/CameraDemo does
+ * the writes, and only the camera's.
  *
- * Counting 32-bit literals in the mask ROM gives its own peripheral map,
- * independent of the FIRM-derived list in §7c. The two bases that are heavily
- * used by the ROM and absent from that list are the interesting ones - the
- * ROM is exactly the code that would own a power/clock register file, since
- * it has to bring the chip up before anything else exists.
+ *     make SKETCH=examples/RegFileProbe RUN_MODE=poll run
  *
- * ---------------------------------------------------------------------
- *  READ THIS FIRST - the same warning examples/MmioProbe carries
- * ---------------------------------------------------------------------
- * Reading an unmapped address on a Cortex-M raises a BusFault, and in payload
- * mode the boot ROM owns the fault handler, so the likely outcome is that the
- * device stops responding. That is not damage: unplug, hold the boot button,
- * plug back in. Flash is never touched here.
+ * RUN_MODE=poll is not optional advice - see the note below.
  *
- * THIS SKETCH ONLY READS. Not one write. A write to a power or clock register
- * can switch the core off, and the whole point of the file being hunted is
- * that it plausibly controls rails.
+ * ===================================================================
+ *  WHAT THE OLD SCAN FOUND, so nobody re-runs it
+ * ===================================================================
+ * This sketch used to read six candidate MMIO bases looking for the file.
+ * Measured on hardware, byte-wide:
  *
- * Every address is printed BEFORE it is read, and the console is flushed, so
- * if the device dies mid-scan the last line in the monitor names the address
- * that killed it. That is the most useful thing a probe like this can leave
- * behind, and it is why the scan is paced one small block per loop() call
- * rather than run to completion inside one.
+ *   0x40080000  clock and reset unit, the control - varied, plausible
+ *   0x40036000  reads all-zero
+ *   0x4010E000  reads all-zero
+ *   0x40040000  VARIED AND LIVE - a real peripheral, but not this one
+ *   0x40030000  reads all-zero
+ *   0x40020000  reads all-zero
  *
- *     make SKETCH=examples/RegFileProbe run
+ * Nothing faulted. 0x40040000 was briefly identified as the file and then
+ * retracted; it is most likely a USB controller. All-zero means gated off at
+ * least as plausibly as absent.
  *
- * WHAT COUNTS AS A HIT. A register file of ~131 byte-wide registers should
- * read back as varied small values - not all zero, not all 0xFFFFFFFF, and
- * not a handful of values repeating. The summary at the end scores each base
- * on exactly that, but the raw dump is printed too, because "what does it
- * actually contain" is the question a score cannot answer.
+ * Payload mode never writes flash, so an unplug undoes anything here.
  */
 
 #include <Arduino.h>
 #include "sl6806_console.h"
+#include "sl6806_regfile.h"
 
-/* How many indices the firmware is known to use: 0x00..0x82. */
-#define REG_COUNT      0x83
+/* [V] The index range the firmware's 140 call sites cover. */
+#define REG_FIRST      0x00
+#define REG_LAST       0x82
+#define REG_COUNT      (REG_LAST - REG_FIRST + 1)
 
-/* Registers per loop() call. Small, so a fault names a narrow range and the
- * console never has to swallow more than a few lines at once. */
-#define REGS_PER_PASS  8
+/* Registers per printed line, and lines per loop() call. */
+#define PER_LINE       16
+#define LINES_PER_PASS 2
 
-typedef struct {
-    uint32_t base;
-    const char *note;
-} candidate_t;
+/* Phase 2: how many times to re-read, and which registers. */
+#define SAMPLES        8
 
 /*
- * Ordered by how much the mask ROM uses them, with the two the FIRM-derived
- * map never saw first - those are the ones this sketch exists to test. The
- * clock and reset unit is last and is the control: it is known to be real
- * (§7c), so if it does not read back sensibly, the sketch is broken rather
- * than the chip being interesting.
+ * The eight worth watching. The first six are the busiest indices across the
+ * firmware; the last two are the camera's own two registers, which should be
+ * rock steady on a unit whose camera is off.
  */
-static const candidate_t candidates[] = {
-    { 0x40080000u, "the clock and reset unit - the CONTROL, known real" },
-    { 0x40036000u, "92 ROM refs, absent from the FIRM-derived map"      },
-    { 0x4010E000u, "65 ROM refs, absent from the FIRM-derived map"      },
-    { 0x40040000u, "125 ROM refs, the most used of all"                 },
-    { 0x40030000u, "87 ROM refs; FIRM's heavily-used 16-bit block"      },
-    { 0x40020000u, "70 ROM refs"                                        },
+static const uint8_t watch[] = {
+    0x03, 0x47, 0x1B, 0x13, 0x30, 0x0F, 0x16, 0x2C,
 };
-#define NCANDIDATES ((int)(sizeof(candidates) / sizeof(candidates[0])))
+#define NWATCH ((int)(sizeof(watch) / sizeof(watch[0])))
 
 /*
  * ===================================================================
  *  BUILD THIS WITH RUN_MODE=poll
  * ===================================================================
- *     make SKETCH=examples/RegFileProbe RUN_MODE=poll run
- *
- * Not optional advice. This probe is deliberately made of very small steps -
- * one address announced per loop() call, one read block per call - and in the
- * default run mode loop() is driven by the boot ROM's idle callback, which on
- * this unit has been measured as low as a fraction of a call per second. The
- * first two attempts at this scan looked exactly like a BusFault: output
- * stopped after the banner and the device went quiet. It was not a fault. It
- * was a probe needing a hundred calls being given about one a second, and a
- * monitor giving up after ten seconds of silence. In poll mode loop() runs at
- * the USB poll rate and the whole scan finishes in seconds.
- *
- * WHAT THE HARDWARE SAID, so nobody re-runs it to find out:
- *
- *   0x40080000  clock and reset unit, the control - varied, plausible
- *   0x40036000  reads all-zero
- *   0x4010E000  reads all-zero
- *   0x40040000  VARIED AND LIVE - a real peripheral, confirmed
- *   0x40030000  reads all-zero
- *   0x40020000  reads all-zero
- *
- * Nothing faulted. All-zero means gated off in bootloader mode at least as
- * plausibly as absent, so a zero here is not evidence that a peripheral does
- * not exist - 0x40030000 in particular is heavily used by FIRM (§7c).
+ * In the default run mode loop() is driven by the boot ROM's idle callback,
+ * which on this unit has been measured as low as a fraction of a call per
+ * second. A probe made of small paced steps then looks exactly like a device
+ * that has faulted: output stops after the banner and the monitor gives up.
+ * In poll mode loop() runs at the USB poll rate and this finishes in seconds.
  */
-#define START_AT 0
 
-static int      cand;          /* which candidate                     */
-static unsigned idx;           /* register index within it            */
-static bool     done;
+enum {
+    STEP_DUMP,
+    STEP_STABLE,
+    STEP_RAILS,
+    STEP_VERDICT,
+    STEP_IDLE,
+};
+
+static uint8_t  step = STEP_DUMP;
+static unsigned idx = REG_FIRST;
+
+/* Tallies for the verdict. */
+static unsigned n_read;        /* completed transfers                  */
+static unsigned n_timeout;     /* mailbox never cleared START          */
+static unsigned n_zero;
+static unsigned n_ff;
+
+static int      sample_round;
+
+static void printHex2(int v)
+{
+    if (v < 0x10)
+        Serial.print('0');
+    Serial.print(v, HEX);
+}
 
 /*
- * Two passes per base, because the access width is itself a guess.
- *
- * Pass 0 reads 32 bits at base + index*4. Pass 1 reads 8 bits at base + index,
- * which is what a byte-wide file addressed by index would actually be - and
- * the firmware masks every value it handles to a byte. This matters more than
- * it sounds: four of the six bases read as flat zero in pass 0, and a
- * peripheral that only decodes byte accesses is one of the things that looks
- * exactly like that. A window that is dead to words and alive to bytes is the
- * signature worth hunting.
+ * Is there room to print the next block without losing it? The console is a
+ * 2 KB ring that only drains when the host polls; holding a block until the
+ * ring is half empty is honest back-pressure rather than a guessed delay.
  */
-static uint8_t  pass;
-
-/* Per-candidate tallies, for the verdict at the end. */
-static unsigned n_zero, n_ones, n_bytes, n_distinct;
-static uint32_t first_seen[8];
-static unsigned n_first;
-
-static void beginCandidate(void)
-{
-    Serial.println();
-    Serial.print("=== base 0x");
-    Serial.print(candidates[cand].base, HEX);
-    Serial.print("  (");
-    Serial.print(candidates[cand].note);
-    Serial.println(")");
-    Serial.flush();
-
-    idx = 0;
-    pass = 0;
-    n_zero = n_ones = n_bytes = n_distinct = n_first = 0;
-}
-
-/* Remember up to eight distinct values, enough to tell "varied" from "one
- * value repeating" without keeping a table of 131. */
-static void tally(uint32_t v)
-{
-    unsigned i;
-
-    if (v == 0)          n_zero++;
-    if (v == 0xFFFFFFFFu) n_ones++;
-    if (v <= 0xFFu)      n_bytes++;
-
-    for (i = 0; i < n_first; i++)
-        if (first_seen[i] == v)
-            return;
-    if (n_first < 8)
-        first_seen[n_first++] = v;
-    n_distinct++;
-}
-
-static void verdict(void)
-{
-    Serial.print("  -> ");
-    Serial.print(n_zero);
-    Serial.print(" zero, ");
-    Serial.print(n_ones);
-    Serial.print(" all-ones, ");
-    Serial.print(n_bytes);
-    Serial.print(" byte-sized, ");
-    Serial.print(n_distinct >= 8 ? 8 : n_distinct);
-    Serial.println(n_distinct >= 8 ? "+ distinct values" : " distinct values");
-
-    if (n_ones >= REG_COUNT - 2) {
-        Serial.println("     reads as all-ones: nothing is decoding this window.");
-    } else if (n_zero >= REG_COUNT - 2) {
-        Serial.println("     reads as all-zero: either unpowered, gated off, or");
-        Serial.println("     not a register file.");
-    } else if (n_distinct <= 2) {
-        Serial.println("     one or two values repeating - a decoded window, but not");
-        Serial.println("     131 independent registers.");
-    } else if (n_bytes >= (REG_COUNT * 3) / 4) {
-        Serial.println("     VARIED AND BYTE-SIZED ACROSS 0x00..0x82. That is what the");
-        Serial.println("     firmware's masking implies the register file looks like.");
-        Serial.println("     Worth following: compare the indices the clock driver");
-        Serial.println("     touches - 0x03, 0x13, 0x16, 0x1B, 0x2C, 0x47.");
-    } else {
-        Serial.println("     varied, but wider than byte-sized - a real peripheral,");
-        Serial.println("     though not obviously this register file.");
-    }
-}
-
-/* Hold off printing while the console ring is more than half full, so a long
- * dump cannot outrun the host's polling and lose the very lines that matter.
- * Same lesson as examples/CameraDemo. */
 static int roomToPrint(void)
 {
     return sl6806_console_space() >= (int)(SL6806_CONSOLE_SIZE / 2);
+}
+
+static void railLine(unsigned ch)
+{
+    int on = sl6806_reg_read(SL6806_RF_LDO_ENABLE);
+    int mv = sl6806_ldo_get_mv(ch);
+
+    Serial.print("  channel ");
+    Serial.print(ch);
+    Serial.print("  ");
+
+    if (on < 0)
+        Serial.print("enable=? ");
+    else {
+        Serial.print((on & (1 << (ch - 2))) ? "ON " : "off");
+        Serial.print(' ');
+    }
+
+    if (ch == 4) {
+        /* The vendor keeps this one's setting in RAM rather than decoding
+         * the register, so there is nothing honest to print. */
+        int raw = sl6806_reg_read(SL6806_RF_LDO4_MV);
+        Serial.print(" (a six-entry menu, raw 0x");
+        if (raw >= 0)
+            printHex2(raw);
+        else
+            Serial.print("??");
+        Serial.println(")");
+        return;
+    }
+
+    if (mv < 0)
+        Serial.println(" read failed");
+    else {
+        Serial.print(' ');
+        Serial.print(mv);
+        Serial.println(" mV");
+    }
 }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 indexed register file probe ===");
-    Serial.println("Read-only. Looking for ~131 byte-wide registers behind the");
-    Serial.println("veneers at 0x00804EAC / 0x00804E44 - see notes 7h.");
-    Serial.println("Each address is printed before it is read, so if this stops,");
-    Serial.println("the last address shown is the one that faulted.");
-    Serial.flush();
-
-    cand = 0;
-    beginCandidate();
+    Serial.println("=== SL6806 indexed register file ===");
+    Serial.println("Mailbox at 0x400F7000+0x100; the file is a chip at I2C 0x30.");
+    Serial.println("Accessors transcribed from SRAM 0x00804E44 / 0x00804EAC.");
+    Serial.println("This sketch only reads. Channels 2..6 are power rails and");
+    Serial.println("four of the five are not known to be safe to touch.");
+    Serial.println();
+    Serial.println("index  00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F");
 }
-
-/*
- * ANNOUNCING AN ADDRESS IS NOT THE SAME AS DELIVERING IT.
- *
- * The first version printed the address, called Serial.flush(), and read. It
- * lost the address anyway: flush() cannot make the host poll, so the line was
- * still sitting in the ring when the fault killed USB, and the run came back
- * naming the base but not the offset.
- *
- * Waiting for the ring to drain cannot be done by spinning either - in the
- * default run mode loop() *is* the ROM's idle callback, so blocking here
- * stops the USB service that would drain it, and the wait would deadlock.
- *
- * So the wait is a state instead: print, return, and only do the read on a
- * later call once the ring has actually emptied. Then a fault leaves the
- * exact address as the last line the host received.
- */
-static bool announced;
 
 void loop()
 {
-    unsigned n;
+    int lines;
 
-    if (done)
+    if (!roomToPrint())
         return;
 
-    if (!announced) {
-        if (!roomToPrint())
-            return;
-        Serial.print("  +0x");
-        Serial.print(idx * 4, HEX);
-        Serial.println(" ..");
-        announced = true;
-        return;                  /* let the host collect it */
-    }
+    switch (step) {
 
-    /* Ring empty means the host has taken everything, including the line
-     * above. Only now is it safe to touch an address that may not decode. */
-    if (sl6806_console_space() < (int)SL6806_CONSOLE_SIZE)
-        return;
+    case STEP_DUMP:
+        for (lines = 0; lines < LINES_PER_PASS && idx <= REG_LAST; lines++) {
+            unsigned col;
 
-    announced = false;
+            Serial.print(" 0x");
+            printHex2((int)idx);
+            Serial.print("  ");
 
-    for (n = 0; n < REGS_PER_PASS && idx < REG_COUNT; n++, idx++) {
-        uint32_t v = pass == 0
-            ? *(volatile uint32_t *)(candidates[cand].base + idx * 4)
-            : *(volatile uint8_t  *)(candidates[cand].base + idx);
+            for (col = 0; col < PER_LINE && idx <= REG_LAST; col++, idx++) {
+                int v = sl6806_reg_read(idx);
 
-        tally(v);
-        Serial.print(" 0x");
-        Serial.print(v, HEX);
-    }
-    Serial.println();
-
-    if (idx >= REG_COUNT) {
-        verdict();
-        if (pass == 0) {
-            /* Same window, byte accesses. */
-            pass = 1;
-            idx = 0;
-            n_zero = n_ones = n_bytes = n_distinct = n_first = 0;
-            Serial.println("  -- again, as bytes at base + index --");
-        } else if (++cand < NCANDIDATES) {
-            beginCandidate();
-        } else {
-            /*
-             * Sample a few registers repeatedly. A configuration file holds
-             * still; a status or counter register does not, and telling those
-             * apart is what decides whether this window is the register file
-             * at all.
-             */
-            int k, r;
-            static const unsigned watch[] = { 0x03, 0x16, 0x2C, 0x60 };
-
-            Serial.println();
-            Serial.println("do these registers hold still? (0x40040000, 8 samples)");
-            for (r = 0; r < 4; r++) {
-                Serial.print("  reg 0x");
-                Serial.print(watch[r], HEX);
-                Serial.print(":");
-                for (k = 0; k < 8; k++) {
-                    Serial.print(" ");
-                    Serial.print(*(volatile uint8_t *)(0x40040000u + watch[r]), HEX);
-                    delayMicroseconds(200);
+                if (v < 0) {
+                    Serial.print("-- ");
+                    n_timeout++;
+                    continue;
                 }
-                Serial.println();
+                n_read++;
+                if (v == 0x00)
+                    n_zero++;
+                if (v == 0xFF)
+                    n_ff++;
+                printHex2(v);
+                Serial.print(' ');
             }
             Serial.println();
-            Serial.println("all candidates read. Nothing was written.");
-            done = true;
         }
+        if (idx > REG_LAST) {
+            step = STEP_STABLE;
+            sample_round = 0;
+            Serial.println();
+            Serial.println("do these hold still? (7l's whole mistake was assuming so)");
+        }
+        break;
+
+    case STEP_STABLE: {
+        int i;
+
+        /* One full sweep of the watch list per call, so a moving register
+         * shows up as a changing column rather than as drift over time. */
+        Serial.print("  ");
+        for (i = 0; i < NWATCH; i++) {
+            int v = sl6806_reg_read(watch[i]);
+
+            Serial.print("0x");
+            printHex2(watch[i]);
+            Serial.print('=');
+            if (v < 0)
+                Serial.print("--");
+            else
+                printHex2(v);
+            Serial.print(' ');
+        }
+        Serial.println();
+
+        if (++sample_round >= SAMPLES) {
+            step = STEP_RAILS;
+            Serial.println();
+            Serial.println("the LDO channels, decoded with the vendor's own scales:");
+        }
+        break;
+    }
+
+    case STEP_RAILS: {
+        unsigned ch;
+
+        for (ch = 2; ch <= 6; ch++)
+            railLine(ch);
+
+        Serial.println();
+        Serial.println("Channel 6 at 2800 mV is the camera's - notes 7h, 0x00D44B1C.");
+        step = STEP_VERDICT;
+        break;
+    }
+
+    case STEP_VERDICT:
+        Serial.println();
+        Serial.print("read ");
+        Serial.print(n_read);
+        Serial.print(" of ");
+        Serial.print(REG_COUNT);
+        Serial.print(", timed out ");
+        Serial.print(n_timeout);
+        Serial.print(", zero ");
+        Serial.print(n_zero);
+        Serial.print(", 0xFF ");
+        Serial.println(n_ff);
+
+        if (n_timeout == REG_COUNT) {
+            Serial.println("VERDICT: the mailbox never completed a transfer. Either");
+            Serial.println("0x400F7000 is gated off in payload mode, or the block is");
+            Serial.println("not this. Nothing above means anything.");
+        } else if (n_read && n_zero + n_ff == n_read) {
+            Serial.println("VERDICT: transfers complete but every byte is 0x00 or");
+            Serial.println("0xFF, which is what an absent slave looks like. The");
+            Serial.println("mailbox is alive; the chip behind it may not be.");
+        } else if (n_read) {
+            Serial.println("VERDICT: the file reads. Check the rail voltages above");
+            Serial.println("against real supplies before believing any of it - that");
+            Serial.println("is the part a wrong block cannot fake.");
+        }
+        step = STEP_IDLE;
+        break;
+
+    case STEP_IDLE:
+    default:
+        break;
     }
 }
