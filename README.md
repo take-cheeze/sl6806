@@ -363,21 +363,24 @@ framework depends on are annotated with their provenance in
 
 In rough order of how much they unlock:
 
-1. **Run `examples/AudioWall`.** It walks `0x400E0000`'s 28 unattributed bits
-   with a witness that is a number: how long the audio DMA takes to retire a
-   25 ms buffer. Everything about the audio block checks out except that it
-   runs 2500× too fast, which is the signature of a missing functional clock —
-   the PWM's problem and the camera's. The walk was impossible until
-   2026-08-13, when `BtProbe` got that register to hold bits from a payload;
-   four are already attributed (camera 6, Bluetooth 0, the `0x400E2300`
-   cluster 1, group 5) so the walk can check itself. The same bit that fixes
-   audio may well be next to the PWM's, which is what makes the backlight dim.
-2. **Does the audio DMA touch memory at all?** `examples/AudioWall` answers
-   this before it walks anything, and it is worth its own line: a capture
-   buffer is pre-filled with a pattern and handed to the RX descriptor. If the
-   pattern survives, the completion flag is not a transfer and the "descriptor
-   path runs" reading in [docs/AUDIO.md](docs/AUDIO.md) needs retracting.
-   Capture is the only direction where the engine can be caught in the act.
+1. **The audio block, which is found, woken, and will not run.** Six candidate
+   causes are closed by measurement or call graph — the output route, the bit
+   clock, all 32 bits of `0x400E0000`, the general DMA controller, the
+   vendor's system clock init, and a hidden register behind the coefficient
+   window. What is left is that the block accepts a descriptor and retires
+   4796 bytes in 10 µs (480 MB/s, which this bus does not do) with every
+   register holding exactly what the vendor's own code puts there.
+   [docs/AUDIO.md](docs/AUDIO.md) has the whole elimination table and the four
+   sketches. **The most useful thing anyone can do here is have a fresh idea**
+   — this one has been narrowed about as far as reading can narrow it.
+2. **Walk `0x400E0000`'s 28 unattributed bits with the PWM counter as the
+   witness.** `examples/AudioWall` already walked them against an audio
+   witness and found nothing, but the audio witness may simply be insensitive
+   — the block has other problems. The PWM's stalled counter is a cleaner
+   test, and the walk only became possible on 2026-08-13, when `BtProbe` got
+   that register to hold bits from a payload. Four bits are attributed
+   (camera 6, Bluetooth 0, the `0x400E2300` cluster 1, group 5), so the walk
+   can check itself.
 3. **Run the display driver on a real P20 and report what happens.** This is
    worth more than any further reading of the dump. The whole stack is
    written and the panel is a QSPI display; what nobody knows is whether the

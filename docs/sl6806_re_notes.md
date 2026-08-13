@@ -4201,3 +4201,26 @@ So the elimination table stands as it did, one row longer:
 
 The block accepts a descriptor and retires it in 10 µs having moved nothing,
 with every register holding exactly what the vendor's own code puts there.
+
+### Two more static leads closed, 2026-08-13
+
+**`0x00D94B0C` is a no-op in the playback path.** It was the one function in
+the audio stream setup nobody had read. It takes a three-bit mask and, per
+bit, sets bit 0 / bit 4 of `0x40009030` and polls bit 29 of `+0x50`, `+0x54`,
+`+0x58` — a power-up-and-wait for three analogue channels, i.e. the microphone
+front end. The playback path calls it from `0x00D97A4C` with **r0 = 0**, after
+a loop that exits when the state byte reaches zero, so it returns immediately.
+Nothing there for playback.
+
+**No LDO rail belongs to audio.** Every caller of the register-file write
+accessor (`0x00804E44`) in the whole of FIRM lives in `0x00CC7xxx`, which §7m
+identifies as the register-file/LDO driver itself. Nothing in the audio HAL or
+in `driver_audio` ever asks for a rail. So the "the analogue side has no
+supply" idea has no support in the vendor's code — the codec's supply, if it
+has a separate one, is not switched by software.
+
+With those two closed, the static reading of the audio subsystem is
+substantially exhausted. What is left unread is the application's EQ path
+(`HAL_eq_open`, `hardware EQ open success`, `audio_crab`), which is a
+software-side abstraction over the coefficient RAM §22 decoded, and is
+unlikely to contain a missing hardware enable.
