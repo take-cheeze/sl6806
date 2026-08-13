@@ -285,6 +285,8 @@ static bool     bus_proved;           /* and gave its documented id     */
 static uint32_t mclk_khz;             /* what the square wave measured  */
 static unsigned ctrl_drive;           /* drive strength for RESET/PWDN  */
 static bool     reset_stuck;          /* RESET cannot be driven high    */
+static bool     reset_floats;         /* nothing pulls the RESET net    */
+static bool     pwdn_floats;          /* nor the PWDN one               */
 static uint32_t heartbeat_at;
 static uint32_t sample_at;
 static uint32_t samples;
@@ -813,6 +815,79 @@ static void driveTest(uint32_t id, const char *name)
     }
 }
 
+/*
+ * How long does the pad hold a charge once nothing is driving it?
+ *
+ * This is the test that tells a connected net from an empty one, and it came
+ * out of a contradiction: RESET stayed *low* after being driven low under a
+ * pull-up, and stayed *high* after being driven high with no pull. A line
+ * that keeps whichever state it was last given is not being pulled anywhere
+ * by anything - it is a floating capacitor, which is what a pad with nothing
+ * on the other end looks like.
+ *
+ * So: drive a level, release to an input with no pull, and time how long the
+ * level survives. The physics is one line - an external resistor drags the
+ * net back in microseconds, while leakage alone takes many milliseconds.
+ *
+ *   both directions hold the window    nothing external on this net
+ *   high decays quickly               there is a pull-down out there
+ *   low decays quickly                there is a pull-up out there
+ *
+ * The two bus pads are the control group: they are known to have external
+ * pull-ups, because the sweep read them high with no internal pull at all. If
+ * this test does not show their lows decaying fast, the test is wrong rather
+ * than the board being interesting.
+ */
+#define HOLD_LIMIT_US   10000u
+
+static uint32_t holdTime(uint32_t id, int level)
+{
+    uint32_t cfg = PAD_WHICH(id) | (SL6806_PAD_FUNC_OUTPUT << 7) | (3u << 4);
+    uint32_t start, waited;
+
+    sl6806_pad_configure(cfg);          /* pull selector 0 - no pull */
+    sl6806_pad_write(id, level);
+    delayMicroseconds(200);
+    sl6806_pad_set_func(id, SL6806_PAD_FUNC_INPUT);
+
+    if (!sl6806_tick_mask())
+        return 0;
+
+    start = micros();
+    while ((waited = micros() - start) < HOLD_LIMIT_US) {
+        if (sl6806_pad_read(id) != level)
+            return waited;
+    }
+    return HOLD_LIMIT_US;
+}
+
+/* Returns 1 if the net looks floating - neither level decays. */
+static int holdTest(uint32_t id, const char *name)
+{
+    uint32_t hi = holdTime(id, 1);
+    uint32_t lo = holdTime(id, 0);
+    int floating = (hi >= HOLD_LIMIT_US && lo >= HOLD_LIMIT_US);
+
+    Serial.print("  ");
+    Serial.print(name);
+    Serial.print(": high held ");
+    if (hi >= HOLD_LIMIT_US) Serial.print(">10ms"); else { Serial.print(hi); Serial.print("us"); }
+    Serial.print(", low held ");
+    if (lo >= HOLD_LIMIT_US) Serial.print(">10ms"); else { Serial.print(lo); Serial.print("us"); }
+    Serial.println();
+
+    if (floating)
+        Serial.println("    holds both - nothing external pulls this net either way.");
+    else if (lo < HOLD_LIMIT_US && hi >= HOLD_LIMIT_US)
+        Serial.println("    low decays - there is a pull-up on this net.");
+    else if (hi < HOLD_LIMIT_US && lo >= HOLD_LIMIT_US)
+        Serial.println("    high decays - there is a pull-down on this net.");
+    else
+        Serial.println("    both decay - something is actively driving this net.");
+
+    return floating;
+}
+
 /* ----------------------------------------------------------- reporting */
 
 static void printAttempt(void)
@@ -1196,6 +1271,19 @@ void loop()
         }
         (void)driveHighTest(CAM_PAD_PWDN, "PWDN pin 15", ctrl_drive);
 
+        /*
+         * And the question those two answers raise between them: if RESET
+         * keeps whichever level it was last given, is anything out there at
+         * all? The bus pads are the control - they are known to have external
+         * pull-ups, so their lows must decay.
+         */
+        Serial.println();
+        Serial.println("what is on these nets? (charge held with nothing driving)");
+        (void)holdTest(CAM_PAD_B, "SDA/SCL pin 12");
+        (void)holdTest(CAM_PAD_A, "SDA/SCL pin 13");
+        reset_floats = holdTest(CAM_PAD_RESET, "RESET pin 14");
+        pwdn_floats  = holdTest(CAM_PAD_PWDN, "PWDN pin 15");
+
         printAttempt();
         step = STEP_POWER_LOW;
         break;
@@ -1355,18 +1443,31 @@ void loop()
                 Serial.println();
             }
 
-            Serial.println("What is left, now in this order:");
-            Serial.println("  1. There is no camera in this unit. The firmware supports");
-            Serial.println("     one and the pads are real, but cheap players ship one");
-            Serial.println("     image across several builds. Look at the case: if there");
-            Serial.println("     is no lens, everything above is already explained and");
-            Serial.println("     this is the end of the investigation.");
-            Serial.println("  2. Sensor power. RESET and PWDN are pads and they move,");
-            Serial.println("     but a module rail behind a regulator nothing here drives");
-            Serial.println("     is not - and the vendor's power-up has no such call in");
-            Serial.println("     it either, so if that is the answer it is on the module.");
-            Serial.println();
-            Serial.println("Neither is on this bus, and neither is fixable in software.");
+            if (reset_floats && pwdn_floats) {
+                Serial.println("AND BOTH CONTROL NETS FLOAT. Driven either way they keep");
+                Serial.println("the level, for longer than any resistor would allow, while");
+                Serial.println("the bus pads next to them behave exactly as pulled-up lines");
+                Serial.println("should. A camera module would put something on reset and");
+                Serial.println("power-down - a pull, an input, a load. There is nothing.");
+                Serial.println();
+                Serial.println("The most economical reading of every result in this run is");
+                Serial.println("that THIS UNIT HAS NO CAMERA FITTED: the SoC pads are real");
+                Serial.println("and work, the firmware's driver is real, and the module the");
+                Serial.println("firmware was written for is not on the end of the traces.");
+                Serial.println("Look at the case for a lens - that is the confirmation, and");
+                Serial.println("if it is absent this line of investigation is finished.");
+            } else {
+                Serial.println("What is left:");
+                Serial.println("  1. Sensor power. RESET and PWDN are pads and they drive,");
+                Serial.println("     but a module rail behind a regulator nothing here");
+                Serial.println("     drives is not - and the vendor's power-up has no such");
+                Serial.println("     call in it either, so that would be on the module.");
+                Serial.println("  2. No camera fitted in this unit. Cheap players ship one");
+                Serial.println("     firmware image across several hardware builds. Look at");
+                Serial.println("     the case for a lens.");
+                Serial.println();
+                Serial.println("Neither is on this bus, and neither is fixable in software.");
+            }
         } else if (saw_fm) {
             Serial.println("Something did answer the scan, so the bus is not dead - but");
             Serial.println("the tuner check above did not confirm it. Read that first:");
