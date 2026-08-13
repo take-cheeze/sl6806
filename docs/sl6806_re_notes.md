@@ -510,6 +510,613 @@ all nine.
 So the TWI controller base is the blocker for both. Finding it is the same
 kind of job that §12b did for the LCDC, and it buys two devices at once.
 
+### But neither device has to wait for it: both buses are pads
+
+The TWI base costs speed, not access. Every line either device needs is a pad
+whose id is in the tables above, and the pad controller is a driver
+(`sl6806_padctl.h`, out of the mask ROM), so I2C is software:
+
+- `examples/TouchDemo` bit-bangs bus 1 and reads the CST816's seven-byte
+  touch report. Seven bytes per touch at ~100 kHz is nowhere near a bottleneck.
+- `examples/CameraDemo` does the same for bus 0 and reads the sensor's chip
+  id. It probes both SDA/SCL assignments, because the id order and the pin
+  order in the table above disagree, so which pad is which is an assumption.
+
+**The camera has one line the touch panel does not: MCLK.** The vendor muxes
+it to alternate function 2 and programs clock channel 6 with 2800, and that
+channel's registers are unknown - programmed through the same hidden library.
+A sensor of this family clocks its register block from MCLK, so with no clock
+it can be alive and still never ACK. `CameraDemo` therefore tries the pad two
+ways, the vendor's mux (in case something already drives channel 6) and a
+software square wave on the pad as an output, which is slow and not
+continuous but is not nothing. If the sensor answers under either, the
+missing channel is a frame-rate problem rather than an access one.
+
+### HARDWARE RESULT: bus 0 works, and the camera is not what is on it
+
+Run on a P20, 2026-08-13, with `examples/CameraDemo`. Three findings, in the
+order they were established.
+
+**1. The TWI0 pads are the other way round from the table above.** Scanning
+`0x08..0x77` after the vendor's power-up:
+
+| SDA | SCL | result |
+|---|---|---|
+| bank 4 pin 13 (`0x46938`) | pin 12 (`0x46138`) | nothing answers |
+| **bank 4 pin 12 (`0x46138`)** | **pin 13 (`0x46938`)** | **`0x10`, `0x11`, `0x60` answer** |
+
+Both pads idle high under most of the ROM's pull selectors and both drive low
+and release cleanly, so this is not a marginal difference - one assignment has
+devices on it and the other is silent. **SDA is `0x00046138`, SCL is
+`0x00046938`.** The order §7h lists them in was the order they are configured
+in, which is not the same thing.
+
+**2. Those three addresses are the FM tuner - see §7i.** Not the camera, and
+not a surprise once found: the board has an FM radio and its driver is on this
+bus.
+
+**3. `0x68` answers nothing, on a bus that demonstrably works.** The same
+sketch reads the tuner's documented chip id through the same bit-banged code
+before drawing any conclusion, so the pads, the assignment, the pull-ups, the
+timing, the ACK handling and the byte order are all verified against a known
+answer at the moment the camera is called silent.
+
+That removes the entire bus from the list of suspects.
+
+**4. And MCLK has now been measured out of the list too.** The software square
+wave was rewritten to toggle the pad through its set/clear registers directly
+and to run for an interval rather than for a number of edges, and it measures
+**2.8 MHz** on hardware, held for 30 ms before the first transfer and through
+every bit of it. The vendor programs channel 6 with **2800**, and 2.8 MHz is a
+thoroughly ordinary sensor MCLK where 280 MHz is not - so the argument is
+that the unit is kHz and *this sketch is now delivering the vendor's own
+nominal clock*. The sensor still does not ACK.
+
+`0x00046938`/`0x00046138` are also confirmed as the one and only bus: the FM
+driver configures the very same two pads (`0x00046918`, `0x00046118` - same
+pins, same alt function 2, only the drive strength differs) before its own
+transfers, so there is no second TWI0 pad option hiding the camera.
+
+**5. The four nets themselves were then measured**, by driving a level,
+releasing to an input with no pull, and timing how long the level survives -
+a resistor drags a net back in microseconds, leakage takes many milliseconds:
+
+| net | high held | low held | reading |
+|---|---|---|---|
+| SDA, 4/12 | >10 ms | **1 µs** | external pull-up |
+| SCL, 4/13 | >10 ms | **1 µs** | external pull-up |
+| RESET, 4/14 | >10 ms | >10 ms | **no external pull** |
+| PWDN, 4/15 | >10 ms | **3 µs** | external pull-up |
+
+The two bus pads are the control group - they are known to carry external
+pull-ups, since the sweep reads them high with no internal pull - and they
+behave exactly as they must, which is what makes the other two readings worth
+anything.
+
+**The pull table is not uniform across these four pads, and reading it wrongly
+produced a false finding.** The sweep was originally run on the two bus pads
+only, and the selector it chose from them - 6 - was then used on all four.
+Sweeping all four says why that was wrong:
+
+| pad | selectors that read high |
+|---|---|
+| SDA 4/12, SCL 4/13 | 6, 7, 8, 9, 10, 11, 13, 15 |
+| PWDN 4/15 | 6, 7, 8, 9, 10, 11, 13 |
+| **RESET 4/14** | **8, 9, 10, 11, 13** - not 6, not 7 |
+
+On a pad with an external pull-up, *every* selector that is not a pull-down
+reads high, because the external resistor does the work - so the bus pads
+cannot tell an internal pull-up from no pull at all. Pin 14 has no external
+pull-up, and there selector 6 does nothing. Under it, RESET stayed low after
+being driven low, and that was written up as "something external holds this
+line down". **It does not.** With the vendor's own selector 8, RESET rises in
+1 µs like every other pad. Selector 8 is what §7h's own pad ids carry, so the
+evidence was there to be used.
+
+Timing how long an internal pull takes to move each net - a proxy for the
+capacitance hanging off the pad - gives the same answer everywhere:
+
+| net | pull-up | pull-down |
+|---|---|---|
+| SDA 4/12 | 1 µs | 1-2 µs |
+| SCL 4/13 | 1 µs | 1-2 µs |
+| RESET 4/14 | 1 µs | 1 µs |
+| PWDN 4/15 | 1-2 µs | 1-2 µs |
+
+So all four nets are small and none is loaded differently from the bus pads
+that demonstrably reach a fitted chip. That kills the last software-visible
+way to ask whether a module is on the end of the traces: a bare stub and a
+trace to a high-impedance input look identical at this resolution.
+
+**PWDN's pull-up is a fitted component**, so the board does carry camera
+circuitry; the easy explanation that this unit simply has no camera is weaker
+than it looked. RESET floating proves less: a sensor's reset pin is a
+high-impedance input, so a trace running to one with no resistor floats
+exactly like a trace running nowhere. The measurement separates pulled nets
+from unpulled ones, not connected ones from empty ones.
+
+RESET also drives high perfectly well at the vendor's drive strength of 0, so
+"the sensor is held in reset" is ruled out too.
+
+### SETTLED: the camera module is fitted and works
+
+**The stock firmware's camera app shows a live preview on this unit.** That is
+the vendor's own driver, on the same board, driving the same sensor at the same
+address on the same bus this branch has been probing.
+
+It closes the question that was still open and reverses one of the two
+candidates outright:
+
+- **"No module fitted" is dead.** The part is there and it works.
+- **Sensor power is not the leading explanation any more, it is the
+  explanation.** Everything else about the path is now positively confirmed
+  from both ends: the pads, the bus, the address and the clock are right,
+  because the vendor reaches the same sensor over them. What the vendor does
+  and a payload does not is switch something on.
+
+The vendor's `power_on` at `0x00D44B1C` contains no such call - it is pads,
+delays and clock channel 6, nothing else (decoded above). So the rail is
+enabled further up the stack, before the sensor driver is ever entered, which
+points once more at the byte-wide register file: a ~131-entry indexed file of
+exactly the kind that carries LDO enables, reached through veneers a payload
+cannot call.
+
+What is left, in the order the evidence now supports:
+
+- **Sensor power**, now the leading explanation. Every rail a module needs is
+  behind a regulator that nothing in this framework drives, and per the decode
+  below the vendor's own power-up has no such call in it either - it is pads,
+  delays and the clock, nothing else. So whatever switches the camera's supply
+  sits further up the stack than the sensor driver. The likeliest home is the
+  byte-wide indexed register file behind the clock driver (below): a ~130-entry
+  file of the kind SoCs use for LDO and power-domain control, reached through
+  SRAM routines a payload cannot call.
+
+  **And the sensor driver writes it - the enable is not further up the stack
+  after all.** An earlier revision of this note said the camera driver only
+  read registers `0x03` and `0x16` and wrote none. That was wrong: it came
+  from a tool-assisted search that missed both write sites. Disassembling the
+  region directly finds two read-modify-writes, and they are the missing step:
+
+  ```
+  0x00D44EA6   v = read(0x03);  write(0x03, (v & 0xE7) | 0x08)   ; field [4:3] = 01
+  0x00D44F06   v = read(0x16);  write(0x16, (v | 0x80) & 0xFF)   ; set bit 7
+  ```
+
+  Register `0x03` is shared - the clock driver masks it with `0x5D` and sets
+  bit 1, the camera clears bits 3-4 and sets bit 3 - so one control register,
+  different fields.
+
+  **Everything about this camera is now specified except one address.** Pads,
+  bus, sensor registers, power-up order, clock channel and now the two enable
+  writes are all known to the bit. What is missing is where the indexed
+  register file sits in the memory map; with that, a payload could run the
+  whole sequence itself.
+- ~~**No module fitted.**~~ Ruled out: the stock camera app previews live.
+
+Both readings of which power pad is RESET were tried, and neither helps -
+worth recording, because under §7h's attribution the vendor's sequence ends by
+driving PWDN *high* immediately before reading the chip id, which is backwards
+for a line named power-down.
+
+### The MCLK clock channel: a lead, in flash rather than in the ROM
+
+With the bus eliminated, this is the camera's blocker. The whole power-up at
+`0x00D44B1C` now decodes with nothing unaccounted for:
+
+```
+pad_configure(0x00041930)          ; MCLK, alt function 2
+delay(1)
+clk(6, 1, 0)                       ; 0x00CC769C
+delay_ms(5)
+clk(6, 2, &2800)                   ; the frequency argument
+clk(6, 0, 0)
+pad_configure(0x00047880)          ; PWDN   \  r4 and r5, in that order -
+pad_configure(0x00047080)          ; RESET  /  which confirms §7h's attribution
+gpio_write(PWDN, 0); gpio_write(RESET, 0)
+delay_ms(5);  gpio_write(RESET, 0x40)
+delay_ms(5);  gpio_write(PWDN,  0x40)     ; note: PWDN ends *high*
+delay_ms(20)                              ; then the chip-id read
+```
+
+Every call is a delay, a pad, or the clock. There is no fourth thing - no
+regulator enable, no power-domain call - so if sensor power is the problem it
+is on the module and not in this routine.
+
+**The op codes fall out of the power-*down* routine.** `0x00D44AB2` is the
+camera's teardown, and it is short enough to read whole:
+
+```
+rom_1EC4(80)                       ; unattributed
+gpio_write(PWDN, 0); gpio_write(RESET, 0)
+delay_ms(10)
+clk(6, 1, 0)                       ; the only clk call here
+pad_configure(0x00047780)          ; RESET \
+pad_configure(0x00047F80)          ; PWDN   > all three parked on function 15
+pad_configure(0x00041F80)          ; MCLK  /
+```
+
+Power-up runs `(6,1,0)`, `(6,2,&2800)`, `(6,0,0)`; power-down runs `(6,1,0)`
+alone. So **op 1 stops the channel, op 2 sets its frequency, op 0 starts it** -
+which is the ordering both routines need and neither contradicts.
+
+It also settles the three pad ids §7g had left as "the rest of that selector
+group, role unknown": `0x00041F80`, `0x00047780` and `0x00047F80` are MCLK,
+RESET and PWDN again, with the function nibble at 15 - the parked state, input
+buffer off. Not three more pads.
+
+`clk(channel, op, arg)` at **`0x00CC769C`** is called three times on the way
+up: `(6, 1, 0)`, then `(6, 2, &2800)` after a 5 ms wait, then `(6, 0, 0)`.
+That dispatcher is ordinary flash and it decodes:
+
+```
+channel 0..1  ->  0x00CC75F0
+channel 2..6  ->  0x00CC7334     <- MCLK is channel 6
+```
+
+`0x00CC7334` is the interesting one. It switches on the op in `r1` through a
+`tbh` table, and it reaches the hardware **not** through an MMIO address but
+through a pair of routines taking a *register index*:
+
+```
+0x00804EAC   read  register <n>        called with 27, 3, 44
+0x00804E44   write register <n>, value
+```
+
+and it compares the requested value against a fixed set - `2700`, `2800`,
+`2900`, `3000`, `3200`, `3300` - selecting different bit patterns for each, so
+the argument is a menu rather than a divisor.
+
+**That register file is worth finding on its own.** It is not clock-specific:
+`0x00804EAC` is read 90 times and `0x00804E44` written 50 times across FIRM,
+with register numbers spread over `0x00`..`0x82` and values masked as bytes
+(`uxtb`, `and #0x5d`, `orn #0x7f`). A ~130-entry byte-wide indexed file
+reached by index rather than by address is the shape of a PMU / analog
+register bank on a serial side-channel, not of an MMIO block - which is
+consistent with §7c finding no `0x4xxxxxxx` constants anywhere near this code.
+The busiest indices are `0x03`, `0x47`, `0x1B`, `0x13`, `0x30`, `0x16`, `0x0F`.
+
+Both routines are in SRAM, so per §7f they are not resident in bootloader mode
+and a payload cannot call them. The *caller* is in flash and fully readable,
+the argument space is six values, and the same file is behind 140 other call
+sites - so whoever finds how `0x00804E44` reaches the hardware unlocks
+considerably more than MCLK.
+
+**SETTLED, NEGATIVE: the callee is not in the flash image.** The obvious next
+move is to disassemble `0x00804E44` itself, and it cannot be done from
+`dump.bin`:
+
+- The FIRM partition (`0x10000`, length `0x1B80D0`) carries a header in the
+  same field layout as HLKJ's - `load=0x00804C00`, `entry=0x00804C01`,
+  `hdrlen=0x1000`, `seglen=0x5862` at `0x10010`. `load` matching the SRAM base
+  this framework's own firmware mode links to is a good sign the reading is
+  right, but no CRC16 over the obvious candidate ranges verifies, so treat the
+  layout as [I] rather than [V].
+- That segment's address range does cover `0x00804E44`, but the code found at
+  the implied offset is floating-point DSP, not a register accessor.
+- So the whole 4 MB was searched for *any* alignment at which nine known SRAM
+  entry points (`0x00804E44`, `0x00804EAC`, `0x008051F4`, `0x008051FE`,
+  `0x00805224`, `0x00805454`, `0x008071F6`, `0x008071FA`, `0x008072E4`) all
+  land on a function prologue. **Zero offsets score 7 or more out of 9**, and
+  the best anywhere in the image is 3.
+
+The library is therefore not stored uncompressed in flash. The mask ROM was
+the obvious next place to look - it is where the pad controller turned out to
+be - and that hunt has now been run across all three binaries in the tree.
+
+### SETTLED, NEGATIVE: the SRAM library is in none of the three dumps
+
+**And there is a structural reason, which is the useful part.** The addresses
+`sl6806-ramcalls` reports are **not function entry points**. Their spacing
+gives it away: of the 251, twenty-six consecutive pairs are exactly 12 bytes
+apart and fifteen exactly 4, including the run
+
+```
+0x008051E8  0x008051EC  0x008051F0  0x008051F4  0x008051F8
+```
+
+A four-byte slot holds one instruction, and the only useful one is `b.w`. So
+this is a dispatch region - veneers forwarding to implementations elsewhere -
+which is exactly how §7h already read the four-byte block at `0x00811C78`. The
+implication is that **the targets are written at run time**, so no byte-level
+search of a static image can produce them, and every search below was doomed
+before it started:
+
+| search | over | result |
+|---|---|---|
+| 80 in-segment entry points vs function prologues, every 2-byte alignment | dump.bin, maskrom.bin, sram.bin | nothing above chance (best 19/80, in a high-entropy region) |
+| 15 four-byte-run entry points vs `B.W` encodings | all three | nothing above 70% |
+| self-referencing literals, solving for a constant load delta | dump.bin, maskrom.bin | no dominant mapping (best count 4) |
+| any literal equal to a veneer address or to `0x00804C00` | whole 4 MB | **only** the FIRM header at `0x10010` and its vector table - no installer, no copy loop |
+| runs of Thumb-odd ROM pointers that could be a target table | FIRM | one 131-entry run at `0x00C526F4`, which is repeated `0x010001` data, not pointers |
+
+`sram.bin` also settles §7f by measurement rather than inference: all nine
+addresses read as high-entropy noise in bootloader mode.
+
+So static analysis of `dump.bin`, `maskrom.bin` and `sram.bin` cannot yield
+this library. What would: reading SRAM while the **stock firmware** is running,
+which needs SWD rather than the USB path, since the veneers only exist once
+the application has installed them.
+
+**Two by-products worth keeping.** The ROM's own variables sit at
+`0x00804048`..`0x00804504`, i.e. ROM data occupies roughly
+`0x00804000`-`0x00804600`, immediately below FIRM's load address of
+`0x00804C00` - so that boundary is not arbitrary. And the mask ROM's
+peripheral map, by literal frequency, is independent evidence next to §7c's
+FIRM-derived list:
+
+| base | refs in ROM | |
+|---|---|---|
+| `0x40040000` | 125 | |
+| `0x40036000` | 92 | not in §7c's list |
+| `0x40030000` | 87 | §7c's "heavily used, 16-bit registers" |
+| `0x40020000` | 70 | |
+| `0x4010E000` | 65 | not in §7c's list |
+| `0x40080000` | 27 | the clock and reset unit |
+
+`0x40036000` and `0x4010E000` are new candidates, and one of them is a
+plausible home for the indexed register file.
+
+Note also what a working bus does *not* buy: pixels leave the sensor on the
+DVP/CSI front end above, which is undecoded. Reading the chip id proves the
+device and the pads; it is not a step towards an image on its own.
+
+## 7i. The FM tuner — IDENTIFIED, and the first device ever read on this board
+
+Found by scanning bus 0 while looking for the camera, then attributed from the
+firmware. It is an **RDA5807-family FM tuner on TWI 0**, and it is the third
+I2C device on this board rather than a second look at one of the two in §7h.
+
+| | |
+|---|---|
+| driver | `0x00D3D92C` (chip-id read), wrappers at `0x00D3D6F8` / `0x00D3D70A` |
+| bus | **0**, the camera's - both wrappers pass `r0 = 0` to the vendor's twi calls |
+| address | **`0x10`** in the driver; `0x11` and `0x60` also ACK on hardware |
+| chip id | the driver compares **`0x5808`**, at `0x00D3D988` - see the caveat below |
+
+The three addresses are one part: `0x10` is the RDA5807's sequential-access
+address, `0x11` its random-access one and `0x60` its TEA5767-compatible alias.
+All three answered the scan; only `0x10` appears in the firmware.
+
+The id read, verbatim (`0x00D3D92C`):
+
+```
+twi_write(0, 0x10, {0x00, 0x02}, 2, stop)     ; 0x00D3D952, low bit is ENABLE
+delay 50
+twi_read (0, 0x10, buf, 10)                   ; 0x00D3D962
+id = (buf[8] << 8) | buf[9]                   ; 0x00D3D972
+id == 0x5808 ?                                ; 0x00D3D988
+```
+
+**The vendor's id check is a presence check, not an identity check.** It takes
+bytes 8 and 9 of the ten-byte sequential read - register `0x0E` - and those are
+state-dependent: `0x5808` on a chip fresh out of reset, `0x0000` once
+`examples/FmDemo` has enabled and tuned it, both observed on this unit. The
+part's real identity is register `0x00`, read by random access at address
+`0x11`, and on this board it is **`0x5804`**.
+
+Strings around it: `FM chip id: 0x%x` (`0x00C75C1E`), `fm init err`,
+`fm_clk_init over`, `/dev/fm`, and a whole `fm_band` / `fm_search` /
+`fm_preset_station` UI.
+
+**CONFIRMED ON HARDWARE, 2026-08-13.** `examples/CameraDemo` reproduces that
+read over bit-banged GPIO and gets `0x5808` back - **on the read-only pass**,
+without the vendor's enable write, so the part answers cold. The ten bytes, as
+returned by a plain read from `0x10`, are the tuner's registers `0x0A`..`0x0E`:
+
+| reg | 0x0A | 0x0B | 0x0C | 0x0D | 0x0E |
+|---|---|---|---|---|---|
+| value | `0x013F` | `0x0000` | `0x5803` | `0x5804` | `0x5808` |
+
+(`0x0A` is the RDA5807's status register; the three `0x58xx` words at the end
+are why the driver takes bytes 8-9 rather than a documented id register.)
+
+**Why this matters beyond the radio.** That is the first time any I2C device
+on this board has been read by this framework, and it converts a whole class
+of "nothing answered" results into evidence: the pads, the SDA/SCL assignment,
+the internal pull-ups, the bit timing, the ACK handling and the byte order are
+all correct, because a device answered with the one value its own driver
+checks for. Any other silent address on this bus is silent for its own
+reasons - which is exactly how the camera's remaining suspects were narrowed
+to two, neither of them on the bus.
+
+**DRIVEN ON HARDWARE.** `examples/FmDemo` enables the tuner and sweeps the
+band over the same bit-banged bus, and it works: 41 channels tuned, every one
+setting tune-complete and reading its own channel number back out of the
+status register. That is the first time this framework has *written* to a
+peripheral device rather than reading one or driving a pad.
+
+RSSI stays at the noise floor - 0 to 5 out of 127 - and, importantly, **its
+peaks do not reproduce between runs**. A 500 kHz sweep of the Japanese band
+showed 77.5, 79.0, 82.0 and 88.0 MHz standing out of zeros, which looked like
+stations; re-running at 100 kHz put nothing at those frequencies and scattered
+2s elsewhere. So the structure is noise, not reception, and the aerial - which
+on this device is the headphone lead - has not been connected during any run so
+far. The tuner is demonstrably being driven; that it can *receive* is still
+unproven
+
+An FM driver is now a small job
+
+## 7j. The peripheral map, read on hardware
+
+`examples/RegFileProbe` reads `0x00`..`0x82` at word stride from six candidate
+bases in payload mode. Read-only, and the clock and reset unit goes first as a
+control - it is known real, so if it did not read back sensibly the probe
+would be wrong rather than the chip interesting.
+
+| base | result | |
+|---|---|---|
+| `0x40080000` | varied, 8+ distinct values | the control - clock and reset unit |
+| **`0x40040000`** | **varied, 8+ distinct values** | **live peripheral, confirmed** |
+| `0x40036000` | all zero | |
+| `0x4010E000` | all zero | |
+| `0x40030000` | all zero | FIRM uses it heavily, so this is "gated off", not "absent" |
+| `0x40020000` | all zero | |
+
+**Nothing faulted at any address.** An all-zero window in bootloader mode is at
+least as easily a gated-off peripheral as an empty one, so none of the zeros
+is evidence of absence.
+
+**`0x40040000` is now confirmed on hardware**, which §7c only had as a
+candidate - and had partly discounted, since its one apparent appearance near
+the touch/camera drivers turned out to be a float constant pool. It is the
+mask ROM's most referenced base (125 literals) and it reads structured data:
+
+```
++0x00  00004102 000F0000 0F00000E 0001058E   +0x20  00040200 00010200 00000FFF BB000000
++0x40  00000FFF BB000000 0043031E 00494943   ...
++0x28  DA5580F1 5AA2A94A                     random-looking - efuse or chip id?
++0x110 00040200 00010200 00000FFF BB000000   the +0x10 group repeating
++0x120 40000300 400000C0 00000FF8 BB000000   again, with different values
+```
+
+The four-register group `{..., ..., 0x00000FFF, 0xBB000000}` repeating at
+three offsets is the shape of a multi-channel block rather than a flat
+register file.
+
+### The indexed register file is probably not direct MMIO at all
+
+This probe did not find it, and the reason is worth writing down rather than
+continuing to look the same way. Two things argue that the file is reached
+*indirectly* - an index register and a data register - rather than as
+`base + index * 4`:
+
+- The vendor calls a **function** for every access, even a single read. Direct
+  word-strided MMIO would be inlined; an indirect sequence has to be a
+  function because it is several ordered writes.
+- Values are masked as **bytes** (`uxtb`, `and #0x5d`, `orn #0x7f`) across
+  ~131 registers, which is a serial/analog register bank convention, not a
+  32-bit MMIO block.
+
+That also fits §7c finding no `0x4xxxxxxx` constants anywhere near the drivers
+that use it: they reach it through the SRAM veneers, and the base lives in
+whatever code the veneers point at.
+
+**A read-only probe cannot confirm an indirect interface**, because proving it
+means writing an index and seeing the data register change - and writing to a
+suspected power/clock file is exactly what should not be done casually. That
+is the wall this line of attack reaches.
+
+## 7l. RETRACTED: `0x40040000` is not the indexed register file
+
+An earlier revision of this section claimed the file had been found at
+`0x40040000`, one byte per register. **That was wrong**, and the way it failed
+is worth more than the claim was.
+
+**The evidence that looked good.** Sweeping the mask ROM for byte
+read-modify-writes through a `0x4xxxxxxx` literal finds a cluster at
+`0x04E00`-`0x05800` working on `0x40040001`, `0x40040004`, `0x4004000A`,
+`0x4004000B`, `0x4004000E` and `0x40040060` - each `0x40040000` plus a number
+inside the file's `0x00..0x82` index range, one of them a bare `ldrb` / `uxtb`
+/ set-bit-3 / `strb` setter in exactly the veneers' idiom. That part is real
+and still stands; it is simply a different peripheral with byte registers.
+
+**Why the confirmation was worthless.** Four registers were checked against
+their supposed meanings, and three of them - `0x03` reading `0x00`, `0x16`
+reading `0x01`, `0x0B` having bit 3 set - are satisfied by very nearly any
+window. The fourth carried the argument: `0x2C` read `0x4A`, which was
+interpreted as the clock driver's channel bitmask with channels 3 and 5 on and
+channel 6, the camera's, off. Sampling it eight times in a row settles it:
+
+```
+reg 0x2C:  6A DB 31 C4 B5 6A DB 94
+```
+
+It changes on every read. It is a counter or a status register, and `0x4A` was
+one sample of a moving target. A single reading of a register that never holds
+still was the load-bearing evidence for the whole identification.
+
+**The write test.** Writing the vendor's own four values - clock frequency and
+channel into `0x03` and `0x2C`, camera field and enable into `0x03` and `0x16` -
+was harmless and conclusive:
+
+```
+reg 0x03: 0x00 -> 0x20   reads back 0x00   ignored
+reg 0x2C: 0x85 -> 0x95   reads back 0x67   changed, but not to what was written
+reg 0x03: 0x00 -> 0x08   reads back 0x00   ignored
+reg 0x16: 0x01 -> 0x81   reads back 0x01   ignored
+```
+
+Nothing stuck, the device stayed up, USB stayed enumerated and the FM tuner
+still answered afterwards. Read-back verification is what turned a wrong guess
+into a clean negative instead of a mystery, and it is the reason the write was
+worth doing at all.
+
+**What `0x40040000` probably is.** A live peripheral with byte-wide registers,
+the mask ROM's single most referenced base, holding some registers steady
+(`0x60` reads `0x99` every time, `0x16` reads `0x01`) while others free-run -
+and busy during USB download mode, which is the only mode we can observe it
+in. A USB controller fits every one of those.
+
+### Static analysis cannot locate the file — three more sweeps say so
+
+After the retraction, three further searches, all negative, all recorded so
+they are not repeated:
+
+| sweep | result |
+|---|---|
+| every ROM byte access through an absolute `0x4xxxxxxx` literal | **17 literals, all within ±16 of `0x40040000`** - the USB cluster and nothing else |
+| the same over the HLKJ bootloader (flash `0x60`, loads to `0x0081FC00`) | one hit, `0x40001000+12`, unrelated |
+| every ROM byte access with a *register* index inside a small function | 86 candidates and no way to tell them apart - the same fishing that produced the wrong answer above |
+
+A Hough-style vote was also tried: every byte-access literal in the ROM voting
+for `literal - index` across all 43 indices the veneers are called with, on the
+theory that the true base collects votes from many different literals. Every
+candidate it produced sits within sixteen bytes of `0x40040000`, because those
+are the only literals of that shape in the image.
+
+**So the accessor does not use absolute per-register addresses, and the file is
+not a plain MMIO array.** What is left fits a computed base plus index, or a
+serial/indirect protocol - either of which is invisible to a pattern search.
+
+**But it is reachable, and cheaply, by one runtime read.** The veneers live in
+SRAM and are written at boot; the only code that is always resident to be
+written *into* them is the mask ROM. So `0x00804E44` almost certainly branches
+to a ROM address, and a single read of that veneer on a running system - four
+bytes, over SWD - decodes to the accessor, which then decodes to the base. That
+is the whole remaining problem: four bytes that cannot be read from a dump.
+
+**Still true, and independent of all this:** the camera's two enable writes at
+`0x00D44EA6` and `0x00D44F06` - registers `0x03` and `0x16` of the file,
+whatever its address - and the clock driver's use of `0x03` and `0x2C`. Those
+come from the drivers' own code. What remains unknown is where the file lives.
+
+## 7k. PSMP — the settings partition, decoded
+
+The last partition, `PSMP` at `0x3FC000` (`0x4000` bytes), is a key/value store
+of the device's own runtime state. Records are appended, so a key appears many
+times and the last one wins - which is why a 16 KB partition holds only 27
+distinct keys across 128 records.
+
+```
+55 AA | crc32? (4) | flags (2) | index (2) | keylen (2) | key | value
+```
+
+The keys, in first-seen order:
+
+```
+restore_factory  bt_addr     device_id    freq_drift   bt_inqname
+bt_showname      bright      clock_type   bluetooch_status (sic)
+bt_name          set_screen_time          screen_saver start_screen_time
+on_lang_sel      spk_switch  language     volume       MUSIC
+voltage          power_on_step            language_name
+bt_relink        btlinknum   btlinkinfo   le_addr
+alarm_clock_info FM
+```
+
+`device_id` on this unit reads
+`BJTXKJMP3---P20-------D30-------------F7B2F5D6674A218152--------`, which is
+the only SKU-like string on the device - vendor code, model `P20`, a variant
+field `D30`, then a serial.
+
+**Relevant to whether this unit has a camera:** there is a persisted `FM` key
+(64 bytes of preset stations) for a device we have proved is fitted, and *no
+camera key of any kind*. That is suggestive rather than conclusive - a camera
+app need not persist anything - and it sits against the fact that the `camerca`
+scene is fully wired into the UI, with 26 references and its own dedicated key
+(§7h). The firmware offers a camera; the settings have never recorded one being
+used.
+
 ## 7c. Peripheral map
 
 - **Peripheral MMIO region is `0x40000000`.** Established by decoding every

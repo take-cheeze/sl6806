@@ -43,9 +43,11 @@ so it is worth being precise about which parts are real:
 | `shiftOut` / `shiftIn` / `pulseIn` | **Written**, in terms of the digital calls — so as real as GPIO is. |
 | `pinMode` / `digitalWrite` / `digitalRead` | **Written.** The pad controller was recovered from the mask ROM. What is missing now is this board's pinout: only the two reset lines have known pad ids. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet.** Registers unknown. Calls report instead of silently doing nothing. |
-| Audio, SD, Bluetooth, FM | **Not yet.** Hardware confirmed present; no drivers. |
+| Audio, SD, Bluetooth | **Not yet.** Hardware confirmed present; no drivers. |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
-| Camera | **Not yet, but fully decoded.** Documented register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h, pads included. It is on TWI 0 and needs a real bus — a 1 MP sensor is not something to bit-bang — so the TWI controller base still blocks it. |
+| I2C on bare pads | **Works — confirmed on hardware.** `examples/CameraDemo` bit-bangs TWI 0 on two pads and reads the FM tuner's chip id: `0x5808`, the exact value the stock driver checks for, on a read-only pass. First device this framework has ever read over I2C, and it needs no TWI controller. |
+| Camera | **The module is fitted and works — under the stock firmware. From a payload, `0x68` is silent, and the cause is now known to be power.** Decoded register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h. The vendor's camera app shows a live preview on this unit, which confirms the pads, the bus, the address and the clock from the other end — `examples/CameraDemo` reaches the same sensor over the same wires and gets nothing. What the vendor does and a payload does not is switch a rail: its `power_on` is only pads, delays and clock channel 6, so the enable happens further up, behind the indexed register file a payload cannot reach. |
+| FM tuner | **Tunes, on hardware.** RDA5807 family on TWI 0 at `0x10`, chip id `0x5808` (§7i). `examples/FmDemo` enables it and sweeps the band over bit-banged I2C: 41 channels tuned, each setting tune-complete and reading its own channel number back. First peripheral this framework has successfully *written* to. No audio path yet — the proof is the tuner's own status registers, and RSSI stays at the noise floor until headphones are plugged in, since the lead is the aerial. |
 | Flashing to run standalone | **Unproven.** See [docs/FLASHING.md](docs/FLASHING.md). |
 
 Two honest caveats worth reading before you trust output:
@@ -214,7 +216,7 @@ peripheral behind them. See `tests/emu/sl6806_emu.py`.
 hardware says back — mode detection from a SCSI inquiry, for instance. Those
 are pure functions, and `--help` in CI cannot check them.
 
-CI runs all three on every push and pull request, plus a build of seven
+CI runs all three on every push and pull request, plus a build of ten
 sketches in both modes with `-Werror`.
 
 ## Getting started
@@ -362,19 +364,27 @@ In rough order of how much they unlock:
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-3. **The TWI controller's base address.** Two decoded devices are waiting on
-   it: a CST816 touch panel on bus 1 and a 1 MP camera on bus 0, both with
-   their registers, init tables and pads already written down (§7h). The
-   firmware reaches them only through mask-ROM routines that a payload
-   cannot call, so this is the same kind of hunt §12b did for the LCDC. The
-   touch panel no longer waits on it — `examples/TouchDemo` bit-bangs bus 1
-   on the pads, which is plenty for seven bytes per touch — so what the base
-   would buy is the camera, and speed.
-4. **A DMA driver.** The display pushes pixels 16 bytes at a time because
+3. **Where the indexed register file lives.** The camera's own enable writes
+   are now known to the bit — `reg 0x03` field [4:3] = 01 and `reg 0x16` bit 7,
+   from the sensor driver at `0x00D44EA6` / `0x00D44F06` — and the clock
+   driver's channel handling uses the same file. So the camera is fully
+   specified *except* for that one base address. `0x40040000` looked like it
+   and is not (§7l records the failed identification and the write test that
+   disproved it, so nobody repeats either). Finding it finishes the camera and
+   unlocks 140 call sites besides.
+4. **An FM driver**, now the cheapest working device on the board: an
+   RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
+   part, published register map, and the id read is done.
+5. **The TWI controller's base address** — demoted, because it is now a speed
+   problem rather than an access one. `examples/TouchDemo` bit-bangs bus 1
+   and `examples/CameraDemo` bit-bangs bus 0, both on pads alone, and the
+   second has read a real device. What the base would buy is throughput,
+   which matters for a camera and not much else.
+6. **A DMA driver.** The display pushes pixels 16 bytes at a time because
    that is the FIFO depth. The vendor uses the DMA controller at
    `0x40070000`; its command-list format is decoded at the bottom of
    [`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
-5. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+7. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
    clock, so this no longer blocks anything; finding the PLL registers would
    still give it exactly. They are *not* at the clock unit's base:
    `0x40080000` has dividers but no multiplier.
@@ -396,8 +406,9 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, TouchDemo, LcdProbe, PadScope,
-                  PadSweep, BacklightHunt, MmioProbe, RomProbe, CallbackProbe
+examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, FmDemo,
+                  RegFileProbe, LcdProbe, PadScope, PadSweep, BacklightHunt,
+                  MmioProbe, RomProbe, CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
 docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md,
                   ACTIONS_CARDREADER.md
