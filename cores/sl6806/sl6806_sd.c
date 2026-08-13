@@ -380,9 +380,14 @@ uint32_t sl6806_sd_status(void)
  */
 static int sd_clocks_on(void)
 {
-    sl6806_pad_configure(SL6806_SD_PAD_CLK);
-    sl6806_pad_configure(SL6806_SD_PAD_A);
-    sl6806_pad_configure(SL6806_SD_PAD_B);
+    /* [V] the bootloader's six, 0x0082167C - the product's own bus, not the
+     * mask ROM's generic three. See sl6806_sd.h. */
+    sl6806_pad_configure(SL6806_SD_PAD_CLK_BL);
+    sl6806_pad_configure(SL6806_SD_PAD_CMD_BL);
+    sl6806_pad_configure(SL6806_SD_PAD_D0);
+    sl6806_pad_configure(SL6806_SD_PAD_D1);
+    sl6806_pad_configure(SL6806_SD_PAD_D2);
+    sl6806_pad_configure(SL6806_SD_PAD_D3);
 
     sl6806_module_disable(SL6806_SD_MODULE_ID);
     delay(5);

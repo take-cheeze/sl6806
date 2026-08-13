@@ -5238,3 +5238,111 @@ A log that says which state it was taken in cannot be mislabelled, and the
 diff stops depending on anyone's memory. This is a cheaper fix than any of the
 three method notes above it, and it should have been the first thing written
 once the answer turned out to be a two-run comparison.
+
+## 24. The stock boot, phase by phase — and the SD bring-up nobody had read
+
+Prompted by the run that finally settled §23's power-cycle question, below.
+All of this is `dump.bin` and `maskrom.bin`, reproducible with
+`tools/sl6806-boot`.
+
+### [M] First: on a fresh boot the SD block is OFF
+
+`examples/SdProbe` as the first payload after a power cycle, 2026-08-13:
+
+```
+--- step 1b: do writes stick? ---
+    ARG <- 0xA5A5F00D  reads 0x00000000   DROPPED
+    ARG <- 0x5A5A0FF0  reads 0x00000000   DROPPED
+    verdict: WRITES ARE DROPPED - the block is gated
+
+--- step 2: bring-up and identification ---
+    CTRL 0x40000000 <-- changed    CLKCR 0x20070008 <-- changed
+    ARG <- 0xA5A5F00D  reads 0xA5A5F00D   ok
+    verdict: the block takes writes - it is not gated off
+```
+
+Three things settled at once:
+
+- **The mask ROM does not touch the SD host in bootloader mode.** The cold
+  registers read zero, not the ROM's bring-up values. The claim retracted
+  earlier — that the ROM brings the block up and fails at CMD0 — is now
+  positively disproven rather than merely unsupported, and the values seen in
+  earlier sessions were leftovers from earlier payloads, exactly as the
+  correction said.
+- **Module 36 and ROM clock 17 are the right gates.** Writes go from dropped
+  to sticking across them; this is the `DvpProbe` pattern (§7n) and it is a
+  clean positive.
+- **And CMD0 still never completes**, on a block this payload woke itself.
+
+### The boot phases
+
+```
+mask ROM reset
+  |
+  +-- boot-mode select: bank 1 pin 10, then pin 11, ~1 s each   (0x3D8B8)
+  |     each pin's edge tail-calls a different handler
+  |
+  +-- otherwise: load the HLKJ image from flash to 0x0081FC00 and enter it
+        |
+0x00820000  zero r0..lr, set SP, zero BSS, call main
+        |
+0x00820588  main
+        |     +-- 0x00820378   hardware init
+        |     +-- 0x008244DC   "update from PC" requested?  -> update path
+        |     +-- 0x008244CC   forced restore?              -> restore path
+        |     +-- 0x008244D4   sdupdate wanted?             -> SD path
+        |     +-- otherwise 0x00820514 -> 0x00820E8C, load FIRM and run it
+        |
+        +-- the update paths run, in order:
+              0x008204BC  bring up the display
+              0x008203DC / 0x008202B2 / 0x0082029C
+              0x00820318  "Finding file..."
+              ...          and for the SD one, the sequence below
+```
+
+### The SD bring-up the bootloader uses, and what it adds
+
+The bootloader's own SD entry (around `0x008275F0`, logging
+`sd init ok with mode:%d.`) calls **`0x0082167C` first**, then
+`HAL_sd_disk_init` at `0x00822768`, then `sdmmc_wrap_init` — a FatFs mount.
+`0x0082167C` is the step §23 never had:
+
+```
+0x008206AE(17, 10)        clock source select for id 17 - a no-op, as in the ROM
+0x008207A8(17)            -> ROM 0x20EC, romclk_enable(17)
+pad_configure x6          bank 1 pins 12..17, listed below
+0x00001C28(44, handler)   install the IRQ 44 handler
+0x0082017C(44, 8)         its priority
+0x008200A0(44)            enable it
+0x0082A0E8(callback)      store a completion callback
+```
+
+The clocks are the two §23 already had. **The pads are not.**
+
+| pin | function | drive | pull | ROM's version |
+|---|---|---|---|---|
+| 12 | 2 | **3** | none | drive 1 |
+| 13 | 2 | **2** | 11 | drive 1 |
+| 14 | 2 | **3** | **8** | drive 1, pull 11 |
+| 15 | 2 | 3 | 11 | **not configured** |
+| 16 | 2 | 3 | 11 | **not configured** |
+| 17 | 2 | 3 | 11 | **not configured** |
+
+**Six pads is a four-bit bus**, and this is the code that actually reads cards
+on this board — `sdupdate` runs on it. The mask ROM's three-pad configuration
+is the chip's generic minimum, and §23 transcribed the generic one because it
+transcribed the ROM. `cores/sl6806/sl6806_sd.c` now configures the
+bootloader's six, at the bootloader's drive strengths, and still talks
+one-bit — which is the bootloader's own order of business, since it configures
+pads at bring-up and only decides a bus width later with ACMD6.
+
+This does not obviously explain a command state machine that discards
+commands: pads do not gate it. But it retires "the driver is configuring the
+wrong bus" as an explanation, and it answers the §"loose thread" question
+from the pad census in the affirmative — **bank 1 pins 12..17 really are this
+board's SD bus**, since the product's own bootloader drives them.
+
+Which sharpens the remaining puzzle rather than solving it. Of those six pads,
+the card-inserted `PadMap` run reads pins 16 and 17 hard low and 12, 13, 14
+floating — no sign of a card's pull-ups anywhere on a bus the bootloader
+drives. Worth one more look with the socket in hand.
