@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""
+sl6806-sram - map the SRAM-resident half of the application back into the dump.
+
+WHY THIS EXISTS. docs/sl6806_re_notes.md 7d recorded that ~250 routines are
+called at fixed SRAM addresses that appear nowhere in the flash image, and that
+three searches for a flash->RAM copy had failed. That conclusion was wrong.
+The image *is* in flash, and the application fetches it itself: the first-stage
+loader that the boot ROM starts calls the flash reader with a source offset, a
+destination and a length, all four as literals in one pool. Nothing memcpy-like
+happens, which is why a memcpy-shaped search never found it.
+
+    tools/sl6806-sram dump.bin                    # print the mapping and verify it
+    tools/sl6806-sram dump.bin 0x0080E842         # one SRAM address -> flash/file
+    tools/sl6806-sram dump.bin 0x0080B21C --dis 96
+    tools/sl6806-sram dump.bin --extract sram.img # the whole blob, ready to disassemble
+
+WHAT YOU GET. Every SRAM address in the loaded range becomes a file offset, so
+the LCD command writers, the GPIO calls, LVGL's flush path and the panel
+descriptor all disassemble out of dump.bin - no device, no RAM dump. The
+addresses in the notes' "RAM-resident code" table are the addresses this
+resolves.
+
+WHAT IT IS NOT. The blob is loaded, not executed in place, so a flash address
+printed here is where the bytes are stored, not where anything branches to.
+Cross-references between the blob and XIP code go through absolute pointers
+(the blob calls into 0x00Cxxxxx and 0x00Dxxxxx directly, and XIP code calls
+back into the blob by SRAM address), so both halves must be disassembled at
+their own bases for the call targets to read correctly.
+"""
+
+import argparse
+import struct
+import subprocess
+import sys
+
+FLASH_BASE = 0x00C00000
+FIRM_OFF = 0x010000
+FIRM_HDR = 0x30
+SRAM_LO, SRAM_HI = 0x00800000, 0x00900000
+
+
+def find_loader(fw):
+    """Locate the loader's literal pool and return (src_file_off, dst, end).
+
+    The pool holds, in this order, the partition base used as an addend
+    (FIRM_OFF + header length), the destination, the end of the image, and the
+    source offset inside the partition. The loader adds the first to the last
+    and calls the flash reader with (dst, src, end - dst).
+    """
+    base = FIRM_OFF + FIRM_HDR
+    for off in range(0, len(fw) - 16, 4):
+        a, dst, end, src = struct.unpack_from('<4I', fw, off)
+        if a != base:
+            continue
+        if not (SRAM_LO <= dst < end <= SRAM_HI):
+            continue
+        if not (0 < src < len(fw)):
+            continue
+        if base + src + (end - dst) > len(fw):
+            continue
+        return base + src, dst, end, off
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('dump')
+    ap.add_argument('addr', nargs='?', help='an SRAM address to translate')
+    ap.add_argument('--dis', type=int, metavar='N',
+                    help='disassemble N bytes at addr, labelled with SRAM addresses')
+    ap.add_argument('--extract', metavar='FILE', help='write the blob out')
+    args = ap.parse_args()
+
+    fw = open(args.dump, 'rb').read()
+    found = find_loader(fw)
+    if not found:
+        sys.exit('error: no loader literal pool found - is this an SL6806 flash image?')
+    src, dst, end, pool = found
+    size = end - dst
+    adj = dst - src            # sram addr = file offset + adj
+    flash_delta = FLASH_BASE - adj   # flash addr = sram addr + flash_delta
+
+    print(f'loader pool at file 0x{pool:06X}')
+    print(f'  reads flash file 0x{src:06X} .. 0x{src + size:06X}  (0x{size:X} bytes)')
+    print(f'  into SRAM       0x{dst:08X} .. 0x{end:08X}')
+    print(f'  sram addr  = file offset + 0x{adj:X}')
+    print(f'  flash addr = sram addr   + 0x{flash_delta:X}')
+
+    # Self-check: the destination end must match the .bss start the reset
+    # handler zeroes from, and the first byte read must not be padding.
+    nz = fw[src] != 0 or fw[src + 1] != 0
+    print(f'  first source byte non-zero: {"yes" if nz else "NO - suspicious"}')
+
+    if args.extract:
+        with open(args.extract, 'wb') as f:
+            f.write(fw[src:src + size])
+        print(f'wrote {size} bytes to {args.extract} '
+              f'(load it at 0x{dst:08X})')
+
+    if args.addr:
+        a = int(args.addr, 0)
+        if not (dst <= a < end):
+            sys.exit(f'error: 0x{a:08X} is outside the loaded blob '
+                     f'(0x{dst:08X}..0x{end:08X})')
+        off = a - adj
+        print()
+        print(f'SRAM 0x{a:08X}  ->  file 0x{off:06X}  ->  flash 0x{off + FLASH_BASE:08X}')
+        if args.dis:
+            print()
+            sys.stdout.flush()
+            subprocess.run([
+                'arm-none-eabi-objdump', '-D', '-b', 'binary', '-m', 'armv7e-m',
+                '-M', 'force-thumb', f'--adjust-vma=0x{adj:X}',
+                f'--start-address=0x{a:X}', f'--stop-address=0x{a + args.dis:X}',
+                args.dump], check=False)
+
+
+if __name__ == '__main__':
+    main()

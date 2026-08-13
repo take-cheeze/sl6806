@@ -1,6 +1,18 @@
 /*
  * BacklightHunt - find the pin that lights the panel.
  *
+ * ---------------------------------------------------------------------
+ * SUPERSEDED BY examples/Backlight. Try that one first.
+ *
+ * The premise below - "the PWM driver is in no dump, so go looking for an
+ * enable pin instead" - was wrong. The driver is in the flash image after
+ * all (docs/sl6806_re_notes.md 13), and with it the PWM registers: the
+ * block is at 0x40084000 and the backlight is channel 3 (14a). This sketch
+ * is kept because its negative result is real - every pad below was held
+ * high and none lit the panel - and because the pacing lesson it records is
+ * still the right way to write a probe for this device.
+ * ---------------------------------------------------------------------
+ *
  * The stock firmware lights this screen brightly, so the panel, its supply
  * and its backlight all work. This framework never turns the backlight on:
  * the vendor drives it from a PWM channel (/dev/pwm_ch3, 48 kHz, 60%) whose

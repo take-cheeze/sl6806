@@ -3,11 +3,14 @@
 sl6806-ramcalls - list the SRAM- and ROM-resident routines the stock firmware
 calls, ranked by call count.
 
-WHY THIS EXISTS. Large parts of the SL6806 driver stack are not in the flash
-image. The application calls them at fixed addresses in SRAM, and the HLKJ
-bootloader calls a second set at fixed addresses in the mask ROM. Neither set
-can be disassembled from a flash dump - but both can be *enumerated*, because
-every call site is a plain BL with the target encoded in it. That gives the
+WHY THIS EXISTS. The application calls a large part of its own driver stack at
+fixed addresses in SRAM, and the HLKJ bootloader calls a second set at fixed
+addresses in the mask ROM. This enumerates both, because every call site is a
+plain BL with the target encoded in it.
+
+The SRAM half *can* now be disassembled from the flash dump - the application
+loads it from file 0x03B430, and tools/sl6806-sram translates the addresses
+this prints (docs/sl6806_re_notes.md 13). The ROM half still cannot. That gives the
 callable surface, the argument shapes at each call site, and a ranking of
 what is worth recovering first.
 
