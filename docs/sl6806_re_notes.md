@@ -561,14 +561,33 @@ before drawing any conclusion, so the pads, the assignment, the pull-ups, the
 timing, the ACK handling and the byte order are all verified against a known
 answer at the moment the camera is called silent.
 
-That removes the entire bus from the list of suspects and leaves exactly two
-things, neither of which is on it:
+That removes the entire bus from the list of suspects.
 
-- **MCLK.** The vendor's power-up gets it from clock channel 6 (below); the
-  sketch's software square wave is neither fast nor continuous, and a sensor
-  whose register block has no clock cannot ACK however good the wiring is.
-- **Sensor power.** RESET and PWDN are pads, but a module rail behind a
-  regulator nothing in this framework drives is not.
+**4. And MCLK has now been measured out of the list too.** The software square
+wave was rewritten to toggle the pad through its set/clear registers directly
+and to run for an interval rather than for a number of edges, and it measures
+**2.8 MHz** on hardware, held for 30 ms before the first transfer and through
+every bit of it. The vendor programs channel 6 with **2800**, and 2.8 MHz is a
+thoroughly ordinary sensor MCLK where 280 MHz is not - so the argument is
+that the unit is kHz and *this sketch is now delivering the vendor's own
+nominal clock*. The sensor still does not ACK.
+
+`0x00046938`/`0x00046138` are also confirmed as the one and only bus: the FM
+driver configures the very same two pads (`0x00046918`, `0x00046118` - same
+pins, same alt function 2, only the drive strength differs) before its own
+transfers, so there is no second TWI0 pad option hiding the camera.
+
+What is left, in the order the evidence now supports:
+
+- **There may be no camera in this unit.** The firmware supports one, the pads
+  are real and the driver is complete - and cheap players ship one firmware
+  image across several hardware builds. This costs nothing to check: look for
+  a lens. It is now the leading explanation, and §7h should be read as "this
+  is what the firmware's camera is" rather than "this board has one".
+- **Sensor power.** RESET and PWDN are pads and they do move, but a module
+  rail behind a regulator nothing here drives is not - and per the decode
+  below, the vendor's own power-up has no such call in it either, so if that
+  is the answer it lives on the module.
 
 Both readings of which power pad is RESET were tried, and neither helps -
 worth recording, because under §7h's attribution the vendor's sequence ends by

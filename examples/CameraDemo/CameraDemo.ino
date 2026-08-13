@@ -282,6 +282,7 @@ static unsigned pull_sel = PULL_VENDOR;
 static bool     lines_idle_high;      /* both lines rest high           */
 static bool     saw_fm;               /* the FM tuner answered a scan   */
 static bool     bus_proved;           /* and gave its documented id     */
+static uint32_t mclk_khz;             /* what the square wave measured  */
 static uint32_t heartbeat_at;
 static uint32_t sample_at;
 static uint32_t samples;
@@ -1089,8 +1090,22 @@ void loop()
 
     case STEP_DRIVE_TEST:
         Serial.println("can software move them?");
-        driveTest(CAM_PAD_A, "pin 13");
-        driveTest(CAM_PAD_B, "pin 12");
+        driveTest(CAM_PAD_A, "SDA/SCL pin 13");
+        driveTest(CAM_PAD_B, "SDA/SCL pin 12");
+        /*
+         * The control pads deserve the same test and never got it. Everything
+         * this sketch concludes about the sensor assumes RESET and PWDN
+         * actually move: a sensor held in reset by a pad that does nothing is
+         * silent for a reason that has no more to do with MCLK than with the
+         * bus. The bus pads were verified from the first version; these were
+         * taken on faith.
+         *
+         * What it can and cannot show: this reads the pad's own input
+         * register, so it proves the pad drives, not that the trace reaches a
+         * module. That is still the half that is testable from here.
+         */
+        driveTest(CAM_PAD_RESET, "RESET pin 14");
+        driveTest(CAM_PAD_PWDN, "PWDN pin 15");
         printAttempt();
         step = STEP_POWER_LOW;
         break;
@@ -1143,6 +1158,7 @@ void loop()
         if (mclk_mode == MCLK_TOGGLE) {
             uint32_t khz = mclkMeasure();
 
+            mclk_khz = khz;
             Serial.print("  MCLK measured at ");
             if (khz >= 1000) {
                 Serial.print(khz / 1000);
@@ -1211,16 +1227,40 @@ void loop()
             Serial.println("SDA/SCL assignment, the pull-ups and every line of the I2C");
             Serial.println("above are right, and 0x68 is simply not answering.");
             Serial.println();
-            Serial.println("Two things can do that, and neither is on this bus:");
-            Serial.println("  1. MCLK. The vendor gets it from clock channel 6; the");
-            Serial.println("     software square wave here is neither fast nor");
-            Serial.println("     continuous. A sensor whose register block has no clock");
-            Serial.println("     cannot ACK, however good the wiring is.");
-            Serial.println("  2. Sensor power. RESET and PWDN are pads, but a module");
-            Serial.println("     rail behind a regulator nothing here drives is not.");
+
+            /*
+             * MCLK used to head this list. It does not any more, and the
+             * reason is the measurement above rather than an argument.
+             */
+            if (mclk_khz >= 2500) {
+                Serial.print("MCLK is no longer a good explanation either: it measured ");
+                Serial.print(mclk_khz / 1000);
+                Serial.print(".");
+                Serial.print((mclk_khz % 1000) / 100);
+                Serial.println(" MHz here, and the vendor programs clock channel 6");
+                Serial.println("with 2800 - which as kHz is 2.8 MHz, the same clock. It ran");
+                Serial.println("for 30 ms before the first transfer and through every bit");
+                Serial.println("of it. A sensor given its own nominal clock on a proven bus");
+                Serial.println("and still not answering is not a clock problem.");
+            } else {
+                Serial.print("MCLK only measured ");
+                Serial.print(mclk_khz);
+                Serial.println(" kHz, which is low enough to stay a suspect.");
+            }
+
             Serial.println();
-            Serial.println("Both are now the whole remaining question for the camera.");
-            Serial.println("The bus is not.");
+            Serial.println("What is left, now in this order:");
+            Serial.println("  1. There is no camera in this unit. The firmware supports");
+            Serial.println("     one and the pads are real, but cheap players ship one");
+            Serial.println("     image across several builds. Look at the case: if there");
+            Serial.println("     is no lens, everything above is already explained and");
+            Serial.println("     this is the end of the investigation.");
+            Serial.println("  2. Sensor power. RESET and PWDN are pads and they move,");
+            Serial.println("     but a module rail behind a regulator nothing here drives");
+            Serial.println("     is not - and the vendor's power-up has no such call in");
+            Serial.println("     it either, so if that is the answer it is on the module.");
+            Serial.println();
+            Serial.println("Neither is on this bus, and neither is fixable in software.");
         } else if (saw_fm) {
             Serial.println("Something did answer the scan, so the bus is not dead - but");
             Serial.println("the tuner check above did not confirm it. Read that first:");
