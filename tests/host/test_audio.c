@@ -257,7 +257,15 @@ static void test_bringup(void)
     CHECK(misc & SL6806_AUD_MISC_BIT, "0x400F70D8 bit 1 is set");
     CHECK(cru[0x74 / 4] & (1u << 5), "module 37's shadow bit");
     CHECK(cru[0x64 / 4] & (1u << 5), "module 37's gate bit");
-    CHECK(before("C074", "C064"), "shadow before gate - see sl6806_module.h");
+    /*
+     * Module 37's own two writes, by value rather than by register - begin()
+     * now closes the coefficient window first, and that disables module 32,
+     * which puts a C064 in the trace before module 37's pair. Matching on the
+     * bare register name made this test pass for the wrong reason and then
+     * fail for the right one.
+     */
+    CHECK(before("C074=00000020", "C064=00000020"),
+          "module 37: shadow before gate - see sl6806_module.h");
     CHECK(cru[0x88 / 4] & 1u, "romclk 19 is 0x40080088 bit 0");
 
     CHECK(reg(0x100) & SL6806_AUD_TX_EN_BIT, "+0x100 bit 0");

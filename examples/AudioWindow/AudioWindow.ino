@@ -24,8 +24,10 @@
  * *faster*: it got shorter, not better.
  *
  * ---------------------------------------------------------------------
- *  ANSWERED 2026-08-13: IT IS THE PAD-MUX BIT, ON ITS OWN
+ *  ANSWERED 2026-08-13, ON THE SECOND TRY: MODULE 32 *AND* THE PAD BIT
  * ---------------------------------------------------------------------
+ *First run, and it was wrong - see below:
+ *
  *     m32 rc45 pad2 |  length reads  |  +0x400
  *      0   0    0   |  0x12BC ok     |  0x80
  *      0   0    1   |  0xBC  TRUNC   |  0x3378B1
@@ -36,20 +38,28 @@
  *      1   1    0   |  0x12BC ok     |  0x80
  *      1   1    1   |  0xBC  TRUNC   |  0x3378B1
  *
- * Module 32 and romclk 45 do nothing in any combination. **Bit 2 of
- * 0x40000020 is a register-window switch**, and 0x40000020 is the pad/pin
- * function mux (notes 7c), not a clock - which is why none of the clock
- * analysis was ever going to find it.
+ * [!] AND THAT TABLE WAS WRONG. A second run, from a known state, gave:
  *
- * The 0x80 at +0x400 in the normal window is the bit clock_start() writes
- * there, so with the switch clear +0x400 is an ordinary register holding what
- * it was given. That is why the vendor takes this bit for exactly as long as
- * it takes to clear +0x400..+0x5FC and then gives it straight back.
+ *      0   0    1   |  0x12BC ok     |  0x80        <- differs
+ *      0   1    1   |  0x12BC ok     |  0x80        <- differs
+ *      1   0    1   |  0xBC  TRUNC   |  0x3378B1
+ *      1   1    1   |  0xBC  TRUNC   |  0x3378B1
  *
- * And the baseline line above the table read 0xBC *before* the table's first
- * row cleared the bit: the previous ToneDemo EQ build left it set and it
- * survived the re-upload. Independent confirmation of the same cause, and a
- * gotcha worth keeping - sl6806_audio_begin() clears it now.
+ * **It takes module clock 32 AND the pad-mux bit, together.** The first run
+ * had module 32 silently already on - inherited from the ToneDemo EQ build,
+ * because module clocks survive a re-upload - and its m32=0 rows never turned
+ * it off, so they measured m32=1 while claiming otherwise. romclk 45 really
+ * does nothing.
+ *
+ * That is the third time in this block that state left behind by an earlier
+ * sketch has produced a confident wrong reading. Hence the "known state" line
+ * this sketch now prints before the table, and hence begin() closing the
+ * window before anything else.
+ *
+ * The 0x80 at +0x400 with the window closed is the bit clock_start() writes
+ * there, so it is an ordinary register holding what it was given. That is why
+ * the vendor takes all three enables for exactly as long as it takes to clear
+ * +0x400..+0x5FC and then gives them straight back.
  *
  * ---------------------------------------------------------------------
  *  SO: WHAT ELSE IS BEHIND THE SWITCH?
@@ -192,6 +202,19 @@ void setup()
     if (!up)
         return;
 
+    /*
+     * [!] ESTABLISH THE STATE, DO NOT INHERIT IT. This sketch's own first run
+     * produced a wrong answer because module clock 32 was still on from an
+     * earlier sketch and the rows meant to have it off never turned it off.
+     * begin() closes the window now, but say so out loud.
+     */
+    sl6806_audio_coeff_window(0);
+    Serial.print("known state: module 32 ");
+    Serial.print(sl6806_module_enabled(SL6806_AUD_EQ_MODULE_ID) ? "ON (!)" : "off");
+    Serial.print(", 0x40000020 = ");
+    printHex(sl6806_mmio_read(SL6806_AUD_PADMUX_REG));
+    Serial.println();
+
     Serial.print("baseline: wrote ");
     printHex(PROBE_LEN);
     Serial.print(" read ");
@@ -232,10 +255,16 @@ void loop()
     rc45 = ((unsigned)combo >> 1) & 1u;
     pad2 = (unsigned)combo & 1u;
 
+    /* Driven bit by bit here, not through sl6806_audio_coeff_window(), which
+     * now moves module 32 and the pad-mux bit together - that is the answer
+     * this table exists to establish. */
     if (m32)
         sl6806_module_enable(SL6806_AUD_EQ_MODULE_ID);
     romclk(SL6806_AUD_EQ_ROMCLK_ID, (int)rc45);
-    sl6806_audio_coeff_window((int)pad2);
+    if (pad2)
+        sl6806_mmio_set(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
+    else
+        sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
     delay(5);
 
     len = lengthProbe();
@@ -256,10 +285,9 @@ void loop()
 
     /* Put everything back before the next combination. Only module 32 is ever
      * switched off, and only because this sketch switched it on. */
-    if (m32)
-        sl6806_module_disable(SL6806_AUD_EQ_MODULE_ID);
+    sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
     romclk(SL6806_AUD_EQ_ROMCLK_ID, 0);
-    sl6806_audio_coeff_window(0);
+    sl6806_module_disable(SL6806_AUD_EQ_MODULE_ID);
     delay(5);
 
     if (++combo < 8)

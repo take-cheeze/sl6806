@@ -115,11 +115,15 @@ int sl6806_audio_begin(uint32_t rate)
     unsigned ch;
 
     /*
-     * [M] Clear the register-window switch FIRST. It survives a re-upload,
-     * and a sketch that inherits it set will have the top byte of its length
-     * field silently dropped - measured, examples/AudioWindow.
+     * [M] Close the coefficient-RAM window FIRST, both halves of it. Module
+     * clocks and pad-mux bits both survive a re-upload, and a sketch that
+     * inherits this window open has the top byte of its length field silently
+     * dropped before it writes anything - measured, examples/AudioWindow,
+     * twice, and the second time it invalidated the first run's decode.
+     *
+     * Establish state; do not assume it.
      */
-    sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
+    sl6806_audio_coeff_window(0);
 
     /* [V] 0x00D9674A, before either clock. */
     sl6806_mmio_set(SL6806_AUD_MISC_REG, SL6806_AUD_MISC_BIT);
@@ -258,20 +262,34 @@ void sl6806_audio_eq_hold(int on)
 }
 
 /*
- * [M] The window switch on its own. Set it and +0x400..+0x5FC is the
- * coefficient RAM; clear it and the ordinary registers are all there again.
- * Neither of the two clocks eq_hold() also takes has any effect on the
- * window - measured across all eight combinations.
+ * [M] The coefficient-RAM window: module clock 32 AND bit 2 of 0x40000020,
+ * together. Either alone leaves the ordinary registers in place.
  *
- * Leave it clear unless you are reading or writing coefficients. While it is
- * set the length field at +0x108 is 8 bits wide instead of 16.
+ * [!] An earlier version of this said the pad-mux bit did it on its own, from
+ * a run whose table showed exactly that. The table was taken with module 32
+ * silently already on - inherited from a previous sketch, because module
+ * clocks survive a re-upload - and the rows that were supposed to have it off
+ * never turned it off. Re-run from a known state, the two are both required.
+ * That is the third time state left behind by an earlier sketch has produced
+ * a confident wrong reading in this block; see the note on begin().
+ *
+ * romclk 45, the third enable the vendor's init takes, has no effect on the
+ * window in any combination. It presumably clocks the EQ engine rather than
+ * the register aperture.
+ *
+ * Leave the window closed unless you are reading or writing coefficients:
+ * while it is open the length field at +0x108 is 8 bits wide instead of 16,
+ * so a transfer submitted in that state is silently truncated.
  */
 void sl6806_audio_coeff_window(int on)
 {
-    if (on)
+    if (on) {
+        sl6806_module_enable(SL6806_AUD_EQ_MODULE_ID);
         sl6806_mmio_set(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
-    else
+    } else {
         sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
+        sl6806_module_disable(SL6806_AUD_EQ_MODULE_ID);
+    }
 }
 
 void sl6806_audio_clock_stop(void)

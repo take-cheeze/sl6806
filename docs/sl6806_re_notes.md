@@ -4093,3 +4093,41 @@ block that accepts every descriptor and moves no data.
 
 `AudioWindow`'s second half reads the whole map in both windows and prints
 only the differences. Read-only, one register per `loop()` call.
+
+### CORRECTED, same day — it is module 32 AND the pad bit, not the pad bit alone
+
+§21's table was taken with module clock 32 silently already on, inherited from
+the `ToneDemo` EQ build, and its `m32=0` rows never turned it off — so they
+measured `m32=1` while reporting `m32=0`. A second run from a known state:
+
+```
+m32 rc45 pad2 |  length reads  |  +0x400
+ 0   0    1   |  0x12BC ok     |  0x80        <- differs from the first run
+ 0   1    1   |  0x12BC ok     |  0x80        <- differs from the first run
+ 1   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   1    1   |  0xBC  TRUNC   |  0x3378B1
+```
+
+**The coefficient-RAM window needs module clock 32 and bit 2 of `0x40000020`
+together.** Either alone leaves the ordinary registers in place. romclk 45
+really does nothing to the window; it presumably clocks the EQ engine rather
+than the aperture. Everything else in §21 stands — the vendor's init takes all
+three for the length of a memset, holding the window during streaming
+truncates the DMA length, and both halves survive a re-upload.
+
+**Third strike for inherited state.** In this one block it has now produced:
+an `AudioProbe` "cold" pass that was not cold; a `ToneDemo` run whose length
+field was truncated before the sketch wrote anything; and a decode that named
+the wrong cause. All three came from a sketch assuming the machine was in the
+state it left the factory in.
+
+So, alongside §5's *"a completion flag is not a transfer"* and §20's *"a
+literal's address region is not its owner"*: **establish state, do not inherit
+it.** `sl6806_audio_begin()` closes the window before anything else, and
+`examples/AudioWindow` prints the state it starts from.
+
+`tests/host/test_audio.c` needed one fix for the same reason: it asserted
+"shadow before gate" by matching bare register names, and begin()'s new window
+close puts another module's gate write in the trace first. It now matches on
+module 37's own value, `0x20`. The test had been passing for a slightly wrong
+reason and started failing for the right one.

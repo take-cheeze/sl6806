@@ -351,12 +351,18 @@ extern "C" {
  * [M] MEASURED 2026-08-13, examples/AudioWindow - a decode rather than another
  * elimination.
  *
- * **Bit 2 of 0x40000020 is a register-window switch for this block.** Eight
- * combinations of module 32, romclk 45 and this bit; the two clocks make no
- * difference in any of them, and this bit alone flips the window every time:
+ * **Module clock 32 plus bit 2 of 0x40000020 opens a coefficient-RAM window
+ * over this block's registers.** Both are required; either alone leaves the
+ * ordinary registers in place. romclk 45, the third enable the vendor's init
+ * takes, has no effect on the window at all.
  *
- *     pad2 = 0    +0x108 length field holds 0x12BC   +0x400 reads 0x80
- *     pad2 = 1    +0x108 length field holds 0x00BC   +0x400 reads 0x3378B1
+ *     window closed   +0x108 length holds 0x12BC   +0x400 reads 0x80
+ *     window open     +0x108 length holds 0x00BC   +0x400 reads 0x3378B1
+ *
+ * [!] The first run of this experiment said the pad-mux bit did it alone, and
+ * its table showed exactly that. Module 32 was silently already on, inherited
+ * from a previous sketch, and the rows meant to have it off never turned it
+ * off. A second run from a known state corrected it.
  *
  * The 0x80 at +0x400 in the normal window is the bit sl6806_audio_clock_start()
  * writes there, so with the switch clear +0x400 is an ordinary register
@@ -371,10 +377,11 @@ extern "C" {
  * 0x40000020 is the pad/pin function mux (7c), not a clock, which is why
  * nothing in the clock analysis was ever going to find this.
  *
- * [!] IT SURVIVES A RE-UPLOAD. A run that leaves it set truncates the next
- * sketch's length field before that sketch writes anything - which is exactly
- * what AudioWindow's own baseline line caught, after ToneDemo's EQ build left
- * it on. sl6806_audio_begin() clears it now.
+ * [!] BOTH HALVES SURVIVE A RE-UPLOAD. A run that leaves the window open
+ * truncates the next sketch's length field before it writes anything - which
+ * is what AudioWindow's own baseline caught after ToneDemo's EQ build, and
+ * what then corrupted AudioWindow's own first table. sl6806_audio_begin()
+ * closes both halves before doing anything else.
  */
 #define SL6806_AUD_PADMUX_REG   0x40000020u
 #define SL6806_AUD_PADMUX_EQ    (1u << 2)   /* [M] the window switch */
@@ -593,11 +600,11 @@ void sl6806_audio_clock_start(unsigned mode);
 void sl6806_audio_eq_hold(int on);
 
 /*
- * [M] The register-window switch on its own - bit 2 of 0x40000020, and the
- * only one of eq_hold()'s three that does anything. Set it to reach the
- * coefficient RAM at +0x400..+0x5FC; clear it for everything else. While it
- * is set the length field at +0x108 is 8 bits wide instead of 16, so a
- * transfer submitted in that state is silently truncated.
+ * [M] Open or close the coefficient-RAM window: module clock 32 AND bit 2 of
+ * 0x40000020, which are both required. Open it to reach +0x400..+0x5FC; leave
+ * it closed for everything else, because while it is open the length field at
+ * +0x108 is 8 bits wide instead of 16 and a transfer submitted in that state
+ * is silently truncated.
  */
 void sl6806_audio_coeff_window(int on);
 

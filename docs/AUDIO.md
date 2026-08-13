@@ -183,11 +183,25 @@ m32 rc45 pad2 |  length reads  |  +0x400
  1   1    1   |  0xBC  TRUNC   |  0x3378B1
 ```
 
-**Module clock 32 and romclk 45 do nothing in any combination.** Bit 2 of
-`0x40000020` flips it every time, and `0x40000020` is the pad/pin function mux
-(§7c) — not a clock, which is why none of the clock analysis was ever going to
-find it. This is the first outright decode in five runs rather than another
-elimination.
+**And that table was wrong.** A second run, from a known state:
+
+```
+ 0   0    1   |  0x12BC ok     |  0x80        <- differs
+ 0   1    1   |  0x12BC ok     |  0x80        <- differs
+ 1   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   1    1   |  0xBC  TRUNC   |  0x3378B1
+```
+
+**It takes module clock 32 *and* the pad-mux bit, together.** The first run had
+module 32 silently already on — inherited from the `ToneDemo` EQ build, because
+module clocks survive a re-upload — and its `m32=0` rows never turned it off,
+so they measured `m32=1` while claiming otherwise. romclk 45 genuinely does
+nothing.
+
+`0x40000020` is the pad/pin function mux (§7c), so this is a register-window
+switch and not a clock, which is why none of the clock analysis was going to
+find it. It is still the first outright decode in five runs rather than another
+elimination — it just needed two runs to get right.
 
 With the switch **clear**, `+0x400` reads `0x80` — the bit
 `sl6806_audio_clock_start()` writes there, so it is an ordinary register
@@ -198,12 +212,17 @@ the vendor's init takes the bit for as long as it takes to clear
 coefficient RAM, and while you hold it the ordinary registers are not all
 there.
 
-**It survives a re-upload.** `AudioWindow`'s own baseline line read `0xBC`
-before its first row cleared the bit — the previous `ToneDemo` EQ build had
-left it set. A sketch that inherits it has the top byte of its length field
-silently dropped before it writes anything. `sl6806_audio_begin()` clears it
-first now, and `sl6806_audio_coeff_window()` is the one-line way to reach the
-RAM deliberately.
+**Both halves survive a re-upload**, and that is now the third time inherited
+state has produced a confident wrong reading in this block — the first two
+being the "cold" pass that wasn't and the length field truncated before
+`ToneDemo` wrote anything. A sketch that inherits the window open has the top
+byte of its length field silently dropped.
+
+`sl6806_audio_begin()` closes both halves before doing anything else,
+`sl6806_audio_coeff_window()` moves them together, and `AudioWindow` prints
+the state it starts from rather than assuming one. **Establish state; do not
+inherit it** is now a rule in this block, alongside "a completion flag is not
+a transfer" and "a literal's address region is not its owner".
 
 ### What it opens
 
