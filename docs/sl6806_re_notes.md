@@ -3811,32 +3811,39 @@ alternation the earlier `ToneDemo` runs never showed. Worth understanding
 before the walk is trusted as a *sensitive* negative, though a bit that fixed
 the block would still have moved it.)
 
-**3. FOUND: the audio block does not move its own data.** `0x00D97ED8`, inside
-the audio HAL, is the only code in the whole region that loads `0x40001000`:
+**3. WITHDRAWN WITHIN THE HOUR: "the audio block does not move its own
+data".** `0x00D97ED8` claims one of eight DMA channel slots, enables module
+clock 33 and configures `0x40001000 + ch*0x40` — the block §7c describes as
+`{ctrl, src, dst, len}` and §14b found. It is the only code in the audio
+HAL's address region that loads `0x40001000`, and that was taken as evidence
+that the audio FIFO is fed by the general DMA controller.
 
-```c
-/* walk 8 slots of a channel table, claim a free one */
-if (!module_clock_is_enabled(33))  module_clock_enable(33);
-chan = 0x40001000 + ch * 0x40;
-chan[0] &= ~(1 << 30);      /* ...and a dozen more control fields */
-```
+Its one caller in FIRM is `0x00D3EAC0`, whose literal pool holds
+`lcdc_dma_write`, `lcdc_set_descriptor` and `lv_lcd_init`. **It is the LCD
+controller's DMA setup.** `0x00D97ED8` is a shared HAL routine and its only
+identified user is the LCDC; "it sits in the audio region" was proximity, not
+evidence — the same mistake in kind as §7c filing `0x40009000` as the timers,
+made in the same session that corrected it.
 
-§7c already had that block — *"0x40001000, DMA channel registers, 8 channels
-at +ch*0x40, {ctrl, src, dst, len}"* — and §14b found it. Nobody had connected
-it to audio. **The audio controller is a FIFO with a request line**; the bytes
-are carried by the general DMA controller, whose module clock is **id 33** and
-which this driver has never programmed.
+So what audio is missing remains **open**. Ruled out by measurement: the
+output route, the bit clock, and all 32 bits of `0x400E0000`. Still true and
+still not evidence about audio: there is a DMA controller at `0x40001000`
+behind module clock 33, and at least the LCDC uses it.
 
-That is one explanation for every observation at once: descriptors accepted,
-memory untouched, completion instant, and neither the route nor the bit clock
-nor 32 bits of `0x400E0000` moving anything. The route setter and the bit
-clock remain correct transcriptions; they were never the obstacle.
+The way to settle whether audio goes through it is to find what fills the DMA
+config struct on the audio path. `0x00D3EAC0` builds a recognisable one for
+the LCDC — request id 9, source width 32, destination width 16, burst sizes 8
+and 4, and a completion callback — so an audio equivalent would be legible if
+it exists.
 
 **Method note, third of these now.** The witness was chosen well — a capture
 into a pre-filled buffer is the one test that can catch a DMA engine in the
 act, and it overturned a conclusion three runs of playback-only evidence had
 built up. §14a's lesson was "do not trust a status bit as a success test";
-this adds "a completion flag is not a transfer".
+this adds two more. **A completion flag is not a transfer** - only a test that
+observes memory can say that. And **a literal's address region is not its
+owner**: the DMA claim above survived about forty minutes, and would have
+survived into a hardware run if the caller had not been checked.
 
 ## 18. The PWM's register spec, re-inspected — and one row of §14a corrected
 

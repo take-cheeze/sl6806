@@ -4,10 +4,10 @@
 |---|---|
 | Hardware | **Present and identified.** `0x40009000` is the SoC's audio controller: two DMA directions, a DAC path with two channels, three analogue microphone inputs, three playback and four capture volume channels, and a 128-word coefficient RAM. |
 | Clocks | **Known, and both reachable from a payload.** Mask ROM module id 37, and romclk id 19 (`0x40080088` bit 0). Plus a sample-rate PLL at CRU `+0x10`/`+0x14` with two settings: 24.576 MHz and 22.579 MHz. |
-| Data path | **Half decoded.** The block's own descriptor registers (`+0x10C`/`+0x108`/`+0x104`) are read out of the vendor and confirmed to hold — but the block does not carry the bytes. The **general DMA controller at `0x40001000`, module clock 33**, does, and this driver has never programmed it. |
+| Data path | **Half decoded.** The block's own descriptor registers (`+0x10C`/`+0x108`/`+0x104`) are read out of the vendor and confirmed to hold what they are given — and no byte ever moves. What actually carries the data is not established. |
 | Driver | **Written; the block wakes and does not run.** [`cores/sl6806/sl6806_audio.c`](../cores/sl6806/sl6806_audio.c), 93 host tests, four examples. |
 | Confirmed on hardware | **Yes, 2026-08-13.** Cold every register reads flat zero; after module 37 and romclk 19, thirty come up at sensible reset defaults. |
-| Sound | **No.** And the reason is now identified rather than guessed: `examples/AudioWall` proved the engine **moves no memory at all** (0 of 64 words in a capture buffer), and the missing piece is the general DMA controller, not the route, the bit clock, or any bit of `0x400E0000` — all 32 of which were walked with no effect. |
+| Sound | **No, and the cause is narrowed but not found.** `examples/AudioWall` proved the engine **moves no memory at all** (0 of 64 words in a capture buffer). Ruled out by measurement: the output route, the bit clock, and every bit of `0x400E0000`. A DMA-controller hypothesis was raised and withdrawn the same hour — see below. |
 
 ## MEASURED, 2026-08-13 — the block is there
 
@@ -82,30 +82,33 @@ Three smaller things the same runs settled, which do stand:
 And **bit 11 of `+0x108`** clears when a descriptor is armed and returns
 afterwards — an idle flag.
 
-## FOUND — the audio block does not move its own data
+## RETRACTED IMMEDIATELY — "the audio block does not move its own data"
 
-`0x00D97ED8`, inside the audio HAL, is the only code in that whole region that
-loads `0x40001000`:
+Written and then withdrawn within the hour, before it could cost anyone a
+hardware run. The claim was that `0x00D97ED8` — which claims a DMA channel,
+enables module clock 33 and configures `0x40001000 + ch*0x40` — is the audio
+path's data mover, on the strength of it being the only code in the audio
+HAL's address region that loads `0x40001000`.
 
-```c
-/* walk 8 slots of a channel table, claim a free one */
-if (!module_clock_is_enabled(33))  module_clock_enable(33);
-chan = 0x40001000 + ch * 0x40;
-chan[0] &= ~(1 << 30);      /* ... and a dozen more control fields */
-```
+Its one caller in FIRM is `0x00D3EAC0`, and that function's literal pool
+contains `lcdc_dma_write`, `lcdc_set_descriptor` and `lv_lcd_init`. **It is
+the LCD controller's DMA setup.** `0x00D97ED8` is a shared HAL routine, and
+"it is in the audio region" was proximity, not evidence — the same mistake in
+kind as §7c filing this block as the timers.
 
-§7c already had this block: *"`0x40001000`, DMA channel registers, 8 channels
-at `+ch*0x40`, `{ctrl, src, dst, len}`"*. **The audio controller is a FIFO
-with a request line.** The bytes are carried by the general DMA controller,
-which this driver has never programmed and whose module clock — **id 33** —
-it has never enabled.
+What stands, and what does not:
 
-That explains every observation at once: descriptors accepted, memory
-untouched, completion instant, and neither the output route nor the bit clock
-nor 32 bits of `0x400E0000` changing any of it.
+| | |
+|---|---|
+| The engine moves no memory | **Measured.** 0 of 64 words. |
+| `0x400E0000` is not audio's gate | **Measured.** All 32 bits, no effect. |
+| A DMA controller exists at `0x40001000`, module clock 33 | **True**, and used by at least the LCDC. |
+| Audio is fed by that controller | **Unknown.** No evidence either way. |
 
-The route setter and the bit clock are still correct transcriptions and still
-needed. They were never what was standing in the way.
+The way to settle it is to find what fills the DMA config struct on the audio
+path — the struct `0x00D3EAC0` builds for the LCDC has a request id, source
+and destination widths and burst sizes, so an audio equivalent would be
+recognisable — not to reason from which region a literal sits in.
 
 ## MEASURED, third run — the routes take, and the DMA is still not paced
 

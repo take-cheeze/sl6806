@@ -78,51 +78,29 @@
  * was not.
  *
  * =====================================================================
- *  [V] AND WHAT IS ACTUALLY MISSING: THE DMA CONTROLLER
+ *  [?] WHAT IS MISSING IS STILL OPEN. ONE HYPOTHESIS, NOT CONFIRMED.
  * =====================================================================
- * Found after the AudioWall run, at 0x00D97ED8 - inside the audio HAL, and
- * the one place in that whole region that loads 0x40001000:
+ * There is a generic DMA channel setup at 0x00D97ED8 - it claims one of eight
+ * slots, enables module clock 33, and configures 0x40001000 + ch * 0x40,
+ * which 7c and 14b already describe as {ctrl, src, dst, len}. It is in the
+ * same address region as the audio HAL.
  *
- *     walk 8 slots of a channel table, claim a free one
- *     if (!module_clock_is_enabled(33))  module_clock_enable(33);
- *     chan = 0x40001000 + ch * 0x40;
- *     chan[0] &= ~(1 << 30);  ... and a dozen more control fields
+ * [!] AND THAT IS NOT ENOUGH TO SAY AUDIO USES IT. An earlier version of this
+ * comment said "the audio block does not carry its own bytes" on the strength
+ * of that proximity. Checking the one FIRM caller (0x00D3EAC0) turns up
+ * lcdc_dma_write / lcdc_set_descriptor / lv_lcd_init in its literal pool:
+ * **it is the LCD controller's DMA setup, not audio's.** 0x00D97ED8 is a
+ * shared HAL routine whose only identified user is the LCDC.
  *
- * §7c already has this block: "0x40001000, DMA channel registers, 8 channels
- * at +ch*0x40, {ctrl, src, dst, len}". **The audio block does not move its
- * own data.** It is a FIFO with a request line, and the bytes are carried by
- * the general DMA controller - which this driver has never programmed and
- * whose module clock (33) it has never enabled.
+ * So the honest state is:
  *
- * That explains every observation at once: descriptors accepted, memory
- * untouched, completion instant, and no amount of route or bit-clock work
- * changing any of it.
- *
- * sl6806_audio_route() and the bit clock are still needed and still correct
- * as transcriptions - they are just not sufficient, and were never the thing
- * standing in the way.
- *
- * Three more things that run measured:
- *
- *   - **The two DMA address registers keep what they are given** (+0x10C and
- *     +0x20C both took an SRAM address and read it back).
- *   - **+0x104 bit 0 does not stick.** Writing 0x00100001 reads back
- *     0x00100000: the watermark field holds, the arm bit is write-only or
- *     self-clearing. The vendor writes it the same way, so this driver does
- *     too - but do not test for it.
- *   - **+0x138 bit 31 is set by hardware.** Writing 0x1AA reads back
- *     0x800001AA, so the 9-bit level field is right and there is a status bit
- *     above it. [?] what.
- *
- * [M] Bit 11 of +0x108 - the unexplained reset bit below - CLEARS when a
- * descriptor is armed and comes back after the transfer. That is the shape of
- * an idle flag, and it makes it the cheapest available witness that a
- * transfer is in progress.
- *
- * And the reason this was reachable at all, unlike the camera and unlike
- * Bluetooth: **nothing about this block sits behind the 0x400E0000 wall.**
- * Its two clocks are a mask ROM module id and a mask ROM "romclk" id, both of
- * which this framework already drives (sl6806_module.h, sl6806_romclk.h).
+ *   - measured, the engine moves no memory (examples/AudioWall);
+ *   - measured, 0x400E0000 is not audio's gate, all 32 bits walked;
+ *   - the general DMA controller exists, is used by at least the LCDC, and
+ *     needs module clock 33 - all true, and none of it evidence about audio;
+ *   - whether the audio FIFO is fed by that controller is UNKNOWN, and the
+ *     way to settle it is to find what fills the DMA config struct for the
+ *     audio path, not to reason from which region a literal sits in.
  *
  * =====================================================================
  *  HOW 0x40009000 WAS IDENTIFIED
