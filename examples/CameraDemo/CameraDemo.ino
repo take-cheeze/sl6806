@@ -829,9 +829,16 @@ static void driveTest(uint32_t id, const char *name)
  * level survives. The physics is one line - an external resistor drags the
  * net back in microseconds, while leakage alone takes many milliseconds.
  *
- *   both directions hold the window    nothing external on this net
+ *   both directions hold the window    no resistor on this net
  *   high decays quickly               there is a pull-down out there
  *   low decays quickly                there is a pull-up out there
+ *
+ * WHAT IT DOES NOT SHOW. "Holds both" means no *resistor*, not no *device*.
+ * A CMOS input is high impedance, so a trace running to a sensor's reset pin
+ * with no pull resistor on it floats exactly like a trace running nowhere.
+ * This test tells those two apart from a pulled net; it cannot tell them
+ * apart from each other, and an earlier version of this comment claimed it
+ * could.
  *
  * The two bus pads are the control group: they are known to have external
  * pull-ups, because the sweep read them high with no internal pull at all. If
@@ -1443,31 +1450,38 @@ void loop()
                 Serial.println();
             }
 
-            if (reset_floats && pwdn_floats) {
-                Serial.println("AND BOTH CONTROL NETS FLOAT. Driven either way they keep");
-                Serial.println("the level, for longer than any resistor would allow, while");
-                Serial.println("the bus pads next to them behave exactly as pulled-up lines");
-                Serial.println("should. A camera module would put something on reset and");
-                Serial.println("power-down - a pull, an input, a load. There is nothing.");
+            if (!pwdn_floats) {
+                /*
+                 * A populated pull-up is a component someone paid for. It is
+                 * the one piece of evidence here that speaks to whether the
+                 * board carries camera circuitry at all, and it says yes.
+                 */
+                Serial.println("The control nets are not symmetrical, and that is the most");
+                Serial.println("informative thing in this run: PWDN has an external pull-up");
+                Serial.println("on it, RESET has no external pull at all.");
                 Serial.println();
-                Serial.println("The most economical reading of every result in this run is");
-                Serial.println("that THIS UNIT HAS NO CAMERA FITTED: the SoC pads are real");
-                Serial.println("and work, the firmware's driver is real, and the module the");
-                Serial.println("firmware was written for is not on the end of the traces.");
-                Serial.println("Look at the case for a lens - that is the confirmation, and");
-                Serial.println("if it is absent this line of investigation is finished.");
-            } else {
-                Serial.println("What is left:");
-                Serial.println("  1. Sensor power. RESET and PWDN are pads and they drive,");
-                Serial.println("     but a module rail behind a regulator nothing here");
-                Serial.println("     drives is not - and the vendor's power-up has no such");
-                Serial.println("     call in it either, so that would be on the module.");
-                Serial.println("  2. No camera fitted in this unit. Cheap players ship one");
-                Serial.println("     firmware image across several hardware builds. Look at");
-                Serial.println("     the case for a lens.");
-                Serial.println();
-                Serial.println("Neither is on this bus, and neither is fixable in software.");
+                Serial.println("A populated pull-up is a fitted component, so the board does");
+                Serial.println("carry camera circuitry - which argues against the easy");
+                Serial.println("explanation that this unit simply has no camera. And a");
+                Serial.println("floating RESET proves less than it looks: a sensor's reset");
+                Serial.println("pin is a high-impedance input, so a trace running to one");
+                Serial.println("with no resistor floats exactly like a trace running");
+                Serial.println("nowhere. This cannot tell those two apart.");
             }
+
+            Serial.println();
+            Serial.println("What is left:");
+            Serial.println("  1. Sensor power - now the leading explanation. Every rail a");
+            Serial.println("     module needs is behind a regulator that nothing here");
+            Serial.println("     drives, and the vendor's power-up has no such call in it");
+            Serial.println("     either, so whatever switches it is further up the stack:");
+            Serial.println("     the likeliest home is the byte-wide register file behind");
+            Serial.println("     the clock driver, which a payload cannot reach (notes 7h).");
+            Serial.println("  2. No module fitted. Still possible - one firmware image");
+            Serial.println("     ships across several hardware builds - but weaker now.");
+            Serial.println("     Looking at the case for a lens settles it either way.");
+            Serial.println();
+            Serial.println("Neither is on this bus, and neither is fixable from here.");
         } else if (saw_fm) {
             Serial.println("Something did answer the scan, so the bus is not dead - but");
             Serial.println("the tuner check above did not confirm it. Read that first:");

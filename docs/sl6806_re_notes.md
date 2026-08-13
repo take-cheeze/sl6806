@@ -577,17 +577,48 @@ driver configures the very same two pads (`0x00046918`, `0x00046118` - same
 pins, same alt function 2, only the drive strength differs) before its own
 transfers, so there is no second TWI0 pad option hiding the camera.
 
+**5. The four nets themselves were then measured**, by driving a level,
+releasing to an input with no pull, and timing how long the level survives -
+a resistor drags a net back in microseconds, leakage takes many milliseconds:
+
+| net | high held | low held | reading |
+|---|---|---|---|
+| SDA, 4/12 | >10 ms | **1 µs** | external pull-up |
+| SCL, 4/13 | >10 ms | **1 µs** | external pull-up |
+| RESET, 4/14 | >10 ms | >10 ms | **no external pull** |
+| PWDN, 4/15 | >10 ms | **3 µs** | external pull-up |
+
+The two bus pads are the control group - they are known to carry external
+pull-ups, since the sweep reads them high with no internal pull - and they
+behave exactly as they must, which is what makes the other two readings worth
+anything.
+
+**PWDN's pull-up is a fitted component**, so the board does carry camera
+circuitry; the easy explanation that this unit simply has no camera is weaker
+than it looked. RESET floating proves less: a sensor's reset pin is a
+high-impedance input, so a trace running to one with no resistor floats
+exactly like a trace running nowhere. The measurement separates pulled nets
+from unpulled ones, not connected ones from empty ones.
+
+RESET also drives high perfectly well at the vendor's drive strength of 0, so
+"the sensor is held in reset" is ruled out too.
+
 What is left, in the order the evidence now supports:
 
-- **There may be no camera in this unit.** The firmware supports one, the pads
-  are real and the driver is complete - and cheap players ship one firmware
-  image across several hardware builds. This costs nothing to check: look for
-  a lens. It is now the leading explanation, and §7h should be read as "this
-  is what the firmware's camera is" rather than "this board has one".
-- **Sensor power.** RESET and PWDN are pads and they do move, but a module
-  rail behind a regulator nothing here drives is not - and per the decode
-  below, the vendor's own power-up has no such call in it either, so if that
-  is the answer it lives on the module.
+- **Sensor power**, now the leading explanation. Every rail a module needs is
+  behind a regulator that nothing in this framework drives, and per the decode
+  below the vendor's own power-up has no such call in it either - it is pads,
+  delays and the clock, nothing else. So whatever switches the camera's supply
+  sits further up the stack than the sensor driver. The likeliest home is the
+  byte-wide indexed register file behind the clock driver (below): a ~130-entry
+  file of the kind SoCs use for LDO and power-domain control, reached through
+  SRAM routines a payload cannot call. Note the camera driver *reads* two of
+  its registers - indices `0x03` and `0x16`, at `0x00D44EA8` and `0x00D44F08` -
+  but writes none, so if a rail is switched for it, someone else does it.
+- **No module fitted.** Still possible - one firmware image ships across
+  several hardware builds - but weaker than it looked before the nets were
+  measured, because a populated pull-up is a component someone paid for.
+  Looking for a lens settles it either way, and costs nothing.
 
 Both readings of which power pad is RESET were tried, and neither helps -
 worth recording, because under §7h's attribution the vendor's sequence ends by
