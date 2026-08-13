@@ -216,7 +216,7 @@ peripheral behind them. See `tests/emu/sl6806_emu.py`.
 hardware says back — mode detection from a SCSI inquiry, for instance. Those
 are pure functions, and `--help` in CI cannot check them.
 
-CI runs all three on every push and pull request, plus a build of eight
+CI runs all three on every push and pull request, plus a build of nine
 sketches in both modes with `-Werror`.
 
 ## Getting started
@@ -407,9 +407,9 @@ cores/sl6806/gfx/ framebuffer, font, panel + LCD bus, Display
 variants/         board definitions (pin maps go here)
 ld/               linker scripts, one per build mode
 tools/            host-side Python tools
-examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, LcdProbe,
-                  PadScope, PadSweep, BacklightHunt, MmioProbe, RomProbe,
-                  CallbackProbe
+examples/         Hello, Blink, GfxDemo, TouchDemo, CameraDemo, RegFileProbe,
+                  LcdProbe, PadScope, PadSweep, BacklightHunt, MmioProbe,
+                  RomProbe, CallbackProbe
 tests/host/       native tests for console, graphics, the panel and the LCDC
 docs/             DUMPING.md, FLASHING.md, LCD.md, sl6806_re_notes.md
 3rd/              smartlink_flash submodule
