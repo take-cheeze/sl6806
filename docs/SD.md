@@ -416,11 +416,12 @@ a poll loop that prints as it goes), and a sweep of the five CLKCR bits **no
 bring-up in the dump ever writes**: the vendor's read-modify-write clears
 `0x7FFF0FFF`, so bits 12..15 and 31 have never been set by anything.
 
-**[M] Run with and without a card: it makes no difference.** `SdScope` and
-`PadMap` were both taken both ways. The card-detect theory — that a host might
-decline to clock a slot it knows is empty — is not supported: no pad on the
-board changes when a card goes in, so if the controller knows, it is not
-finding out through any pin software can see.
+**[M] Run with and without a card: no register changes.** `SdScope` was taken
+both ways. `PadMap` shows the board *does* detect the card — bank 5 pin 0 moves
+— but nothing in the controller responds to it, and the SD bus pads themselves
+do not move at all, which is the loose thread in the notes: bank 1 pins 12–14
+may be the chip vendor's default SD pads rather than the ones this board routes
+to its socket.
 
 ## [M] It discards commands in under a microsecond, 2026-08-13
 
@@ -666,14 +667,16 @@ Three readings of its output:
 - **Multi-block reads.** CMD18 needs CMD12 to stop it and its own status
   handling. `sl6806_sd_read_blocks()` issues one CMD17 per block instead,
   which is slower and cannot leave the card mid-transfer.
-- **Card detect.** Nothing in the dump reads a card-detect bit in this block,
-  and **[M] 2026-08-13 nothing on the board responds to card insertion
-  either**: `examples/PadMap`, run with one power cycle and a card inserted
-  between the two passes, produced two identical logs across all six banks and
-  all sixty-nine parked pads. Card detect is therefore on one of the six pads
-  the boot ROM has assigned, on a pin that is not bonded, or absent. "No card"
-  stays a pair of command timeouts, and that is now a measured limitation
-  rather than an unexamined gap.
+- **Card detect — [M] candidate found, 2026-08-13: bank 5 pin 0.** Nothing in
+  the dump reads a card-detect bit in this block, but the board has one.
+  `examples/PadMap`, run with a single power cycle and a card inserted between
+  the two passes, differs in exactly one pin of sixty-nine: bank 5 pin 0 is
+  held to ground with the slot **empty** and floats with a card in — a
+  normally-closed detect switch, so "card present" is the pin reading high
+  under a pull-up. It wants one confirming run (insert and remove twice) before
+  it goes into the driver, because the last single-pair result pointed at a
+  different pin and was wrong. Until then "no card" stays a pair of command
+  timeouts.
 - **MMC.** The ROM branches to CMD1 when CMD55 times out. This driver reports
   "no card (or an MMC)" and stops, because with nothing ever having answered
   in this slot there would be no way to tell a working transcription of the

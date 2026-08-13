@@ -5154,3 +5154,56 @@ SD host accepts a command and discards it in under a microsecond with its
 datapath demonstrably clocked; a controller wired to pads that go nowhere is
 one of the few explanations left standing that does not require the block to
 be broken.
+
+### CORRECTION, same day: the previous section is wrong. Bank 5 pin 0 moves
+
+The section above says the card-in and card-out logs were identical and
+concludes there is no reachable card-detect pin. **That was written from a
+duplicated paste — the same log twice — and it is retracted.**
+
+The real pair differs in exactly one pin of sixty-nine:
+
+```
+bank 5 pin 0     slot empty  ->  LOW (up=0 down=0, held to ground)
+                 card in     ->  follows the pull (floating)
+```
+
+Everything else is identical: the census of all six banks, and every other
+driven pin including bank 1 pins 10 and 11 UNSTABLE and bank 2 pin 5 HIGH. So
+the protocol worked exactly as intended, and the single-variable result it was
+built to produce is a pin nobody had been watching.
+
+**Bank 5 pin 0 is the card-detect contact**, wired the less common way round:
+the switch is closed to ground when the slot is **empty** and opens when a card
+is inserted. Both polarities are built; this socket is the normally-closed
+kind. Card present is therefore "reads high under a pull-up", and slot empty is
+"reads low whatever pull is applied".
+
+It is a candidate rather than a fact until it has been run once more —
+insert and remove twice, confirming the pin follows the card both ways —
+because it rests on one pair of logs, and the last thing that rested on one
+pair of logs was bank 1 pin 10, which was wrong. But it is the first thing in
+this investigation that a card has moved.
+
+What has not changed from the retracted section is the loose thread, and the
+card-detect result sharpens it: **the SD bus pads still show nothing.** Bank 1
+pins 12, 13 and 14 follow their pull identically with a card in and with it
+out — while a pad on a completely different bank registers the card
+mechanically. A card holds CMD and DAT up through its own pull-ups. Either
+those are weaker than this chip's internal pulls, or **[?] bank 1 pins 12..14
+are the chip vendor's default SD pads rather than the ones this board routes
+to its socket.** The mask ROM is generic to the part; the board is not, and
+the board demonstrably has the socket wired to bank 5 pin 0 for detection.
+
+That matters to §23 in proportion. The SD host accepts a command and discards
+it in under a microsecond with its datapath demonstrably clocked, and a
+controller driving pads that do not reach the socket is one of the few
+remaining explanations that does not require the block to be broken.
+
+**Method note, and it is the third of its kind in this file.** The retracted
+section was written in the same minute as the log arrived, from two blocks of
+text that looked like two runs. Two identical logs and one duplicated log are
+indistinguishable by inspection — the check that would have caught it is
+asking whether *anything at all* differed, since two runs of a sixty-nine-pad
+sweep agreeing to the byte is itself the surprising outcome and deserved more
+suspicion than it got.

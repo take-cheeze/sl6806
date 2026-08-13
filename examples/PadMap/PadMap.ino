@@ -48,25 +48,35 @@
  * inside a bank's configured run is the signature of exactly that.
  *
  * ===================================================================
- *  [M] THE RESULT: A CARD CHANGES NOTHING SOFTWARE CAN SEE
+ *  [M] THE RESULT: BANK 5 PIN 0 IS THE CARD-DETECT CANDIDATE
  * ===================================================================
  * Run properly at last - one power cycle, slot empty, then a card inserted
- * without unplugging - the two logs are **identical, byte for byte**. Same
- * census across all six banks, same verdict on all sixty-nine parked pads,
- * same counts.
+ * without unplugging. **Exactly one pin of sixty-nine differs**, and it is
+ * not one anybody had been watching:
  *
- * So there is no card-detect pin among the pads this test can reach, and the
- * "one pin differed" result from the earlier pair was the settling bug and a
- * power cycle between runs, not a card. Retracted.
+ *     bank 5 pin 0    slot empty -> LOW (held to ground, up=0 down=0)
+ *                     card in    -> follows the pull (floating)
  *
- * Where card detect could still be, none of which this sketch may touch:
+ * Everything else is identical: the census of all six banks, and every other
+ * driven pin including bank 1 pins 10 and 11 UNSTABLE and bank 2 pin 5 HIGH.
  *
- *   - one of the six pads the boot ROM has assigned (bank 0 pins 0..3 and
- *     bank 2 pins 0..1 on function 2, bank 1 pin 9 on function 3);
- *   - a pin in function 0, which is to say not bonded out at all;
- *   - nowhere - plenty of microSD sockets have no detect contact, or have one
- *     the board does not route.
+ * That is a card-detect contact wired the less common way round: **the switch
+ * is closed to ground when the slot is EMPTY and opens when a card is
+ * inserted.** Both polarities are built; this socket is the normally-closed
+ * kind. So "card present" is the pin reading high under a pull-up, and "slot
+ * empty" is it reading low no matter what pull is applied.
  *
+ * It wants one more run before it goes into a driver - insert and remove
+ * twice, confirming the pin follows the card both ways - because it rests on
+ * a single pair of logs, and an earlier single pair of logs pointed at bank 1
+ * pin 10 and was wrong.
+ *
+ * Note also what did NOT move: bank 1 pins 12, 13 and 14, the SD bus pads.
+ * See below.
+ *
+ * ===================================================================
+ *  THE LOOSE THREAD
+ * ===================================================================
  * There is a second reading worth keeping in view, because it is not settled:
  * **the SD bus pads showed nothing either.** Bank 1 pins 12, 13 and 14 follow
  * their pull with a card in the slot exactly as they do with it out, and a
