@@ -283,6 +283,8 @@ static bool     lines_idle_high;      /* both lines rest high           */
 static bool     saw_fm;               /* the FM tuner answered a scan   */
 static bool     bus_proved;           /* and gave its documented id     */
 static uint32_t mclk_khz;             /* what the square wave measured  */
+static unsigned ctrl_drive;           /* drive strength for RESET/PWDN  */
+static bool     reset_stuck;          /* RESET cannot be driven high    */
 static uint32_t heartbeat_at;
 static uint32_t sample_at;
 static uint32_t samples;
@@ -718,6 +720,55 @@ static unsigned sweepPulls(uint32_t id, const char *name)
  * not prove the opposite: a fast pull on a short trace can win the race. So
  * this reports rather than concludes.
  */
+/*
+ * The complement, and for a control line the more important half: drive the
+ * pad HIGH and find out whether the line follows.
+ *
+ * A reset net with a pull-down on it is ordinary design - the part stays in
+ * reset until the host asserts otherwise - so "stays low when released" says
+ * nothing bad by itself. What matters is whether the push-pull output wins
+ * while it is driving. This charges the line, then releases to an input with
+ * *no* pull applied, so the level read afterwards is the board's doing and
+ * not this sketch's.
+ *
+ *   immediate 1  the output reached the pin; a later 0 is just the pull-down
+ *                taking it back, which is expected and harmless.
+ *   immediate 0  the line is low even while being driven. Something is
+ *                holding it there, and a part wired to it never leaves reset.
+ *
+ * `drive` is the pad's drive-strength field. The vendor configures these two
+ * pads with drive 0, which is worth testing against drive 3 rather than
+ * assuming: a weak driver into a stiff pull-down is exactly the failure this
+ * distinguishes.
+ */
+static int driveHighTest(uint32_t id, const char *name, unsigned drive)
+{
+    uint32_t cfg = PAD_WHICH(id) | (SL6806_PAD_FUNC_OUTPUT << 7) |
+                   ((drive & 3u) << 4);        /* pull selector 0 = no pull */
+    int immediate, settled;
+
+    sl6806_pad_configure(cfg);
+    sl6806_pad_write(id, 1);
+    delayMicroseconds(200);
+
+    sl6806_pad_set_func(id, SL6806_PAD_FUNC_INPUT);
+    immediate = sl6806_pad_read(id);
+    delayMicroseconds(PULL_SETTLE_US);
+    settled = sl6806_pad_read(id);
+
+    Serial.print("  ");
+    Serial.print(name);
+    Serial.print(" driven high at drive ");
+    Serial.print(drive);
+    Serial.print(": reads ");
+    Serial.print(immediate);
+    Serial.print(" on release, ");
+    Serial.print(settled);
+    Serial.println(" after settling");
+
+    return immediate;
+}
+
 static void driveTest(uint32_t id, const char *name)
 {
     int after_release, settled;
@@ -743,8 +794,19 @@ static void driveTest(uint32_t id, const char *name)
     if (after_release == 0 && settled == 1) {
         Serial.println("    moves in both directions - this line is a usable open drain.");
     } else if (settled == 0) {
-        Serial.println("    stays low after release. Something holds this line down, or");
-        Serial.println("    the pull is not a pull-up. I2C cannot work on it.");
+        /*
+         * On a bus line this is fatal. On a control line it is not even bad
+         * news: a reset net is normally held low by a pull-down so the part
+         * stays in reset until the host says otherwise. Saying "I2C cannot
+         * work on it" about RESET, as this used to, was simply wrong.
+         */
+        Serial.println("    stays low after release - something external holds it down.");
+        if (id == CAM_PAD_A || id == CAM_PAD_B) {
+            Serial.println("    On a bus line that is fatal: no ACK can ever be seen.");
+        } else {
+            Serial.println("    On a control line that is ordinary - a pull-down keeps the");
+            Serial.println("    part in reset. What matters is the driven test below.");
+        }
     } else {
         Serial.println("    never seen low. Either the pull won the race - possible and");
         Serial.println("    harmless - or driving the pad does not reach the pin.");
@@ -1106,6 +1168,34 @@ void loop()
          */
         driveTest(CAM_PAD_RESET, "RESET pin 14");
         driveTest(CAM_PAD_PWDN, "PWDN pin 15");
+
+        /*
+         * And the half that decides whether the sensor can ever leave reset.
+         * The vendor configures both control pads with drive 0; if that
+         * cannot hold the line high against whatever is pulling it down,
+         * drive 3 is a one-field change and worth knowing about.
+         */
+        Serial.println();
+        Serial.println("and can they be driven high?");
+        if (driveHighTest(CAM_PAD_RESET, "RESET pin 14", 0)) {
+            ctrl_drive = 0;
+            Serial.println("    the vendor's drive 0 reaches the pin.");
+        } else if (driveHighTest(CAM_PAD_RESET, "RESET pin 14", 3)) {
+            ctrl_drive = 3;
+            Serial.println("    drive 0 does not reach the pin but drive 3 does. Using 3");
+            Serial.println("    below - the vendor's own value would leave the sensor in");
+            Serial.println("    reset, which would explain everything so far.");
+        } else {
+            ctrl_drive = 3;
+            reset_stuck = true;
+            Serial.println("    NEITHER DRIVE STRENGTH CAN PULL THIS LINE HIGH.");
+            Serial.println("    A part wired to it is held in reset permanently, and that");
+            Serial.println("    is a complete explanation for a silent 0x68 - no clock or");
+            Serial.println("    bus question needed. Something drives this net low, or it");
+            Serial.println("    is shorted to ground, or nothing is on the other end.");
+        }
+        (void)driveHighTest(CAM_PAD_PWDN, "PWDN pin 15", ctrl_drive);
+
         printAttempt();
         step = STEP_POWER_LOW;
         break;
@@ -1119,8 +1209,14 @@ void loop()
          */
         sl6806_pad_configure(mclk_mode == MCLK_TOGGLE ? CAM_MCLK_GPIO
                                                       : CAM_MCLK_MUX);
-        sl6806_pad_configure(pad_reset);
-        sl6806_pad_configure(pad_pwdn);
+        /* The vendor's ids carry drive 0; ctrl_drive is what the driven-high
+         * test above found actually reaches the pin. */
+        sl6806_pad_configure(PAD_WHICH(pad_reset) |
+                             (SL6806_PAD_FUNC_OUTPUT << 7) |
+                             ((ctrl_drive & 3u) << 4));
+        sl6806_pad_configure(PAD_WHICH(pad_pwdn) |
+                             (SL6806_PAD_FUNC_OUTPUT << 7) |
+                             ((ctrl_drive & 3u) << 4));
         busInit();
 
         sl6806_pad_write(pad_pwdn, 0);
@@ -1249,6 +1345,16 @@ void loop()
             }
 
             Serial.println();
+
+            if (reset_stuck) {
+                Serial.println("AND RESET COULD NOT BE DRIVEN HIGH AT ALL. That outranks");
+                Serial.println("everything below it: a sensor whose reset line is held low");
+                Serial.println("is in reset, and a part in reset does not answer its");
+                Serial.println("address. Whatever else is true, this alone accounts for");
+                Serial.println("every silent scan above.");
+                Serial.println();
+            }
+
             Serial.println("What is left, now in this order:");
             Serial.println("  1. There is no camera in this unit. The firmware supports");
             Serial.println("     one and the pads are real, but cheap players ship one");
