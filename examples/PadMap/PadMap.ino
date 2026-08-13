@@ -41,9 +41,35 @@
  *
  * ⚠ **The census is only the boot state on a freshly powered device.**
  * Uploading a payload does not reset the chip, so pads an earlier sketch
- * configured stay configured: the first run showed bank 1 pins 12, 13 and 14
- * in function 0, which is examples/SdPads having left them as inputs, not
- * anything the ROM did. Power-cycle before trusting a census.
+ * configured stay configured: two runs now have shown bank 1 pins 12, 13 and
+ * 14 in function 0 with the input register reading 0x7000, which is
+ * examples/SdPads having left them as pulled-up inputs, not anything the ROM
+ * did. Power-cycle before trusting a census - and note that a function 0
+ * inside a bank's configured run is the signature of exactly that.
+ *
+ * ===================================================================
+ *  [M] WHAT THE SECOND RUN FOUND, empty slot
+ * ===================================================================
+ * Forty-six parked pads follow their pull, so the mechanism works. The ones
+ * that do not are driven from outside the chip:
+ *
+ *     bank 1 pin 0    LOW        bank 2 pins 2,3,4  LOW
+ *     bank 1 pin 10   HIGH       bank 2 pin 5       HIGH
+ *     bank 1 pins 16,17,19..31   LOW   (18 floats)
+ *     bank 3 pin 0    LOW
+ *
+ * **Bank 1 pins 10 and 11 are the boot ROM's own inputs**, which is a lead
+ * worth following independently of SD. ROM 0x3C1F0 configures pin 10 as
+ * function 14 with pull selector 11 - a pull-up - then sets an interrupt
+ * mode, enables it, and polls the pending bit 500 times; ROM 0x3C19C does
+ * the same for pin 11 with selector 5, a pull-down. A pin with a pull-up
+ * that the ROM waits for an edge on is an active-low button, and pin 10
+ * reading HIGH here is that button not being pressed. docs/DUMPING.md still
+ * says the boot key is "trial and error".
+ *
+ * That also explains PadScope's table: functions 0 and 14 are the two that
+ * leave the input buffer alive because **both are input modes** - 0 plain,
+ * 14 interrupt-capable.
  *
  * ===================================================================
  *  WHAT IT DOES
@@ -264,8 +290,11 @@ void loop()
             uint32_t saved_pull;
             unsigned up, down;
 
-            /* Function 0 above a bank's bonded run is a pin that does not
-             * exist - see the header. Counted, not tested. */
+            /* Function 0 is either a pin that does not exist - above the
+             * bank's bonded run - or a real pad an earlier payload left as
+             * an input, since uploading does not reset the chip. Those look
+             * identical from here, so both are counted and neither is
+             * tested; the census above is what tells them apart. */
             if (func == 0u) {
                 n_absent++;
                 continue;
@@ -315,7 +344,7 @@ void loop()
         Serial.print(n_follows);
         Serial.print(" floating, ");
         Serial.print(n_absent);
-        Serial.println(" pins absent]");
+        Serial.println(" in function 0 and skipped]");
 
         if (++bank >= SL6806_PAD_NBANKS)
             phase++;

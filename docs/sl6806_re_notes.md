@@ -4922,3 +4922,45 @@ payload does not reset the chip, so pads an earlier sketch configured stay
 configured: this run showed bank 1 pins 12, 13 and 14 in function 0, which is
 `examples/SdPads` having left them as inputs, not anything the ROM did. Same
 caution as §23's cold-dump correction, and the same fix — power-cycle first.
+
+### [M] The parked-pad pull test, empty slot — and the boot ROM's own two inputs
+
+`examples/PadMap` aimed at parked pads, 2026-08-13. Forty-six of the sixty-nine
+parked pads follow their pull, so the mechanism works; the rest are driven from
+outside the chip:
+
+```
+bank 1 pin 0     LOW          bank 2 pins 2,3,4   LOW
+bank 1 pin 10    HIGH         bank 2 pin 5        HIGH
+bank 1 pins 16,17,19..31  LOW     (18 floats)
+bank 3 pin 0     LOW
+```
+
+This is the empty-slot half of the card-detect test; the diff against a
+card-in run is the result, and has not been taken yet.
+
+**Bank 1 pins 10 and 11 are the boot ROM's own inputs**, which is worth having
+independently of SD. ROM `0x3C1F0` configures pin 10 as **function 14** with
+pull selector 11 — a pull-up — then sets an interrupt mode (`0x9BC`, bank
+`+0x218`), enables it (`0x9D2`), and polls the pending bit (`0xA02`, bank
+`+0x214`) five hundred times before giving up. ROM `0x3C19C` does exactly the
+same for pin 11 with selector 5, a pull-down.
+
+A pin with a pull-up that the ROM waits for an edge on is an active-low button,
+and **pin 10 reading HIGH in this run is that button not being pressed**.
+docs/DUMPING.md still describes the boot key as "trial and error"; bank 1
+pin 10 is the first candidate anything in this project has produced for it.
+
+That pair also explains §"the pad input buffer is off in almost every alternate
+function" from the other end: **functions 0 and 14 are the two that leave the
+buffer alive because both are input modes** — 0 a plain input, 14 an
+interrupt-capable one. The table was measured without a reason; this is the
+reason.
+
+The many bank 1 pins reading LOW against a pull-up (16, 17, 19..31, with 18
+floating) are `[I]` unused pads tied to ground on the board, which is ordinary
+practice — but note it sits against §"0 means the pin does not exist", since
+bank 1 is the one bank whose function nibbles read 15 all the way to pin 31.
+Either bank 1 really has 32 bonded pads and sixteen of them are grounded, or
+the `0`/`15` reading needs refining. The card-in diff will not settle that; a
+board photograph would.
