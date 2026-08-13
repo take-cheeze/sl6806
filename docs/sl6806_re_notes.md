@@ -2016,7 +2016,8 @@ are legible where FIRM's are buried.
 | `0x40080000` | **clock & reset unit** | dividers at `+0x40`/`+0x48` with a bit-31 busy poll; module gates at `+0x64`/`+0x74` bit 15; see `cores/sl6806/sl6806_cru.h` |
 | `0x40081000` + `0x400F6000` | **GPIO / pad controller** | six banks, bases in a mask ROM table at `0x00065004`; see §7f and `cores/sl6806/sl6806_padctl.h` |
 | `0x400D9000` | **LCD controller** | the bootloader logs `HAL_lcdc_module_init` from the routine that caches this base; see §12b and `cores/sl6806/sl6806_lcdc.h` |
-| `0x400F7000` | storage host (SD/MMC + SPI flash) | `+0x100`/`+0x104` command registers with a bit-31 start/busy, `+0x108` argument, `+0x10C`/`+0x110` response, `sdio(e):rx error` strings nearby |
+| `0x400F7000` | ~~storage host (SD/MMC + SPI flash)~~ **SPI flash host; `+0x100` is the register-file mailbox** | PARTLY RETRACTED, see §23. The SPI flash half stands. The SD/MMC half does not: `+0x100`..`+0x110` are §7m's mailbox to the register-file chip, and the `sdio(...)` strings are in the bootloader (file < `0x10000`), not near this base. The SD host is `0x40003000` |
+| `0x40003000` | **SD/MMC host** | §23. Written down once per image, into a driver handle (`0x00822958`, mask ROM `0x0003D398`); the driver itself is in the mask ROM. See [`sl6806_sd.h`](../cores/sl6806/sl6806_sd.h) |
 
 ## 7d. RAM-resident code — ~~explained: it belongs to the mask ROM~~ SUPERSEDED
 
@@ -4261,3 +4262,617 @@ substantially exhausted. What is left unread is the application's EQ path
 (`HAL_eq_open`, `hardware EQ open success`, `audio_crab`), which is a
 software-side abstraction over the coefficient RAM §22 decoded, and is
 unlikely to contain a missing hardware enable.
+
+## 23. FOUND: the SD/MMC host is `0x40003000`, and §7c's row is wrong
+
+Everything in this section is from `dump.bin` and `maskrom.bin`. **None of it
+has been run on hardware.** Driver in
+[`cores/sl6806/sl6806_sd.h`](../cores/sl6806/sl6806_sd.h), full write-up in
+[docs/SD.md](SD.md), 72 host tests.
+
+### The row that was wrong, and the three ways it was wrong
+
+§7c files `0x400F7000` as the "storage host (SD/MMC + SPI flash)" on this
+evidence: *"`+0x100`/`+0x104` command registers with a bit-31 start/busy,
+`+0x108` argument, `+0x10C`/`+0x110` response, `sdio(e):rx error` strings
+nearby"*. Each clause is a true statement about something, and none of them is
+about the SD host.
+
+- `0x400F7000+0x100` is the mailbox to the chip that carries the power rails.
+  §7m decoded it while hunting the camera's LDO and did not come back to
+  correct §7c. It has a command word with a bit-31 start, an argument and a
+  response — which is why it read as an SD host to a search looking for
+  exactly that shape. Two sections of this file have described the same four
+  registers as two different peripherals since 7m was written.
+- The `sdio(...)` strings are at file `0xE6B5`–`0xEB60`, **below** `0x10000`.
+  They are in the HLKJ bootloader, not in FIRM. "Nearby" was measuring
+  distance in a file where two programs sit end to end.
+- The SPI flash half of the row is untouched by this: the bootloader really
+  does drive `0x400F7000` for flash, which is what put the base in the map in
+  the first place.
+
+### Where it actually is
+
+Twice in four megabytes, both times a literal feeding a store into a driver
+handle:
+
+```
+mask ROM   0x0003D398    0x40003000
+bootloader 0x00822958    0x40003000   (HAL_sd_disk_init, 0x00822768)
+```
+
+Every other access goes through the handle. §7c's own blind-spot paragraph
+predicted this — *"if a peripheral is missing, look for the table it is cached
+in"* — and the literal-frequency scan that ranked `0x40009000` and
+`0x400E2000` could not have ranked a base that appears once per image.
+
+### The driver is in the mask ROM, again
+
+Same shape as §7f's GPIO: flash carries a disk layer (mid-buffers, a flush
+timer, a mutex, `sdio(i):`/`hal_sd(i):` logging) and every register access is
+a call into the ROM around `0x00004000`. The whole stack is there — command
+layer, identification, CSD parse, a polled FIFO drain, and a bring-up
+function that does pads and clocks in one place (`0x0003D3A0`). docs/SD.md
+tabulates the eleven entry points.
+
+### What the bring-up says about the clock families
+
+```
+pad_configure(0x00016110)   bank 1 pin 12, function 2, drive 1, no pull
+pad_configure(0x0001711B)   bank 1 pin 14, function 2, drive 1, pull 11
+pad_configure(0x0001691B)   bank 1 pin 13, function 2, drive 1, pull 11
+module_clock_enable(36)     15b's family - the registers
+romclk_enable(17)           0x40080080 bit 0 - the function
+install IRQ 44
+```
+
+So **module id 36 and ROM clock id 17 belong to the SD host**, which is two
+more rows for tables that were mostly legend-free: §15b's 128 module ids had
+four attributions before this, and `sl6806_romclk.h`'s 56 entries had two.
+Both were found the same way — by reading the one function that turns a
+peripheral on, rather than by walking.
+
+Three pads is a one-bit bus. The same three ids appear with function 15 at
+`0x0003D2F0`, the routine that parks them, so function 15 is the off state.
+
+Note what is *not* in that list: `0x400E0000`. The SD host is not in the
+`0x400Exxxx` group (§17), and its functional clock is the second family
+rather than the third. If the block turns out to be configured-and-not-running
+the way the PWM (§14a) and the camera (§7n) are, that is where to look next —
+but unlike those two, there is no positive reason here to expect it.
+
+### The register map, and a correction to how these blocks are read
+
+Offsets from `0x40003000`: CMD at `+0x04` with bit 31 as start/busy, ARG at
+`+0x08`, BLKSIZE `+0x0C`, DLEN `+0x10`, DTIMER `+0x14`, DCTRL `+0x2C`, STA
+`+0x34` write-1-clear, RESP0..3 at `+0x38`..`+0x44` with **`+0x44` holding
+bits [127:96]**, a second status at `+0x48` carrying the FIFO flags and the
+echoed command index, CLKCR at `+0x4C`, and the FIFO as a single port at
+`+0x200`.
+
+Two things in that are worth carrying to the next peripheral:
+
+1. **The response registers are MSB-last.** `+0x44` is bits [127:96], not
+   `+0x38`. Established not by guessing but by the ROM's own CSD parse
+   (`0x3E5E`) reading CSD_STRUCTURE — which is bits [127:126] — out of what it
+   had stored from `+0x44`. When a block has four response registers, the
+   parse of a known structure is what fixes their order.
+2. **A single-port FIFO with a "half full" bit is a polled path.** `0x4806`
+   drains 512 bytes in groups of eight words, each group gated on STA bit 5
+   and each acknowledgement asking for the next eight. This is the first
+   block in this chip found to have a complete PIO path, and it is why the SD
+   driver needs neither DMA nor interrupts — where the audio block (§16) has
+   only descriptors.
+
+### The command word table is irregular, and that is informative
+
+ROM `0x40F4` maps an index to a 16-bit word, and it is not `0x2540 | index`.
+CMD0 is `0xA400`, CMD2 and CMD9 carry a long-response bit, CMD12 swaps bit 13
+for bit 14, and the read commands clear bit 10 where the write commands set
+it. Reading the fields off the table gives a plausible layout — response
+expected, long response, data phase, direction, multi-block, abort — with one
+hole: bit 8 is set for everything but CMD0 and CMD1, which reads like "check
+the response CRC" until you notice ACMD41 answers R3 exactly as CMD1 does and
+has the bit set. docs/SD.md has the full table.
+
+### One place the transcription deliberately departs from the ROM
+
+Every one of the ROM's response waits tests a wide error mask before it tests
+the timeout bit, and the timeout bit is inside the wide mask — so an
+unanswered command comes back as the generic error 32, and the ROM recovers
+the real cause afterwards by reading the status register a second time and
+looking at bit 8 by hand (`0x4388`, to tell an MMC from an SD card). The
+driver tests the timeout first, and clears the ROM's whole acknowledge mask
+on every path rather than the one bit it happened to test. Same bits read;
+the difference is that "nobody answered" survives as itself rather than
+needing a status register to still be intact when a caller looks. That
+distinction is the whole of how an empty slot is told from a controller that
+is not running, and it is the first thing `examples/SdProbe` reports.
+
+### [M] The first hardware run, 2026-08-13 — the ROM fails at the same instruction
+
+`examples/SdProbe` on a P20 Player, no card in the slot:
+
+```
+module 36 reads ENABLED
+CTRL   0x40000000      CMD    0x0000A400
+DTIMER 0xFFFFFF40      DCTRL  0x00000000
+STA    0x00000000      STA2   0x00000106
+CLKCR  0x20070008
+result: 3 (no response)      -- CMD0 never completed
+```
+
+That is the **cold** dump, before this framework's driver touched anything.
+Read it against what the transcription says writes each value:
+
+| Register | Cold | Written by |
+|---|---|---|
+| CTRL | `0x40000000` | ROM `0x3D9A`, `edge(0) \| CLKEN` |
+| CMD | `0x0000A400` | the CMD0 word from ROM `0x40F4`, start bit cleared |
+| DTIMER | `0xFFFFFF40` | ROM `0x3E22`, verbatim |
+| CLKCR | `0x20070008` | the identification value, divider 7 |
+
+So the mask ROM brought this block up itself before the payload started, sent
+CMD0, waited out its 65536-iteration poll and gave up — leaving exactly the
+state the driver then reproduced, which is why the "after bring-up" dump is
+identical to the "cold" one.
+
+Two conclusions, pointing opposite ways:
+
+- **The decode is confirmed by the device.** Five registers hold the five
+  values §23 predicts. A wrong base cannot produce `0x20070008` and
+  `0xFFFFFF40` and a CMD0 command word by accident, and this is the same
+  class of evidence as the register file's rails decoding to real supply
+  voltages (§7m).
+- **The transcription is not what is wrong.** The vendor's own driver, in
+  mask ROM, running before anything else on the chip, fails at the same
+  instruction. Nothing in `cores/sl6806/sl6806_sd.c` can fix that.
+
+Which puts the SD host exactly where the PWM (§14a) and the camera front end
+(§7n) are: configured and not running. `examples/SdWall` walks `0x400E0000`
+with "does CMD0 complete" as the witness — the smallest thing the controller
+can be asked to do, needing no card, no data path and no response.
+
+**One measurement the first probe did not take**, and the reason `SdProbe`
+now takes it before anything else: whether a write to this block *sticks*.
+Every register above already held the value the driver was about to write, so
+"unchanged after bring-up" is compatible both with a live block and with a
+gated one dropping writes silently — which is how the ADC was written off for
+four runs (§15b). The probe now writes two nonces to `+0x08` and reads them
+back before and after bring-up.
+
+Also worth noting for the walk: **CTRL bits 0 and 1 read back as zero** even
+though both the ROM's bring-up and the driver's set them along with the reset
+bit. Either they are a self-clearing kick or they are not writable, and the
+probe now says which.
+
+### [M] `0x400E0000` is a seven-bit register, and none of its bits is the SD host's
+
+`examples/SdWall`, 2026-08-13, with "does CMD0 complete" as the witness:
+
+```
+0x400E0000 = 0x00000020     after sl6806_periph_group_begin()
+bits 0,1,2,3,4,6 tried      no CMD0 completed
+bits 7..31                  DO NOT HOLD
+```
+
+The second line is the finding. **`0x400E0000` implements bits [6:0] and
+nothing above them** — every write to bits 7..31 is dropped. Four of the seven
+are already attributed (0 Bluetooth, 1 the `0x400E2300` cluster, 5 the
+group's own, 6 camera), and the walk tried all seven.
+
+Two consequences beyond the SD host:
+
+- **The SD host has no functional-clock bit here.** That is this chip's usual
+  answer *eliminated*, not untested, which is a better position than the audio
+  block is in.
+- **§14a's and §16's open item shrinks from 28 bits to three.** Every walk of
+  this register so far, including `examples/AudioWall`'s, has been walking 25
+  bits that do not exist. The unattributed ones are **2, 3 and 4**.
+
+The bootloader's four differences from the ROM's bring-up — `CTRL[31:30]` =
+`0xC0000000`, the run-speed CLKCR, both together, and clearing bit 0 of
+`+0x18` — were tried in the same run and none of them completed a command
+either.
+
+### A caution about "cold" dumps, and a correction to the section above
+
+**Uploading a payload does not reset the chip.** The boot ROM keeps running
+and drops the new image into SRAM, so every register a previous sketch touched
+is still touched when the next one starts.
+
+That undercuts part of what the first hardware run was read as saying. The
+SdProbe dump was interpreted above as showing the *mask ROM's* SD bring-up
+values, and it is equally consistent with an earlier payload in the same power
+session having left them — the fingerprint is identical, because the payload
+runs the ROM's sequence. What survives from that reading is the part that does
+not depend on provenance: **five registers hold the five values §23 predicts,
+so the decode of `0x40003000` is confirmed**. What does not survive is "the
+mask ROM's own driver fails at the same instruction", which is plausible and
+unproven.
+
+There is a clean discriminator, and it costs one power cycle. The ROM's SD
+bring-up tears itself down when it fails (`0x0003D5CC` calls `0x0003D2F0` on a
+non-zero return, which parks the three pads on function 15, disables module 36
+and clears `0x40080080` bit 0). So after a *fresh* boot into bootloader mode,
+with `examples/SdProbe` as the first payload run:
+
+| module 36 reads | What it means |
+|---|---|
+| ENABLED, registers holding `0x20070008`/`0xA400` | the ROM's init ran and returned success — which with no card in the slot it should not have |
+| disabled | the ROM tried and tore down, and the values seen on 2026-08-13 were a previous payload's |
+| disabled, registers zero | the ROM never touches the SD host in bootloader mode, and the block is simply cold |
+
+### The SD clock register, decoded — and the ROM leaves most of it alone
+
+ROM clock id 17 is `0x40080080`, and the mask ROM's own accessors decode the
+whole register:
+
+| Field | Meaning | Where |
+|---|---|---|
+| bit 0 | enable | `0x223C` sets, `0x2614` clears |
+| bit 4 | source select: set → source 8, clear → source 59 | `0x372E` |
+| bit 8 | divide by 8 | `0x2D64` |
+| bits [19:16] | divider *n* | `0x2A2A` writes it |
+
+and the rate query at `0x2D64` computes the total as `(n + 1) × (bit8 ? 8 :
+1)`, while the setter at `0x2A2A` encodes a requested divide the same way:
+above 16 it shifts right by three and sets bit 8.
+
+**The ROM's SD bring-up sets bit 0 and nothing else.** It never programs a
+divider for this clock, and its one call to the source selector passes 10 —
+which that dispatcher does not recognise for id 17, since the id 17 case only
+tests for 8 and 59 — so nothing is written. The SD clock therefore runs on
+whatever the reset defaults are, which is fine for the ROM (it runs at power-on
+with the tree in a known state) and is not obviously fine for a payload
+arriving in bootloader mode. `examples/SdClock` sweeps all 64 settings of that
+register with CMD0 as the witness, and then CLKCR's own divider field.
+
+### [M] The clock is not it either — and CTRL bit 1 holds while bit 0 does not
+
+`examples/SdClock`, 2026-08-13. The clock tree as found, which nobody had
+recorded:
+
+```
+0x40080080 = 0x00000001     enable on, source 59, no prescale, divider 0
+                            -> total divide 1, the fastest setting available
+CRU +0x40 = 0x00000009      +0x48 = 0x00000051      +0x60 = 0x00000002
+everything else in +0x44..+0x5C and +0x7C..+0x8C reads zero
+```
+
+So the SD clock was already enabled, on the default source, undivided. All 64
+settings of that register — source 8 and 59, prescale on and off, divider 0
+through 15 — were swept with CMD0 as the witness, and so were twelve CLKCR
+configurations across both of its `[30:23]` values. **Nothing completed a
+command.** The clock into the block is not the missing piece.
+
+The useful line in that run was somewhere else:
+
+```
+CTRL <- 0x40000003 (no reset bit)  reads 0x40000002
+```
+
+**Bit 1 holds. Bit 0 does not.** And after a full bring-up CTRL reads
+`0x40000000`, with bit 1 clear as well — so bit 1 holds when written on its
+own and does not survive the bring-up.
+
+Now read ROM `0x3D88` again, which is the only reset in the dump:
+
+```
+CTRL |= 7                  bits 0, 1 and 2 in a single store
+while (CTRL & 4) ;         wait for bit 2 to clear
+```
+
+If bit 2 resets the block, it takes bits 0 and 1 with it, and **the vendor's
+bring-up sets two bits and immediately wipes them** — the ROM's and the
+bootloader's both, and §23's transcription faithfully reproduces the order.
+Nothing in this project or in the vendor's code has ever set those bits
+*after* the reset, and one of them is now known to hold if you do.
+
+`examples/SdCtrl` tests it: which CTRL bits are writable at all, then sixteen
+combinations of the four bits the ROM ever touches (0, 1, 3 and 25) applied
+after bring-up, then every other writable bit on its own. It reports three
+things per attempt rather than one — what CTRL read back, **whether the
+command's start bit was ever seen latched**, and the status — because "the
+start bit did not latch" and "it latched, cleared, and the status stayed
+empty" are different faults and only the second is about clocks.
+
+Ways the hypothesis could still be wrong, all of which that sweep answers:
+bit 0 may be a self-clearing kick that already did its work; `[1:0]` may be a
+two-bit field in which 3 is not a legal value; or the order may be right and
+the block disabled for an unrelated reason.
+
+One method note worth keeping. The line above was printed by a test whose
+condition was `(ctrl & 3)` and whose message was "they stick" — which is true
+of a register where only one of the two stuck, and hid the finding for as
+long as it took to read the hex. **A probe that reduces two bits to one
+boolean can only report what it was already expecting.** Both this sketch and
+`SdProbe` now print the bits separately.
+
+### [M] The command register is live: `start LATCHED` in every configuration
+
+`examples/SdCtrl`, 2026-08-13. Thirty-odd configurations of CTRL — sixteen
+combinations of the four bits the ROM touches, applied *after* the reset, then
+every other writable bit alone, then a bare reset followed by the enables as a
+separate write — and every line reads the same:
+
+```
+start LATCHED   STA 0x00000000   CMD 0x0000A400
+```
+
+**The start bit is taken when it is written, and has cleared by the time the
+poll gives up.** So the block is not gated, is not stalled waiting for a
+clock, and is not refusing the command: it accepts it, drops the busy bit,
+and the status register reports nothing.
+
+The same run mapped CTRL, which nothing had:
+
+```
+writable: bits 1, 3, 4, 24, 25 (and 30/31, the configuration field)
+bit 0: NOT WRITABLE
+```
+
+That retires the hypothesis the sketch was built on. "The reset wipes the
+enable bits" cannot be true of bit 0, because there is no bit 0 to wipe. Bit 1
+does hold after a full bring-up and does *not* hold after a bare reset with no
+clock configuration, which is a real difference and not obviously an important
+one.
+
+Also worth recording: after a bare reset CTRL reads `0x00000000`, so the reset
+clears bit 30 — the one bit the clock configuration sets — as well.
+
+**Three hypotheses are now closed by measurement**, which is worth stating
+together because each one looked like the answer when it was proposed:
+
+| Ruled out | By | How completely |
+|---|---|---|
+| a functional-clock bit in `0x400E0000` | `SdWall` | the register is seven bits wide; all seven tried |
+| the clock into the block | `SdClock` | 64 settings, and it was already enabled and undivided |
+| a CTRL enable the reset destroys | `SdCtrl` | every writable bit, before and after the reset |
+
+### Where that leaves it, and the method change
+
+Every sketch above tested one hypothesis with one witness, and the supply of
+plausible hypotheses is now exhausted. `examples/SdScope` has none: it
+snapshots all 72 registers of the block, sends one CMD0, snapshots again, and
+prints what moved — the method that found the DVP's DMA destination register
+(§7n), and the right one once the question has become "does this block execute
+anything" rather than "which bit enables it".
+
+It also captures 32 back-to-back samples of the status and command registers
+with no formatting in between, because a bit that sets and self-clears in a
+few cycles is invisible to a poll loop that prints as it goes; and it sweeps
+the five CLKCR bits **no bring-up in the dump ever writes** — the vendor's
+read-modify-write clears `0x7FFF0FFF` and leaves bits 12..15 and 31 alone, so
+nothing has ever set them.
+
+**One thing has not been controlled for and should be**: whether a card is in
+the slot. CMD0 needs no card in principle — it expects no response and the
+controller only has to shift 48 bits out — but a host with a card-detect
+input may decline to run its clock into a slot it knows is empty, and if so
+every run so far has been asking a controller to talk to nothing. The
+card-detect pin is unknown (§23), so this cannot be checked in software. Two
+runs of `SdScope`, one with a card and one without, settle it in a minute.
+
+### [M] The block takes commands and discards them in under a microsecond
+
+`examples/SdScope`, 2026-08-13. All 72 registers snapshotted, one CMD0 sent,
+snapshotted again:
+
+```
+registers that bring-up moved:      +0x004  0x0000A400 -> 0x00008020
+registers that the command moved:   +0x004  0x00008020 -> 0x0000A400
+32 back-to-back samples afterwards: STA 0 and CMD's busy bit already clear
+                                    in the very first one
+CLKCR bits 12,13,14,15,31:          all DROPPED - those bits do not exist
+```
+
+**Exactly one register moved, and it was the one that was written.** Read that
+next to `SdCtrl`, which read the command register one MMIO access earlier and
+saw the start bit set: both are true, and together they say the busy bit lasts
+**less than one register access, about 300 ns**. At the identification clock,
+divider 7, shifting a 48-bit command out takes tens of microseconds. The block
+is not executing the command slowly or waiting on anything — it is discarding
+it.
+
+### The question none of it answers, and the test that does
+
+Every register read so far is on the *register interface*, which module 36
+clocks and which demonstrably works: writes stick and read back. **Nothing
+that has been measured says whether the logic behind those registers is
+running.** A peripheral with a clocked bus interface and a stopped core looks
+exactly like this — it takes writes, returns them, and does nothing.
+
+`examples/SdLife` tests that directly and without reference to SD at all:
+
+1. **Sample all 72 registers 200 times and report any word that ever differs
+   from itself.** Counters, FIFO levels and state machines all show up here.
+   Nothing moving is a fact, where "a command failed" is an inference.
+2. **Push words into the FIFO at `+0x200` and watch the flags in `+0x48`**
+   (bit 2 receive-empty, bit 3 transmit-full, from ROM `0x464A`/`0x4658`).
+   This exercises the datapath with no card, no command and no bus to the
+   slot. **Flags that move mean the core is alive and the fault is in the
+   command path; flags that do not mean the core is stopped**, and no amount
+   of SD protocol work matters until that changes. This is the sharpest test
+   available.
+3. **The six unused bits of CLKCR's `[30:23]` field.** The vendor uses two
+   single bits of it — 29 to identify, 28 to run — and the other six have
+   never been set by anything.
+
+If the core turns out to be stopped with module 36 and ROM clock 17 both on,
+the remaining candidate is a third clock, and the place to look is the CRU's
+own divider registers at `+0x40` and `+0x48` — which read `0x09` and `0x51`
+on this device and which nothing in this project has ever written.
+
+### Method: the console loses the head of a long report
+
+Four runs in a row opened with `[lost output - device outran the poll rate]`,
+and each time it was the register dump that went missing. The console is a
+2 KB ring that **overwrites rather than blocking** (deliberately — a sketch
+must not stall because nobody is running the monitor), and in `RUN_MODE=poll`
+the host only drains it between `loop()` calls. So any sketch that prints more
+than about two kilobytes without returning loses the beginning of it, every
+time.
+
+`examples/BtProbe` already solved this and nothing else copied it: a state
+machine with one section per `loop()` call, guarded by
+`sl6806_console_space() >= SL6806_CONSOLE_SIZE / 2`. `SdLife` is written that
+way. Any future probe that prints a register map should be.
+
+### [M] The core IS clocked: the FIFO works. The command path is the fault
+
+`examples/SdLife`, 2026-08-13, and the first positive result this block has
+produced:
+
+```
+STA2 before 0x00000106     rx-empty 1  tx-full 0
+pushed 16 words, STA2 now 0x00200109
+*** THE FLAGS MOVED ***
+nothing moved on its own across 200 passes over 72 registers
+CLKCR [30:23]: all eight bits hold; none of them starts a command
+```
+
+Sixteen words went into the data port at `+0x200` and the block noticed.
+Decoding the change to `+0x48`:
+
+| Bit | before | after | reading |
+|---|---|---|---|
+| 0 | 0 | 1 | pairs with bit 1 |
+| 1 | 1 | 0 | pairs with bit 0 |
+| 2 | 1 | 0 | FIFO empty — clears once there is data |
+| 3 | 0 | 1 | FIFO full — sets at exactly 16 words |
+| 21 | 0 | 1 | a level field in the high half |
+
+**The FIFO is sixteen words deep, its flags respond, and the datapath has a
+clock.** That retires the whole "the core is stopped" line of enquiry, which
+five sketches had been circling. Bits 0/1 flipping as a complementary pair
+alongside 2/3 suggests two views of the same fullness — the register carries
+more than the two flags ROM `0x464A`/`0x4658` use.
+
+Reading the FIFO back returned zeros, so the read port is not simply the write
+port; either the two directions are separate FIFOs or reads are only served
+during a data phase.
+
+Nothing moving on its own is consistent rather than contradictory: with no
+transfer running there is nothing to count.
+
+So the position is now precise. **The register interface works, the datapath
+works, and the command state machine discards commands in under 300 ns.**
+
+### The card clock is testable without an oscilloscope
+
+A command shifts out on the *card* clock; the FIFO runs on the core clock.
+`SdLife` proved the second one only. And the card clock is observable from
+software, because this chip's pad controller has an input register that reads
+a pad's physical level **regardless of the function it is muxed to** (§7f,
+bank base `+0x010`). So a pad the SD controller is driving can still be read by
+the CPU, and a pin carrying a clock, sampled a few thousand times, comes back
+as a mixture of ones and zeros where a parked pin comes back constant.
+
+`examples/SdPads` samples the whole of bank 1 four ways: before the SD pads
+are configured, with the controller up and idle, while CMD0 is being issued
+repeatedly, and with pins 12/13/14 taken back as pulled inputs. It answers:
+
+- **does pin 12 toggle** — if it does, the clock is leaving the chip and the
+  fault is on the far side of the pad; if it does not, the controller is not
+  driving its clock, which no register dump could have established;
+- **do pins 13 and 14 sit high** under the ROM's own pull selector, which is
+  what a CMD and a DAT0 line should do;
+- **which pins change when a card is inserted** — run it twice and diff. Any
+  pin that differs is wired to the slot, which is this board's SD pinout, and
+  a pin that changes on insertion and does nothing else is the card-detect
+  contact. Neither is known (§23).
+
+### Tooling: the bootloader is now reachable from the repository
+
+All of the above came out of a hand-extracted copy of the HLKJ bootloader in
+a scratch directory, which nobody else could reproduce. `tools/sl6806-boot`
+does it properly — the mapping, both CRCs, strings at run addresses, a literal
+cross-reference and a disassembler front end:
+
+```
+tools/sl6806-boot dump.bin --xref 0x40003000
+    0x40003000 referenced by 1 literal load(s)
+       loaded at 0x008227f0   (pool 0x00822958)
+```
+
+which is §23's central finding, reproducible in one command. It exists because
+the bootloader is where a lot of the interesting code is and no tool reached
+it: `tools/sl6806-xref` scans FIRM, and every `sdio(...)` string in the image
+is below file `0x10000`. 36 tests in `tests/tools/test_boot.py`, including
+that the bias round-trips and that a single flipped byte fails the CRC — a
+wrong bias produces addresses that look perfectly plausible and are off by a
+constant, which is exactly what cost §7h five searches.
+
+### [M] Software is blind to the SD bus too — and a test that should not have been written
+
+`examples/SdPads`, 2026-08-13, asked whether the card clock toggles on bank 1
+pin 12 by sampling the pad input register while the pad was muxed to function
+2. Every phase that used function 2 reported the pin stuck low; the phase that
+took the three pads back to function 0 under the ROM's own pull read all three
+**high**.
+
+The second reading is real: **the pads exist and their pull-ups work.** The
+first three mean nothing, and the reason is recorded three sections above in
+this same file, from `examples/PadScope`:
+
+> the input register reads 1 in function 0 and function 14, and 0 in every
+> other function … there is no function where the controller is connected
+> *and* the pin is readable
+
+`docs/LCD.md` states the consequence in as many words — *"no software test can
+watch that bus. Anyone tempted to write another one should read this table
+first"* — and that is exactly what happened: a sketch was written on the
+assumption that §7f's description of the input register meant it always
+reflects the pad, when the measured behaviour was already on file. The
+hardware run cost was a whole session's worth of turnaround.
+
+**The conclusion generalises: software is blind to the SD bus for the same
+reason it is blind to the LCD bus.** Whether the card clock leaves the chip
+cannot be answered from a payload. It needs a probe on the socket.
+
+The sketch is kept and its header now opens with this, rather than being
+deleted, because the reasoning inside it is a tidy example of a plausible test
+resting on an assumption nobody re-checked.
+
+### The pull table at ROM 0x0006501C, decoded
+
+§7f found the table and left its contents unread. Twelve entries, selectors
+4..15; each word's bits [1:0] go to the "pull a" register at bank `+0x24` and
+bits [17:16] to "pull b" at `+0x2C` (ROM `0x736`):
+
+| selector | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| pull a | 1 | 1 | 0 | 0 | 2 | 0 | 0 | 2 | 3 | 3 | 3 | 3 |
+| pull b | 2 | 3 | 0 | 0 | 0 | 0 | 0 | 2 | 0 | 1 | 2 | 3 |
+
+Selector 8 is known to hold a plain input high (docs/LCD.md), so **a = 2 is
+pull-up**, a = 0 is no pull, and **a = 1 is [I] pull-down** — which makes
+selector 4 the only clean pull-down in the table. a = 3 is [?], possibly a bus
+keeper, and is best left alone.
+
+Having a pull-down matters: it is what turns "this pin floats" into "this pin
+is driven", and that is the only card-presence test available while the bus
+pads themselves are unreadable.
+
+### `examples/PadMap`: the census, and the card-detect hunt
+
+Stays inside function 0, where software can see.
+
+1. **A census with no writes at all** — every pin's function nibble and level
+   across all six banks. Nobody has recorded what this board's pads are set to
+   in bootloader mode, and it is the missing half of the README's "this
+   board's pinout" item: the pad controller has been done since §7f, the
+   pinout has not.
+2. **A pull test on pads already in function 0** — pull up, read, pull down,
+   read, restore. A pin that follows the pull is floating; one that ignores it
+   is driven from outside. **A microSD socket's card-detect contact is a
+   switch to ground**, so a pin that follows its pull with an empty slot and
+   reads low with a card in it is card detect.
+
+It never drives a pad and never touches a pad outside function 0 — the notes'
+own warning is that driving all 192 wedges the device, since something USB
+needs is among them.
+
+Run it twice, once with a card and once without; the diff is this board's SD
+pinout and its card-detect pin.

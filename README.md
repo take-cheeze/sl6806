@@ -53,7 +53,7 @@ so it is worth being precise about which parts are real:
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
 | Backlight | **Works, on/off.** Dimming does not — `sl6806_backlight_begin(100)` lights the panel from cold or warm. The PWM counter does not run, so duty has no effect yet — but the reason §15 gave for that is now known to be wrong: `0x400E0000` is not dead, it is gated behind a module clock (§7n), and the PWM's bit in it has never been looked for. Worth one walk. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
 | Audio out | **Block confirmed on hardware 2026-08-13; configured and not running.** The audio controller is `0x40009000` — two DMA directions, a two-channel DAC path, three microphone inputs, volume, and a 128-word EQ coefficient RAM. Found by following the vendor's `/dev/audio0` to its codec dispatcher, and corroborated by a `rate % 8000` that picks between 24.576 MHz and 22.579 MHz. Its clocks — module id 37, romclk id 19 — are reachable from a payload with no unlock work, and with them **thirty registers come up at reset defaults**: playback levels at maximum, capture at zero, both DMA address registers at the base of SRAM. Descriptors are accepted and the completion flag raises itself, with the length reading back `0x12BC` exactly. **But 25 ms of audio retires in 10 µs across all twelve route/clock-source combinations**, which is configured-and-not-running — the PWM's failure and the camera's, and for both of those the answer was a functional-clock bit in `0x400E0000`. `examples/AudioWall` now walks that register's 32 bits with the buffer time as the witness, which is possible only because the same day's `BtProbe` got its gate open. Driver in [`cores/sl6806/sl6806_audio.c`](cores/sl6806/sl6806_audio.c), 93 host tests; [docs/AUDIO.md](docs/AUDIO.md). **This also corrects the peripheral map: `0x40009000` is not the timers** (those are `0x40099000`). |
-| SD | **Not yet.** Hardware confirmed present; no driver. |
+| SD / TF card | **Host found, driver written, and run on hardware 2026-08-13: configured and not running.** The SD/MMC host is `0x40003000` — not `0x400F7000`, which is the SPI flash host and, at `+0x100`, the register-file mailbox (§7m); that row of the peripheral map is now corrected. It is written down once per image, into a driver handle, which is why a literal scan never ranked it. **The whole SD stack is in the mask ROM**, the same way GPIO is: command layer, CMD0/CMD8/ACMD41 identification, the CSD parse, and a *polled* FIFO drain at `+0x200` — so this needs neither DMA nor interrupts. [`cores/sl6806/sl6806_sd.c`](cores/sl6806/sl6806_sd.c) transcribes it with every poll bounded, brings the block up the ROM's way (pads bank 1 pins 12–14 on function 2, module id 36 for the registers, ROM clock id 17 for the function), identifies the card and reads 512-byte blocks over a one-bit bus. 72 host tests against a model of the controller. **On hardware the decode is confirmed and the block does not run.** The cold dump — before this framework touched anything — reads `CTRL 0x40000000`, `CLKCR 0x20070008`, `DTIMER 0xFFFFFF40` and `CMD 0x0000A400`, which are exactly the four values the transcription predicts, the last of them being the CMD0 command word with its start bit cleared. (Whether the *mask ROM* left those values or an earlier payload in the same power session did is not settled — uploading a payload does not reset the chip; [docs/SD.md](docs/SD.md) has the one-power-cycle test that decides it.) That looked like the PWM's failure and the camera's a third time — and `examples/SdWall` **ruled it out**: `0x400E0000` implements bits [6:0] and nothing above them, all seven were tried, and none is the SD host's. (That also shrinks §14a's and §16's open item from 28 bits to three — 2, 3 and 4 — since every walk of that register so far has been walking 25 bits that do not exist.) The bootloader's four differences from the ROM's bring-up fail too. `examples/SdClock` then swept all 64 settings of the SD clock register `0x40080080` (found already enabled, on its default source, undivided) and twelve CLKCR configurations: **the clock is not it either.** `examples/SdCtrl` then swept every writable CTRL bit before and after the reset, and reported the thing that reframes the problem: **`start LATCHED` on every line.** The command register takes the start bit and has dropped it again by the time the poll gives up — so the block is not gated, not stalled on a clock, and not refusing the command; it accepts it, drops busy, and the status register reports nothing. (It also mapped CTRL: writable bits are 1, 3, 4, 24, 25, and **bit 0 is not writable at all**, which retired the hypothesis that sketch was built on.) Three hypotheses are now closed by measurement — `0x400E0000`, the clock, and CTRL — so `examples/SdScope` mapped instead of guessing: 72 registers snapshotted around one CMD0, and **exactly one moved, the one that was written**, with the busy bit gone within ~300 ns where shifting 48 bits would take tens of microseconds. `examples/SdLife` then produced the first positive result: **sixteen words pushed into the FIFO at `+0x200` moved the flags in `+0x48`** — empty cleared, full set at exactly 16, a level field appeared. The FIFO is 16 words deep and **the datapath is clocked**, so the core is not stopped and the command state machine alone is at fault. `examples/SdPads` then tried to see whether the card clock toggles on a pin, and **that test could not have worked**: the pad input buffer is off in every function except 0 and 14, which `examples/PadScope` measured during the LCD work and `docs/LCD.md` records. So **software is blind to the SD bus for the same reason it is blind to the LCD bus** — whether the clock leaves the chip needs a probe on the socket. What the run did establish is that pins 12/13/14 pull high as plain inputs, so the pads and their pull-ups are real. `examples/PadMap` covers what is left that software *can* see: a no-write census of every pad's function and level across all six banks — this board's pinout, never written down — and a pull-up/pull-down test on pads already in function 0, which finds the card-detect contact (a switch to ground) by diffing a run with a card against one without. Also outstanding: the power-cycle test in [docs/SD.md](docs/SD.md), because uploading a payload does not reset the chip and a "cold" dump taken second in a session is not cold. The bootloader half of all this is now reproducible with `tools/sl6806-boot` (36 tests). No writing to cards, and no four-bit mode. |
 | Bluetooth | **Candidate register window found; its gate is decoded and RUN, 2026-08-13.** `0x400E2000`, next to the application's HCI command dispatcher — about ninety load sites over thirty registers in three clusters, including four free-running counters of 25 and 30 bits that read like a link controller's native clock. The block's functional clock is `0x400E0000` **bit 0** and its reset is `0x400E0008` bit 0, and the shared bring-up that opens the whole `0x400Exxxx` group is transcribed in [`cores/sl6806/sl6806_bt.c`](cores/sl6806/sl6806_bt.c) — which also settles that module 46 gates the *group*, not the camera, and that `0x4008011C`'s value is `0x31`. No bit's meaning is known. **On hardware the gate opens**: the PLL locks from a payload (`0x40080008` came back `0xD0010C04`, lock bit set), `0x400E0000` holds `0x21`, and four registers in the window wake up — but the counters stay at zero, so the link controller is not running. `examples/BtProbe`; see [docs/BLUETOOTH.md](docs/BLUETOOTH.md). |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
 | I2C on bare pads | **Works — confirmed on hardware.** `examples/CameraDemo` bit-bangs TWI 0 on two pads and reads the FM tuner's chip id: `0x5808`, the exact value the stock driver checks for, on a read-only pass. First device this framework has ever read over I2C, and it needs no TWI controller. |
@@ -350,7 +350,8 @@ Peripheral blocks identified so far:
 | `0x400E1000` | camera front end / DVP ([`sl6806_dvp.h`](cores/sl6806/sl6806_dvp.h)) |
 | `0x400E2000` | **candidate** Bluetooth window, three clusters, unconfirmed on hardware ([`sl6806_bt.h`](cores/sl6806/sl6806_bt.h), [docs/BLUETOOTH.md](docs/BLUETOOTH.md)) |
 | `0x40099000` | timers (`HAL_timer_*`) |
-| `0x400F7000` | SD/MMC + SPI flash host; `+0x100` is a serial master, and the indexed register file is the chip on it (§7m) |
+| `0x40003000` | **SD/MMC host** ([`sl6806_sd.h`](cores/sl6806/sl6806_sd.h), [docs/SD.md](docs/SD.md)). §7c filed the SD host at `0x400F7000` on the strength of a mailbox that turned out to be §7m's; the real base appears once per image, cached in a driver handle (§23) |
+| `0x400F7000` | SPI flash host; `+0x100` is a serial master, and the indexed register file is the chip on it (§7m). **Not** the SD host |
 
 Flash layout: HLKJ bootloader at `0x0`, partition table at `0xF000`, then
 `FIRM` (application, XIP at `0x00C10000`), `PICS` and `FONT`.
@@ -377,33 +378,59 @@ In rough order of how much they unlock:
    [docs/AUDIO.md](docs/AUDIO.md) has the whole elimination table and the four
    sketches. **The most useful thing anyone can do here is have a fresh idea**
    — this one has been narrowed about as far as reading can narrow it.
-2. **Walk `0x400E0000`'s 28 unattributed bits with the PWM counter as the
-   witness.** `examples/AudioWall` already walked them against an audio
+2. **Walk `0x400E0000`'s three unattributed bits with the PWM counter as the
+   witness.** [M] 2026-08-13, `examples/SdWall`: **the register is seven bits
+   wide** — writes to bits 7..31 are dropped — so it is bits 2, 3 and 4, not
+   28 of them, and every previous walk of it spent most of its time on bits
+   that do not exist. `examples/AudioWall` already walked them against an audio
    witness and found nothing, but the audio witness may simply be insensitive
    — the block has other problems. The PWM's stalled counter is a cleaner
    test, and the walk only became possible on 2026-08-13, when `BtProbe` got
    that register to hold bits from a payload. Four bits are attributed
    (camera 6, Bluetooth 0, the `0x400E2300` cluster 1, group 5), so the walk
    can check itself.
-3. **Run the display driver on a real P20 and report what happens.** This is
+3. **The SD host is confirmed at `0x40003000` and will not complete a
+   command — and the usual answer is now ruled out.** `examples/SdWall`
+   walked `0x400E0000` with CMD0 as the witness and found that the register
+   is only seven bits wide; all seven were tried and none is the SD host's.
+   The clock is ruled out too (all 64 settings of `0x40080080`, found already
+   enabled and undivided), and so is CTRL (every writable bit, before and
+   after the reset). What those runs established is sharper than any of them
+   set out to test: **the command register is live** — the start bit latches
+   and clears on every configuration — so the block accepts commands and
+   executes nothing. `examples/SdScope` then mapped the block around one CMD0:
+   one register moved, the one that was written, and the busy bit was gone
+   within ~300 ns. `examples/SdLife` then showed the FIFO works: 16 words
+   into `+0x200` and the flags in `+0x48` move, so the datapath is clocked
+   and only the command state machine is at fault. `examples/SdPads` then tried to watch the card
+   clock on a pin and **could not have worked** — the pad input buffer is off
+   outside functions 0 and 14, which `PadScope` measured during the LCD work.
+   Software is blind to this bus, as it is to the LCD's; the clock question
+   now needs a probe on the socket. **`examples/PadMap` is the run that
+   matters, and it wants two — once with a card in the slot and once
+   without.** It censuses every pad's function and level without writing
+   anything (this board's pinout, never recorded) and pull-tests the pads
+   already in function 0, so the diff between the two runs gives the SD
+   pinout and the card-detect contact.
+4. **Run the display driver on a real P20 and report what happens.** This is
    worth more than any further reading of the dump. The whole stack is
    written and the panel is a QSPI display; what nobody knows is whether the
    two inferred bits of the transfer register and the guessed pixel byte
    order are right. [docs/LCD.md](docs/LCD.md) has the checklist. It cannot
    brick anything in payload mode.
-4. **This board's pinout.** The pad controller is done
+5. **This board's pinout.** The pad controller is done
    ([`sl6806_padctl.h`](cores/sl6806/sl6806_padctl.h)); what is missing is
    which pad each button and LED is on. The ids are immediates at the stock
    firmware's 54 GPIO call sites, so this is a reading exercise plus a meter.
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-5. ~~**Find the PWM's bit in `0x400E0000`**~~ — merged into item 1, which is
+6. ~~**Find the PWM's bit in `0x400E0000`**~~ — merged into item 1, which is
    the same walk. `0x400E0000` was recorded as dead from a payload for two
    sessions; it is gated, `sl6806_module_enable(46)` opens it (§7n), and the
    whole vendor gate sequence including the PLL has now been run (§17,
    measured).
-6. ~~**Where the indexed register file lives**~~ — found (§7m): a chip at I2C
+7. ~~**Where the indexed register file lives**~~ — found (§7m): a chip at I2C
    `0x30` behind a mailbox at `0x400F7000+0x100`, not a base address, which is
    why five searches for a base could not have worked. Read and written on
    hardware; its five LDO rails decode to real supply voltages.
@@ -412,19 +439,19 @@ In rough order of how much they unlock:
    clock families and the whole front end all check out and the sensor never
    starts (§7n). What is left there needs SWD or `MODE=firmware`, not more
    probing.
-7. **An FM driver**, one of the cheapest working devices on the board: an
+8. **An FM driver**, one of the cheapest working devices on the board: an
    RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
    part, published register map, and the id read is done.
-8. **The TWI controller's base address** — demoted, because it is now a speed
+9. **The TWI controller's base address** — demoted, because it is now a speed
    problem rather than an access one. `examples/TouchDemo` bit-bangs bus 1
    and `examples/CameraDemo` bit-bangs bus 0, both on pads alone, and the
    second has read a real device. What the base would buy is throughput,
    which matters for a camera and not much else.
-7. **A DMA driver.** The display pushes pixels 16 bytes at a time because
+8. **A DMA driver.** The display pushes pixels 16 bytes at a time because
    that is the FIFO depth. The vendor uses the DMA controller at
    `0x40070000`; its command-list format is decoded at the bottom of
    [`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h).
-8. **Run `examples/BtProbe` on a real P20 and report what happens.** A
+9. **Run `examples/BtProbe` on a real P20 and report what happens.** A
    candidate Bluetooth register block, `0x400E2000`, is found — see
    [docs/BLUETOOTH.md](docs/BLUETOOTH.md) — but read-only and completely
    unconfirmed on hardware. Cheap to run, and the outcome (flat zero, flat
@@ -432,7 +459,7 @@ In rough order of how much they unlock:
    any further reverse engineering at all. Note it shares the `0x400Exxxx`
    group with the camera front end, so it may well need a bit in
    `0x400E0000` before it reads as anything but zeros (§7n).
-9. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
+10. ~~**The real CPU clock**~~ — `make calibrate` measures it against the host
    clock, so this no longer blocks anything; finding the PLL registers would
    still give it exactly. They are *not* at the clock unit's base:
    `0x40080000` has dividers but no multiplier.
