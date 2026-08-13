@@ -5207,3 +5207,34 @@ indistinguishable by inspection — the check that would have caught it is
 asking whether *anything at all* differed, since two runs of a sixty-nine-pad
 sweep agreeing to the byte is itself the surprising outcome and deserved more
 suspicion than it got.
+
+### [M] Bank 5 pin 0 is bistable, and the sketch now labels its own logs
+
+A third run puts bank 5 pin 0 back in the floating state. Across the three
+logs taken since the protocol was fixed it has been seen in both states and it
+remains **the only pin of sixty-nine that varies at all** — everything else,
+census included, is identical run to run.
+
+Bistability on exactly one pin is what the card-detect candidate needed; what
+it still needs is the states tracking the card, which requires knowing which
+state each run was taken in.
+
+**And that is where this investigation has actually been losing, twice now.**
+The result is a diff between two runs, and the two runs are told apart by
+whoever pastes the logs remembering which was which. Once that produced a
+mislabel and once a duplicated paste analysed as a pair, and each cost a
+retracted conclusion — the second one within a minute of being committed. The
+measurements were fine both times. The bookkeeping was not.
+
+So `examples/PadMap` now tests bank 5 pin 0 **first** and prints the verdict at
+the top of every log:
+
+```
+--- card detect: bank 5 pin 0 ---
+  up=1 down=0   ->  CARD PRESENT   (pin floats: switch open)
+```
+
+A log that says which state it was taken in cannot be mislabelled, and the
+diff stops depending on anyone's memory. This is a cheaper fix than any of the
+three method notes above it, and it should have been the first thing written
+once the answer turned out to be a two-run comparison.

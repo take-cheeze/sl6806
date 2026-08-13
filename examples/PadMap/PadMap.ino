@@ -245,6 +245,15 @@ extern "C" {
  * fast pass pay it. */
 #define SETTLE_SLOW_US 40000u
 
+/*
+ * [M] The card-detect candidate, found by this sketch on 2026-08-13 and the
+ * only pin of sixty-nine that a card moves. Normally closed: held to ground
+ * with the slot EMPTY, floating with a card in, so "present" is the pin
+ * reading high under a pull-up.
+ */
+#define CD_BANK 5u
+#define CD_PIN  0u
+
 static int  phase;
 static int  bank;
 static bool done;
@@ -362,8 +371,51 @@ void loop()
 
     switch (phase) {
 
-    /* --- the census, one bank per poll ---------------------------- */
+    /* --- the card verdict, first, so the log labels itself -------- */
     case 0: {
+        /*
+         * THIS PHASE EXISTS BECAUSE OF A WORKFLOW FAILURE, not a technical
+         * one. The card-detect result is a diff between two runs, and two
+         * runs are told apart by whoever pasted the logs remembering which
+         * was which. That went wrong twice - once a mislabel, once a
+         * duplicated paste analysed as a pair - and cost a retracted
+         * conclusion each time.
+         *
+         * A log that says which state it was taken in cannot be mislabelled.
+         */
+        uint32_t base = sl6806_pad_bank_base[CD_BANK];
+        uint32_t saved = pull_save(base, CD_PIN);
+        unsigned up, down;
+
+        Serial.println();
+        Serial.println("--- card detect: bank 5 pin 0 ---");
+
+        sl6806_pad_configure(SL6806_PAD_ID(CD_BANK, CD_PIN, 0) | PULL_UP);
+        up = pad_settled(base, CD_PIN);
+        sl6806_pad_configure(SL6806_PAD_ID(CD_BANK, CD_PIN, 0) | PULL_DOWN);
+        down = pad_settled(base, CD_PIN);
+        sl6806_pad_set_func(SL6806_PAD_ID(CD_BANK, CD_PIN, 15), 15u);
+        pull_restore(base, CD_PIN, saved);
+
+        Serial.print("  up=");
+        Serial.print(up);
+        Serial.print(" down=");
+        Serial.print(down);
+        Serial.print("   ->  ");
+        if (up == 1u && down == 0u)
+            Serial.println("CARD PRESENT   (pin floats: switch open)");
+        else if (up == 0u && down == 0u)
+            Serial.println("SLOT EMPTY     (pin held to ground)");
+        else
+            Serial.println("UNEXPECTED - the candidate does not behave");
+        Serial.println("  Polarity is normally-closed; see the header. Say");
+        Serial.println("  whether this matches the slot before trusting it.");
+        phase++;
+        return;
+    }
+
+    /* --- the census, one bank per poll ---------------------------- */
+    case 1: {
         uint32_t base = sl6806_pad_bank_base[bank];
         uint32_t in = sl6806_mmio_read(IN_REG(base));
 
@@ -406,7 +458,7 @@ void loop()
     }
 
     /* --- the pull test, one bank per poll ------------------------- */
-    case 1: {
+    case 2: {
         uint32_t base = sl6806_pad_bank_base[bank];
         unsigned n_tested = 0, n_absent = 0, n_follows = 0;
 
