@@ -9,6 +9,15 @@
 | Confirmed on hardware | **Yes, 2026-08-13.** Cold every register reads flat zero; after module 37 and romclk 19, thirty come up at sensible reset defaults. |
 | Sound | **No, and the cause is narrowed but not found.** `examples/AudioWall` proved the engine **moves no memory at all** (0 of 64 words in a capture buffer). Ruled out by measurement: the output route, the bit clock, and every bit of `0x400E0000`. A DMA-controller hypothesis was raised and withdrawn the same hour — see below. |
 
+**Outside corroboration, 2026-08-13.** The chip is very probably Zhuhai
+绅聚科技's 云P3 ([notes §1a](sl6806_re_notes.md)), and their announcement of it
+advertises 192 kHz/24-bit playback, full-format decode, and ENC-denoised
+recording with VAD. That fits the block's shape — two DMA directions, three
+microphone inputs, a 128-word coefficient RAM — and it argues the path is meant
+to work in production silicon rather than being a fused-off option on this SKU.
+It is marketing copy, not a register spec: treat it as one more reason the
+failure below is a missing enable rather than missing hardware, and nothing more.
+
 ## MEASURED, 2026-08-13 — the block is there
 
 `examples/AudioProbe` on a P20 Player. Cold, every register reads

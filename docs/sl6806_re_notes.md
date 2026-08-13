@@ -18,6 +18,43 @@ Working log for the `dump.bin` analysis. Everything here was verified against th
   - Card-reader: inquiry `SSTLINK DDVICE 2.02`, serial `20221008000002`
   - Bootloader (boot ROM): inquiry `SMTLINK DEVICE 2.00`, serial `20220320000001`
 
+### 1a. Vendor identity, and why there is no datasheet
+
+Searched 2026-08-13. **There is no public SL6806 datasheet**, in English or Chinese:
+no entry on alldatasheet / DigChip / the Chinese 规格书 aggregators, no pinout, no
+package drawing. Searching the part number finds only unrelated `*6806` parts and
+`ilyakurdyukov/smartlink_flash`, which remains the sole open-source technical
+reference and itself links no documentation. Assume none will appear; the mask ROM
+is the datasheet.
+
+The vendor is very probably **珠海绅聚科技 / Shenju Technology** (English site brands
+it "Jointbees", which is the label `smartlink_flash` reports for these players).
+Founded 2018, HQ Zhuhai, R&D in Shenzhen and Xi'an; `shenjugroup.com`. In March 2022
+they announced the **云P3 ("cloud P3")** chip — matching the firmware's `yp3_` version
+strings — as a dual-core AI SoC for MP3 players, in mass production at 1M+ units.
+The part number mapping 云P3 → SL6806 is **(inferred)**: no public text states it.
+Nothing register-level is available from them, and the P3 line has since been dropped
+from their product page (current catalogue is WS310 / W30 / W20 / TWS300 / WS300A);
+the announcement survives at `shenjugroup.com/zh-CN/news/82.html`.
+
+Two claims in that announcement corroborate work elsewhere in these notes, and are
+worth having on record as *independent* of the dump:
+
+- "主控与蓝牙功能一体" — the Bluetooth is **on-die**, not a companion part. That is
+  the strongest outside evidence that the `0x400E2000` window (§16, Bluetooth, and
+  its gate in §17) is a real link controller rather than a host-side HCI transport,
+  and that its counters are supposed to run.
+- 192 kHz / 24-bit playback, full-format decode, and ENC-denoised recording with VAD.
+  Consistent with the audio block's shape at `0x40009000` (§16, audio controller —
+  note the duplicated section number — and §21): two DMA directions,
+  three microphone inputs, a 128-word EQ coefficient RAM. A path this capable is not
+  expected to be fused off, which further isolates the "configured and not running"
+  failure to a missing functional-clock bit rather than to a missing feature.
+
+The one route left to real documentation is asking Shenju directly through the
+contact form on `shenjugroup.com` — possibly under NDA, possibly not at all. No SDK
+leak exists on the Chinese board-house forums as of this search.
+
 ## 2. Dump / flash tooling
 
 - Tool: `ilyakurdyukov/smartlink_flash` (`smtlink_dump`).

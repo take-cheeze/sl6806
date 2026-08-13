@@ -27,8 +27,12 @@ Bringing a real device up for the first time: **[docs/BRINGUP.md](docs/BRINGUP.m
 
 ## What actually works
 
-This chip has no datasheet. Everything here was built from a firmware dump and
-from [ilyakurdyukov/smartlink_flash](https://github.com/ilyakurdyukov/smartlink_flash),
+This chip has no datasheet — searched again 2026-08-13, and there is nothing
+public in English or Chinese; the vendor is very probably Zhuhai's 绅聚科技
+("Jointbees"), whose 云P3 chip matches the firmware's `yp3_` strings, and it
+publishes no documentation ([notes §1a](docs/sl6806_re_notes.md)). Everything here
+was built from a firmware dump and from
+[ilyakurdyukov/smartlink_flash](https://github.com/ilyakurdyukov/smartlink_flash),
 so it is worth being precise about which parts are real:
 
 | Area | Status |

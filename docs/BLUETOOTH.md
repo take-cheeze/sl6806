@@ -12,6 +12,16 @@ This is still an earlier-stage document than [LCD.md](LCD.md). What has
 changed is that its two headline unknowns — "what unlocks it" and "which bit
 in `0x400E0000` it needs" — are both answered, and the answer has been run.
 
+**Outside corroboration, 2026-08-13.** Every claim above comes from the dump, so
+it is worth recording one piece of evidence that does not. The chip is very
+probably Zhuhai 绅聚科技's 云P3 — the vendor's `yp3_` version strings, and see
+[notes §1a](sl6806_re_notes.md) — and their 2022 announcement of it says
+"主控与蓝牙功能一体": controller and Bluetooth in one part. So the radio is
+on-die, and `0x400E2000` is a link controller to be driven, not a transport to
+some companion chip that this board may or may not be fitted with. That was
+assumed here already; it is no longer only an assumption. It does not narrow
+which register does what.
+
 ## MEASURED, 2026-08-13 — the wall comes down
 
 `examples/BtProbe` on a P20 Player. The sequence ran, the device stayed on the
