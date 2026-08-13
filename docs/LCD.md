@@ -482,6 +482,48 @@ make -C tests/host
   and interrupt 74. This driver polls. The command-list format that path uses
   is decoded and written down at the bottom of `sl6806_lcdc.h`; what is not
   written is a DMA driver.
+
+  **It is worth writing, and the reason is measured rather than assumed.**
+  `examples/PushRate` on one P20 Player, 2026-08-13:
+
+  | | |
+  |---|---|
+  | full 240x296 frame | 167348 us — 829 KiB/s, 5 fps |
+  | transfers | 8900, no timeouts, **0 busy_waits** |
+  | polls per completion | min 3, max 7 |
+  | one LCDC register read | 312 ns (~20 cycles); the same loop on SRAM is 94 ns |
+
+  `busy_waits == 0` is the load-bearing number. It says the controller was
+  never still busy when the CPU arrived with the next transfer, and a minimum
+  of 3 polls says it finished within a few reads of being asked. **The panel's
+  clock is not the ceiling.** So raising the module clock cannot be the fix,
+  and DMA is not just offloading time the bus would have spent anyway.
+
+  Where the 167 ms actually goes, with `test_bus_traffic` counting the
+  crossings exactly against the model:
+
+  - **~83 ms of register accesses.** 231346 accesses for the frame, 26 per
+    transfer, times the measured 312 ns. The model completes on its first
+    poll where the device takes 3 to 7, so the hardware figure is a few reads
+    per transfer higher than the 72 ms the count alone gives.
+  - **~84 ms of software.** What is left. `bus_pixels()` stages every pixel as
+    two separate `stage()` calls, so a 16-byte transfer is 16 calls through a
+    bounds check and a global before any register is touched — about 75 cycles
+    a pixel.
+
+  Both halves are per-16-bytes CPU work, and both are exactly what a command
+  list removes, which is why the DMA path is the fix rather than a tidy-up.
+
+  Two cheaper things are worth knowing before starting it, because they
+  need no new peripheral:
+
+  - `irq_quiet()` is 8 of the 26 accesses, four read-modify-writes of the
+    interrupt enables, once per transfer. It writes the same constants every
+    time. Hoisting it is ~15% of the frame — but it is `[V]` vendor sequence
+    and `test_lcdc` pins it, so it is a deliberate change, not a cleanup.
+  - Staging pixels a word at a time instead of a byte at a time changes no
+    bus traffic at all, only how the bytes reach `g_pend`. That is most of the
+    software half and it cannot alter what the panel sees.
 - **Backlight.** Identified but not implemented: PWM channel 3 at 48000 Hz,
   duty as a percentage, default 60%. The strings are at `0x00C6854E` and
   `0x00C68585`, and `0x00D10354` opens the device and sets the default. The

@@ -99,6 +99,16 @@ static unsigned nfifo;
  * path gets exercised. */
 static int model_completes = 1;
 
+/*
+ * Access counters, for test_bus_traffic().
+ *
+ * How long a frame takes on hardware turned out to be a question about how
+ * many times the CPU crosses to the peripheral, not about the panel's clock -
+ * see test_bus_traffic() for the measurements. Counting here is exact and
+ * costs no hardware, which is the whole reason this hook exists.
+ */
+static unsigned long mmio_reads, mmio_writes, mmio_transfers;
+
 static void model_reset(void)
 {
     memset(lcdc_reg, 0, sizeof(lcdc_reg));
@@ -147,6 +157,8 @@ static void model_transfer(void)
     unsigned cs   = (xfer >> 18) & 1u;
     unsigned n, i;
 
+    mmio_transfers++;
+
     if (mode == 1) {
         emit((uint8_t)lcdc_reg[SL6806_LCDC_CMD0 / 4]);
     } else if (mode == 2) {
@@ -181,6 +193,7 @@ uint32_t sl6806_mmio_read(uint32_t addr)
 {
     uint32_t *p = slot_of(addr);
 
+    mmio_reads++;
     if (!p) {
         printf("  FAIL: read of unmapped address 0x%08X\n", addr);
         failures++;
@@ -193,6 +206,7 @@ void sl6806_mmio_write(uint32_t addr, uint32_t value)
 {
     uint32_t *p = slot_of(addr);
 
+    mmio_writes++;
     if (!p) {
         printf("  FAIL: write of 0x%08X to unmapped 0x%08X\n", value, addr);
         failures++;
@@ -467,6 +481,71 @@ static void test_long_stream(void)
           "last pixel wrong: %02X %02X", txn[2].data[130], txn[2].data[131]);
 }
 
+/*
+ * Where a frame's 167 ms goes.
+ *
+ * MEASURED ON HARDWARE, 2026-08-13, examples/PushRate on one P20 Player:
+ *
+ *   full 240x296 frame     167348 us    829 KiB/s   5 fps
+ *   transfers              8900         0 timeouts, 0 busy_waits
+ *   polls per completion   min 3, max 7
+ *   one LCDC register read 312 ns  (~20 cycles), against 94 ns for the same
+ *                          loop reading SRAM - so ~218 ns of that is the
+ *                          crossing to the peripheral
+ *
+ * Two of those numbers together rule out the explanation everyone reaches for
+ * first. `busy_waits == 0` says the controller was never still busy when the
+ * CPU came back with the next transfer, and 3 polls minimum says it finished
+ * within a few reads of being asked. The panel's clock is not the ceiling, so
+ * raising the module clock cannot be the fix and DMA is not merely offloading
+ * work the bus was going to spend anyway.
+ *
+ * What is left is the crossing itself, and this test counts it exactly - which
+ * is the point of running the driver against a model. Multiply the count by
+ * the measured 312 ns and compare against the 18.8 us per transfer that
+ * 167348/8900 gives.
+ *
+ * The model completes every transfer on its first poll, so it counts one poll
+ * read where the device took 3 to 7. That gap is the only known difference
+ * between this count and the hardware's, and it is in the safe direction: the
+ * count below is a floor.
+ *
+ * The CHECK is a ceiling, not a description. Anything that adds a register
+ * access to this path multiplies by 8900, so a change that quietly puts one
+ * more read-modify-write in a per-transfer helper costs about 5 ms a frame and
+ * should have to say so here.
+ */
+static void test_bus_traffic(void)
+{
+    extern const sl6806_dcs_panel_t sl6806_p20_panel;
+    static sl6806_color_t frame[240 * 296];
+    unsigned long total, per;
+
+    CHECK(begin_clean() == 0, "begin failed");
+
+    mmio_reads = mmio_writes = mmio_transfers = 0;
+    sl6806_dcs_flush(&sl6806_p20_panel, 0, 0, 240, 296, frame);
+
+    total = mmio_reads + mmio_writes;
+    /* Rounded, not truncated: 25.99 reported as 25 invites someone to
+     * "correct" the 26 in docs/LCD.md to a number that is further from the
+     * truth. */
+    per = mmio_transfers
+        ? (total + mmio_transfers / 2) / mmio_transfers
+        : 0;
+
+    printf("  frame traffic: %lu transfers, %lu accesses "
+           "(%lu reads + %lu writes), %lu per transfer\n",
+           mmio_transfers, total, mmio_reads, mmio_writes, per);
+    printf("  at the measured 312 ns per access that is %lu ms of a %u ms "
+           "frame\n", total * 312ul / 1000000ul, 167u);
+
+    CHECK(mmio_transfers == 8900,
+          "full frame took %lu transfers, want 8900", mmio_transfers);
+    CHECK(per <= 40,
+          "%lu register accesses per transfer, ceiling is 40", per);
+}
+
 static void test_no_swap(void)
 {
     sl6806_lcdc_config_t cfg = p20_cfg;
@@ -575,6 +654,7 @@ int main(void)
     test_flush();
     test_flush_clipped();
     test_long_stream();
+    test_bus_traffic();
     test_no_swap();
     test_reset_pin();
     test_real_init_sequence();
