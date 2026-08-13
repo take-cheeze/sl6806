@@ -593,6 +593,41 @@ pull-ups, since the sweep reads them high with no internal pull - and they
 behave exactly as they must, which is what makes the other two readings worth
 anything.
 
+**The pull table is not uniform across these four pads, and reading it wrongly
+produced a false finding.** The sweep was originally run on the two bus pads
+only, and the selector it chose from them - 6 - was then used on all four.
+Sweeping all four says why that was wrong:
+
+| pad | selectors that read high |
+|---|---|
+| SDA 4/12, SCL 4/13 | 6, 7, 8, 9, 10, 11, 13, 15 |
+| PWDN 4/15 | 6, 7, 8, 9, 10, 11, 13 |
+| **RESET 4/14** | **8, 9, 10, 11, 13** - not 6, not 7 |
+
+On a pad with an external pull-up, *every* selector that is not a pull-down
+reads high, because the external resistor does the work - so the bus pads
+cannot tell an internal pull-up from no pull at all. Pin 14 has no external
+pull-up, and there selector 6 does nothing. Under it, RESET stayed low after
+being driven low, and that was written up as "something external holds this
+line down". **It does not.** With the vendor's own selector 8, RESET rises in
+1 µs like every other pad. Selector 8 is what §7h's own pad ids carry, so the
+evidence was there to be used.
+
+Timing how long an internal pull takes to move each net - a proxy for the
+capacitance hanging off the pad - gives the same answer everywhere:
+
+| net | pull-up | pull-down |
+|---|---|---|
+| SDA 4/12 | 1 µs | 1-2 µs |
+| SCL 4/13 | 1 µs | 1-2 µs |
+| RESET 4/14 | 1 µs | 1 µs |
+| PWDN 4/15 | 1-2 µs | 1-2 µs |
+
+So all four nets are small and none is loaded differently from the bus pads
+that demonstrably reach a fitted chip. That kills the last software-visible
+way to ask whether a module is on the end of the traces: a bare stub and a
+trace to a high-impedance input look identical at this resolution.
+
 **PWDN's pull-up is a fitted component**, so the board does carry camera
 circuitry; the easy explanation that this unit simply has no camera is weaker
 than it looked. RESET floating proves less: a sensor's reset pin is a

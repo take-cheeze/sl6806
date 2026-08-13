@@ -699,7 +699,14 @@ static unsigned sweepPulls(uint32_t id, const char *name)
 
         Serial.print(sel);
         Serial.print(level ? ":1 " : ":0 ");
-        if (level && !found)
+        /*
+         * Prefer the vendor's selector over the lowest one that happens to
+         * read high. On a pad with an external pull-up every non-pull-down
+         * selector reads high, so "lowest that works" picked 6 - which turns
+         * out not to be a pull-up at all on a pad without one. The vendor's
+         * choice is the one with evidence behind it.
+         */
+        if (level && (!found || sel == PULL_VENDOR))
             found = sel;
     }
 
@@ -770,50 +777,6 @@ static int driveHighTest(uint32_t id, const char *name, unsigned drive)
     Serial.println(" after settling");
 
     return immediate;
-}
-
-static void driveTest(uint32_t id, const char *name)
-{
-    int after_release, settled;
-
-    sl6806_pad_configure(PAD_AT_REST(id, pull_sel));
-    sl6806_pad_write(id, 0);
-
-    sl6806_pad_set_func(id, SL6806_PAD_FUNC_OUTPUT);
-    delayMicroseconds(50);
-    sl6806_pad_set_func(id, SL6806_PAD_FUNC_INPUT);
-    after_release = sl6806_pad_read(id);
-
-    delayMicroseconds(PULL_SETTLE_US);
-    settled = sl6806_pad_read(id);
-
-    Serial.print("  ");
-    Serial.print(name);
-    Serial.print(": driven low then released reads ");
-    Serial.print(after_release);
-    Serial.print(", after settling ");
-    Serial.println(settled);
-
-    if (after_release == 0 && settled == 1) {
-        Serial.println("    moves in both directions - this line is a usable open drain.");
-    } else if (settled == 0) {
-        /*
-         * On a bus line this is fatal. On a control line it is not even bad
-         * news: a reset net is normally held low by a pull-down so the part
-         * stays in reset until the host says otherwise. Saying "I2C cannot
-         * work on it" about RESET, as this used to, was simply wrong.
-         */
-        Serial.println("    stays low after release - something external holds it down.");
-        if (id == CAM_PAD_A || id == CAM_PAD_B) {
-            Serial.println("    On a bus line that is fatal: no ACK can ever be seen.");
-        } else {
-            Serial.println("    On a control line that is ordinary - a pull-down keeps the");
-            Serial.println("    part in reset. What matters is the driven test below.");
-        }
-    } else {
-        Serial.println("    never seen low. Either the pull won the race - possible and");
-        Serial.println("    harmless - or driving the pad does not reach the pin.");
-    }
 }
 
 /*
@@ -894,6 +857,71 @@ static int holdTest(uint32_t id, const char *name)
         Serial.println("    both decay - something is actively driving this net.");
 
     return floating;
+}
+
+/*
+ * How long does an internal pull take to move the net?
+ *
+ * The hold test says which nets carry a resistor. It cannot say whether a net
+ * with no resistor runs anywhere, because a high-impedance input and an
+ * unconnected stub both just hold their charge. This asks the one thing that
+ * does differ between them: **capacitance**. Drive the pad to one rail,
+ * release it to an internal pull in the other direction, and time the flip.
+ * The internal pull is a roughly fixed resistance, so the time is a proxy for
+ * how much copper - and how many pins - hang off the pad.
+ *
+ * It is a comparison, not a measurement: the number means nothing on its own,
+ * only next to the same number from a pad whose wiring is known. The bus pads
+ * are the reference, since the FM tuner proves they reach a fitted chip.
+ *
+ * Sweep results say selectors 6..11, 13 and 15 read high and 4, 5, 12, 14
+ * read low even against the bus's external pull-ups - so 4 is a pull-down
+ * strong enough to be useful as the other direction.
+ */
+/*
+ * Selector 8 is the vendor's own for these pads and the sweep reads it high
+ * on all four. Selector 6 is not usable here: on pins 12, 13 and 15 it reads
+ * high only because their *external* pull-ups hold the line, and on pin 14,
+ * which has none, it does nothing at all. Measuring pin 14's rise time
+ * through it produced "(never)" and nearly became a finding about the board.
+ */
+#define PULL_UP_SEL     8u
+#define PULL_DOWN_SEL   4u
+#define PULL_LIMIT_US   50000u
+
+static uint32_t pullTime(uint32_t id, unsigned sel, int from)
+{
+    uint32_t start, waited;
+
+    /* Drive it to `from` with no pull, then release to the pull under test. */
+    sl6806_pad_configure(PAD_WHICH(id) | (SL6806_PAD_FUNC_OUTPUT << 7) | (3u << 4));
+    sl6806_pad_write(id, from);
+    delayMicroseconds(200);
+
+    sl6806_pad_configure(PAD_WHICH(id) | (3u << 4) | sel);   /* input + pull */
+
+    if (!sl6806_tick_mask())
+        return 0;
+
+    start = micros();
+    while ((waited = micros() - start) < PULL_LIMIT_US)
+        if (sl6806_pad_read(id) != from)
+            return waited;
+    return PULL_LIMIT_US;
+}
+
+static void pullTimeReport(uint32_t id, const char *name)
+{
+    uint32_t up = pullTime(id, PULL_UP_SEL, 0);     /* low -> pulled up   */
+    uint32_t dn = pullTime(id, PULL_DOWN_SEL, 1);   /* high -> pulled down */
+
+    Serial.print("  ");
+    Serial.print(name);
+    Serial.print(": pull-up took ");
+    if (up >= PULL_LIMIT_US) Serial.print("(never)"); else { Serial.print(up); Serial.print("us"); }
+    Serial.print(", pull-down took ");
+    if (dn >= PULL_LIMIT_US) Serial.print("(never)"); else { Serial.print(dn); Serial.print("us"); }
+    Serial.println();
 }
 
 /* ----------------------------------------------------------- reporting */
@@ -1246,6 +1274,25 @@ void loop()
             sub++;
             break;
         }
+        /*
+         * The control pads get swept too, which they should have from the
+         * start. Every reading of RESET in this sketch has assumed that
+         * selector 6 pulls *up* on bank 4 pin 14 - an assumption imported
+         * from two different pads, on the strength of them being in the same
+         * bank. If some selector does hold pin 14 high, "nothing pulls this
+         * net" needs rewriting; if none does, that is worth knowing before
+         * anything else is concluded from it.
+         */
+        if (sub == 2) {
+            (void)sweepPulls(CAM_PAD_RESET, "RESET pin 14");
+            sub++;
+            break;
+        }
+        if (sub == 3) {
+            (void)sweepPulls(CAM_PAD_PWDN, "PWDN pin 15");
+            sub++;
+            break;
+        }
         sub = 0;
 
         /*
@@ -1284,25 +1331,10 @@ void loop()
         /* Paced one item per call, for the reason given in STEP_PULL_SWEEP. */
         switch (sub) {
         case 0:
-            Serial.println("can software move them?");
-            driveTest(CAM_PAD_A, "SDA/SCL pin 13");
+            Serial.println("can the outputs reach the pins?");
             sub++;
             break;
         case 1:
-            driveTest(CAM_PAD_B, "SDA/SCL pin 12");
-            sub++;
-            break;
-        case 2:
-            driveTest(CAM_PAD_RESET, "RESET pin 14");
-            sub++;
-            break;
-        case 3:
-            driveTest(CAM_PAD_PWDN, "PWDN pin 15");
-            sub++;
-            break;
-        case 4:
-            Serial.println();
-            Serial.println("and can they be driven high?");
             if (driveHighTest(CAM_PAD_RESET, "RESET pin 14", 0)) {
                 ctrl_drive = 0;
                 Serial.println("    the vendor's drive 0 reaches the pin.");
@@ -1322,26 +1354,46 @@ void loop()
             }
             sub++;
             break;
-        case 5:
+        case 2:
             (void)driveHighTest(CAM_PAD_PWDN, "PWDN pin 15", ctrl_drive);
             Serial.println();
             Serial.println("what is on these nets? (charge held with nothing driving)");
             sub++;
             break;
-        case 6:
+        case 3:
             (void)holdTest(CAM_PAD_B, "SDA/SCL pin 12");
             sub++;
             break;
-        case 7:
+        case 4:
             (void)holdTest(CAM_PAD_A, "SDA/SCL pin 13");
             sub++;
             break;
-        case 8:
+        case 5:
             reset_floats = holdTest(CAM_PAD_RESET, "RESET pin 14");
             sub++;
             break;
-        default:
+        case 6:
             pwdn_floats = holdTest(CAM_PAD_PWDN, "PWDN pin 15");
+            Serial.println();
+            Serial.println("how much net hangs off each pad? (time for an internal");
+            Serial.println("pull to move it - a proxy for capacitance, read by");
+            Serial.println("comparison with the bus pads, which reach a fitted chip)");
+            sub++;
+            break;
+        case 7:
+            pullTimeReport(CAM_PAD_B, "SDA/SCL pin 12");
+            sub++;
+            break;
+        case 8:
+            pullTimeReport(CAM_PAD_A, "SDA/SCL pin 13");
+            sub++;
+            break;
+        case 9:
+            pullTimeReport(CAM_PAD_RESET, "RESET pin 14");
+            sub++;
+            break;
+        default:
+            pullTimeReport(CAM_PAD_PWDN, "PWDN pin 15");
             sub = 0;
             printAttempt();
             step = STEP_POWER_LOW;
