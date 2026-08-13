@@ -48,8 +48,9 @@ so it is worth being precise about which parts are real:
 | Keys — the two volume buttons | **Works.** They are an ADC resistor ladder, not GPIO; driver in [`cores/sl6806/sl6806_adc.c`](cores/sl6806/sl6806_adc.c), board map in the variant, 97 host tests. Verified on hardware. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | **Not yet**, though the ADC block itself now works — see `sl6806_adc.h`. `analogRead` needs a pin-to-channel map this board does not have. |
 | Backlight | **Works, on/off.** Dimming does not — `sl6806_backlight_begin(100)` lights the panel from cold or warm. The PWM counter does not run, so duty has no effect yet — but the reason §15 gave for that is now known to be wrong: `0x400E0000` is not dead, it is gated behind a module clock (§7n), and the PWM's bit in it has never been looked for. Worth one walk. PWM at `0x40084000`, channel 3, module id 68, pad bank 1 pin 0 function 4, and the pair clock enable at `0x40084014` bit 8 that nothing in the vendor's firmware writes. 13 host tests. |
-| Audio, SD | **Not yet.** Hardware confirmed present; no drivers. |
-| Bluetooth | **Candidate register block found, unread.** `0x400E2000` — the single literal reference to that address anywhere in FIRM, sitting next to the application's HCI command dispatcher. No bit in it has been checked against a real device yet. See [docs/BLUETOOTH.md](docs/BLUETOOTH.md) and `examples/BtProbe`. Note it sits in the same `0x400Exxxx` group as the camera front end, whose functional clock is a bit in `0x400E0000` — reachable only after a module clock gates that register open (§7n). Anything at `0x400E2000` most likely needs its own bit there first. |
+| Audio out | **Block confirmed on hardware 2026-08-13; configured and not running.** The audio controller is `0x40009000` — two DMA directions, a two-channel DAC path, three microphone inputs, volume, and a 128-word EQ coefficient RAM. Found by following the vendor's `/dev/audio0` to its codec dispatcher, and corroborated by a `rate % 8000` that picks between 24.576 MHz and 22.579 MHz. Its clocks — module id 37, romclk id 19 — are reachable from a payload with no unlock work, and with them **thirty registers come up at reset defaults**: playback levels at maximum, capture at zero, both DMA address registers at the base of SRAM. Descriptors are accepted and the completion flag raises itself, with the length reading back `0x12BC` exactly. **But 25 ms of audio retires in 10 µs across all twelve route/clock-source combinations**, which is configured-and-not-running — the PWM's failure and the camera's, and for both of those the answer was a functional-clock bit in `0x400E0000`. `examples/AudioWall` now walks that register's 32 bits with the buffer time as the witness, which is possible only because the same day's `BtProbe` got its gate open. Driver in [`cores/sl6806/sl6806_audio.c`](cores/sl6806/sl6806_audio.c), 93 host tests; [docs/AUDIO.md](docs/AUDIO.md). **This also corrects the peripheral map: `0x40009000` is not the timers** (those are `0x40099000`). |
+| SD | **Not yet.** Hardware confirmed present; no driver. |
+| Bluetooth | **Candidate register window found; its gate is decoded and RUN, 2026-08-13.** `0x400E2000`, next to the application's HCI command dispatcher — about ninety load sites over thirty registers in three clusters, including four free-running counters of 25 and 30 bits that read like a link controller's native clock. The block's functional clock is `0x400E0000` **bit 0** and its reset is `0x400E0008` bit 0, and the shared bring-up that opens the whole `0x400Exxxx` group is transcribed in [`cores/sl6806/sl6806_bt.c`](cores/sl6806/sl6806_bt.c) — which also settles that module 46 gates the *group*, not the camera, and that `0x4008011C`'s value is `0x31`. No bit's meaning is known. **On hardware the gate opens**: the PLL locks from a payload (`0x40080008` came back `0xD0010C04`, lock bit set), `0x400E0000` holds `0x21`, and four registers in the window wake up — but the counters stay at zero, so the link controller is not running. `examples/BtProbe`; see [docs/BLUETOOTH.md](docs/BLUETOOTH.md). |
 | Touch panel | **Interrupt works; coordinates written, not yet confirmed.** `examples/TouchDemo` resets the controller and watches its interrupt pad — that much has run on hardware. For the coordinates it bit-bangs I2C on the two TWI1 pads rather than waiting for the TWI controller to be found, and reads the CST816 the way the vendor does; that path has not been run yet. |
 | I2C on bare pads | **Works — confirmed on hardware.** `examples/CameraDemo` bit-bangs TWI 0 on two pads and reads the FM tuner's chip id: `0x5808`, the exact value the stock driver checks for, on a read-only pass. First device this framework has ever read over I2C, and it needs no TWI controller. |
 | Camera — the sensor | **The module is fitted and works under the stock firmware; from a payload `0x68` has always been silent, and the missing rail is now reachable — written, not yet run.** Decoded register-for-register in [`docs/sl6806_re_notes.md`](docs/sl6806_re_notes.md) §7h, and the rail in §7m. The vendor's `power_on` is pads, delays and "clock channel 6" — which turns out to be an LDO at 2.8 V, not a clock, and which it switches through the indexed register file. That file was the blocker and is now found: not an MMIO block at all but a chip at I2C `0x30` behind a mailbox at `0x400F7000+0x100`, driven by [`cores/sl6806/sl6806_regfile.c`](cores/sl6806/sl6806_regfile.c). `examples/CameraDemo` performs the vendor's six writes, and then — if the chip id answers — replays the vendor's own 203-pair init table, lifted out of flash by `tools/sl6806-sensortab`. Whether the sensor answers at all is the open question, and it needs a P20 and five minutes. |
@@ -336,14 +337,15 @@ Peripheral blocks identified so far:
 
 | Base | Block |
 |---|---|
-| `0x40000000` | pad / pin function mux |
-| `0x40009000` | timers |
+| `0x40000000` | pad / pin function mux; `+0x70`/`+0x74` is also a ten-domain power handshake ([`sl6806_bt.h`](cores/sl6806/sl6806_bt.h)) |
+| `0x40009000` | **audio controller** ([`sl6806_audio.h`](cores/sl6806/sl6806_audio.h), [docs/AUDIO.md](docs/AUDIO.md)). §7c filed this as "timers" from the shape of `+0x108`/`+0x208`; those are its two DMA directions, and the timers are at `0x40099000` |
 | `0x40070000` | DMA |
 | `0x40080000` | clock & reset ([`sl6806_cru.h`](cores/sl6806/sl6806_cru.h)) |
 | `0x400D9000` | LCD controller ([`sl6806_lcdc.h`](cores/sl6806/sl6806_lcdc.h)) |
-| `0x400E0000` | peripheral **functional** clocks, one bit each; camera is bit 6. Gated behind a module clock, which is why §15 read it as dead (§7n) |
+| `0x400E0000` | peripheral **functional** clocks, one bit each: camera 6, Bluetooth 0, the `0x400E2300` cluster 1, and 5 taken by the group's own bring-up. Resets are the matching bits of `+0x08`. Gated behind module clock 46, which is why §15 read it as dead (§7n) |
 | `0x400E1000` | camera front end / DVP ([`sl6806_dvp.h`](cores/sl6806/sl6806_dvp.h)) |
-| `0x400E2000` | **candidate** Bluetooth register block, unconfirmed on hardware ([`sl6806_bt.h`](cores/sl6806/sl6806_bt.h), [docs/BLUETOOTH.md](docs/BLUETOOTH.md)) |
+| `0x400E2000` | **candidate** Bluetooth window, three clusters, unconfirmed on hardware ([`sl6806_bt.h`](cores/sl6806/sl6806_bt.h), [docs/BLUETOOTH.md](docs/BLUETOOTH.md)) |
+| `0x40099000` | timers (`HAL_timer_*`) |
 | `0x400F7000` | SD/MMC + SPI flash host; `+0x100` is a serial master, and the indexed register file is the chip on it (§7m) |
 
 Flash layout: HLKJ bootloader at `0x0`, partition table at `0xF000`, then
@@ -361,29 +363,43 @@ framework depends on are annotated with their provenance in
 
 In rough order of how much they unlock:
 
-1. **Run the display driver on a real P20 and report what happens.** This is
+1. **The audio block, which is found, woken, and will not run.** Six candidate
+   causes are closed by measurement or call graph — the output route, the bit
+   clock, all 32 bits of `0x400E0000`, the general DMA controller, the
+   vendor's system clock init, and a hidden register behind the coefficient
+   window. What is left is that the block accepts a descriptor and retires
+   4796 bytes in 10 µs (480 MB/s, which this bus does not do) with every
+   register holding exactly what the vendor's own code puts there.
+   [docs/AUDIO.md](docs/AUDIO.md) has the whole elimination table and the four
+   sketches. **The most useful thing anyone can do here is have a fresh idea**
+   — this one has been narrowed about as far as reading can narrow it.
+2. **Walk `0x400E0000`'s 28 unattributed bits with the PWM counter as the
+   witness.** `examples/AudioWall` already walked them against an audio
+   witness and found nothing, but the audio witness may simply be insensitive
+   — the block has other problems. The PWM's stalled counter is a cleaner
+   test, and the walk only became possible on 2026-08-13, when `BtProbe` got
+   that register to hold bits from a payload. Four bits are attributed
+   (camera 6, Bluetooth 0, the `0x400E2300` cluster 1, group 5), so the walk
+   can check itself.
+3. **Run the display driver on a real P20 and report what happens.** This is
    worth more than any further reading of the dump. The whole stack is
    written and the panel is a QSPI display; what nobody knows is whether the
    two inferred bits of the transfer register and the guessed pixel byte
    order are right. [docs/LCD.md](docs/LCD.md) has the checklist. It cannot
    brick anything in payload mode.
-2. **This board's pinout.** The pad controller is done
+4. **This board's pinout.** The pad controller is done
    ([`sl6806_padctl.h`](cores/sl6806/sl6806_padctl.h)); what is missing is
    which pad each button and LED is on. The ids are immediates at the stock
    firmware's 54 GPIO call sites, so this is a reading exercise plus a meter.
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-3. **Find the PWM's bit in `0x400E0000`, and the backlight dims.** This is the
-   cheapest unclaimed result on the board. `0x400E0000` carries one functional
-   clock bit per peripheral and was recorded as dead from a payload for two
-   sessions; it is not dead, it is gated, and a mask ROM module clock opens it
-   — `sl6806_module_enable(46)` then the bit sticks (§7n, measured). Only the
-   camera's bit 6 is attributed. The PWM's counter has been stalled since §14a
-   behind exactly this, so a 32-bit walk with the counter as the witness
-   should finish it. The same walk is worth running for `0x400E2000` before
-   trusting `examples/BtProbe`'s zero read.
-4. ~~**Where the indexed register file lives**~~ — found (§7m): a chip at I2C
+5. ~~**Find the PWM's bit in `0x400E0000`**~~ — merged into item 1, which is
+   the same walk. `0x400E0000` was recorded as dead from a payload for two
+   sessions; it is gated, `sl6806_module_enable(46)` opens it (§7n), and the
+   whole vendor gate sequence including the PLL has now been run (§17,
+   measured).
+6. ~~**Where the indexed register file lives**~~ — found (§7m): a chip at I2C
    `0x30` behind a mailbox at `0x400F7000+0x100`, not a base address, which is
    why five searches for a base could not have worked. Read and written on
    hardware; its five LDO rails decode to real supply voltages.
@@ -392,10 +408,10 @@ In rough order of how much they unlock:
    clock families and the whole front end all check out and the sensor never
    starts (§7n). What is left there needs SWD or `MODE=firmware`, not more
    probing.
-5. **An FM driver**, now the cheapest working device on the board: an
+7. **An FM driver**, one of the cheapest working devices on the board: an
    RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
    part, published register map, and the id read is done.
-6. **The TWI controller's base address** — demoted, because it is now a speed
+8. **The TWI controller's base address** — demoted, because it is now a speed
    problem rather than an access one. `examples/TouchDemo` bit-bangs bus 1
    and `examples/CameraDemo` bit-bangs bus 0, both on pads alone, and the
    second has read a real device. What the base would buy is throughput,

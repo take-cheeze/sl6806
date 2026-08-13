@@ -1971,7 +1971,8 @@ are legible where FIRM's are buried.
 | Base | What | Evidence |
 |---|---|---|
 | `0x40000000` | pad / pin function mux | `0x00820650` rewrites four byte-lanes of `+0x04` (per-pad function nibbles) and a 5-bit field at `+0x08`, switching one bus between two functions |
-| `0x40009000` | timers | channels at 0x100 stride (`+0x108`, `+0x208`) with write-1-clear flags and per-channel callbacks; register triples at 0x20 stride |
+| `0x40009000` | ~~timers~~ **the audio controller** | RETRACTED, see §16. Every word of the original evidence — "channels at 0x100 stride (`+0x108`, `+0x208`) with write-1-clear flags and per-channel callbacks; register triples at 0x20 stride" — is right, and describes this block's two DMA directions, their interrupts, and the three playback volume channels. The timers are `0x40099000`, as this same section says four subsections down |
+| `0x40099000` | timers | FIRM's `HAL_timer_*`; named while eliminating candidates for the PWM |
 | `0x40070000` | DMA **control only** | per-channel IRQ status at `+0x24`/`+0x2c`, callback table indexed by channel, request routing at `+0x00`/`+0x20`/`+0x28`. The data path is **not** here — see `0x40001000` below |
 | `0x40001000` | **DMA channel registers** | 8 channels at `+ch*0x40`, `{ctrl, src, dst, len}`; §14b |
 | `0x40084000` | **PWM** | 6 channels at `+0x20 + ch*0x20`; channel 3 is the backlight; §14a |
@@ -2755,7 +2756,7 @@ Channel registers, from the accessors in the blob at `0x00811E48`–`0x00811EC0`
 
 | Off | Role |
 |---|---|
-| `+0x00` | control. bit 4 = **run**; bit 8 = update trigger, and the same bit is polled until clear; bit 28 polled as busy; `0x40` written at init; `0x00811EC0` writes `src \| (div << 8)` |
+| `+0x00` | control. bit 4 = **run**; bit 8 = update trigger, and the same bit is polled until clear; bit 28 polled as busy; `0x40` written at init. ~~`0x00811EC0` writes `src \| (div << 8)`~~ — **corrected, see §18: that write goes to the pair register, not here** |
 | `+0x04` | **`(period << 16) \| duty`** — written by `0x00811D04`, which returns without writing unless `period >= duty` |
 | `+0x10` | bit 0 = enable; `0x00811E9A` writes `(x << 16) \| (mode << 1) \| bit0`, and forces bit 0 low first if bits [3:1] change |
 | `+0x14`, `+0x18`, `+0x1C` | three more `(hi << 16) \| lo` pairs |
@@ -3321,8 +3322,14 @@ falls inside that range). §14a's own host-side read of `0x400E2000` in
 bootloader mode already came back **all zeros**, alongside `0x400E0000` and
 `0x40084000` — consistent with this block sharing the same unlocked PLL and
 `0x400E0000` gate as everything else behind that wall, not evidence against
-it being real hardware. `0x00D9A768` remains unexamined; it sits in the same
-small cluster of bring-up helpers as `0x00D9A7FC`/`0x00D9A734`/`0x00D9A74C`.
+it being real hardware.
+
+> **Superseded, §17:** `0x00D9A768` is not unexamined any more — it is
+> `sl6806_periph_reset`, a clear/delay/set pulse on `0x400E0008`, and it was
+> already in `cores/sl6806/sl6806_module.c` under that name from the camera
+> work. `0x00D9A7FC` is likewise more than "starts the PLL": it is the whole
+> group bring-up, guarded on module 46. And this block's own bit in
+> `0x400E0000` — left open here — is **bit 0**.
 
 **Not established:** what any bit means (the mixed 7/8/10/12/14/16/18-bit
 field widths are consistent with radio/link timing parameters but that is a
@@ -3341,3 +3348,879 @@ payload too, and neither it nor the gate carried the core or USB away.
 `examples/BtProbe` reproduces §14a's zero-read from a payload rather than
 the host command, and is the sketch to re-run once that unlock work (Next
 actions item 11) lands.
+
+---
+
+## 16. The audio controller — `0x40009000`, found by following a device name
+
+Static, from the dump, 2026-08-13. Nothing in this section has been run on
+hardware; `examples/AudioProbe` is the sketch that would change that, and it
+takes five minutes.
+
+### How it was found
+
+Not by scanning for base addresses — §7c's literal scan had already seen this
+block and misfiled it (below). By following the vendor's own device names.
+
+The application keeps a device registry with string names, two of which are
+`/dev/audio0` (`0x00C7595C`) and `/dev/audio1` (`0x00C75950`). The routine
+that opens them, `0x00D72418`, logs
+
+```
+-audio_driver_open _volume=====%d cfg1.is_headphone:%d
+```
+
+Everything below it reaches hardware through a four-entry table of driver
+objects at SRAM `0x0082B430`. Entry 1 is the audio stream device: its ops are
+installed by `0x00D9A0A4`, and its ioctl `0x00D9A024` forwards every command
+it does not handle to `0x00D96824` — a 145-way `tbh` jump table whose literal
+pool is nothing but addresses in `0x40009000..0x400092BC`.
+
+```sh
+tools/sl6806-xref dump.bin 0x00C8EABD          # the open's log string
+tools/sl6806-xref dump.bin 0x00C7595C          # "/dev/audio0"
+```
+
+Two independent confirmations before a single register is decoded:
+
+**Three microphones.** `0x00D3C688` logs `[driver_audio] AMIC0_GAIN set to:%d`
+(and AMIC1, AMIC2) and reaches the same dispatcher with commands `0x2D..0x32`.
+
+**The rate split.** `0x00D979E0` computes `rate % 8000` and picks between two
+constants handed to `0x00807300`: `24,576,000` (= 48000 × 512) and
+`22,579,000` (≈ 44100 × 512). A modulo that separates the 48 kHz family from
+the 44.1 kHz one, and two master clocks at 512 fs, is not something a
+non-audio peripheral does.
+
+### RETRACTED: §7c's "`0x40009000` = timers"
+
+§7c's evidence was "channels at 0x100 stride (`+0x108`, `+0x208`) with
+write-1-clear flags and per-channel callbacks; register triples at 0x20
+stride". Every word of that is accurate:
+
+- `+0x108` and `+0x208` are the playback and capture DMA control registers;
+- their write-1-clear flags are bits 8 and 10, the two interrupts each
+  direction raises;
+- the per-channel callbacks are the four function pointers the IRQ 30 handler
+  at SRAM `0x0080D8F8` dispatches to;
+- the triples at 0x20 stride are the three playback volume channels at
+  `+0x134`.
+
+The same section already carried the disconfirmation and nobody joined it up:
+*"FIRM's `HAL_timer_*` is at `0x40099000`, a different block"*. And the
+literal scan over the **HLKJ bootloader** — the scan §7c says named most of
+that table — returns nothing at all for `0x40009000`, so the attribution never
+had a second source. This is the second time in these notes that a correct
+structural description has been attached to the wrong peripheral (the first
+was `0x40040000`, §7l); both times the giveaway was that only one program in
+the image ever touched it.
+
+### The clocks, and why this is the reachable one
+
+```
+0x400F70D8 |= 2                 0x00D9674A, before either clock
+module_clock_enable(37)         0x00D96754, ROM 0x1EC0 -> 0x1C5C
+romclk_enable(19)               0x00D9675A, 0x008051EC -> ROM 0x20EC
+                                   -> 0x40080088 |= 1
+IRQ 30, priority 2              0x00D967D0..0x00D967E4
+```
+
+**Neither of those is `0x400E0000`.** Every other peripheral this project has
+left unfinished — the PWM's counter (§14a), the camera's MCLK (§7n) — is stuck
+behind that register and the PLL in front of it. Audio's two clocks are a mask
+ROM module id and a mask ROM romclk id, both of which `sl6806_module.h` and
+`sl6806_romclk.h` already drive from an ordinary payload. That makes this the
+cheapest untested peripheral on the board by a wide margin.
+
+The sample-rate PLL is a *different* PLL from `0x40080008`: `0x00807300` in the
+SRAM blob programs CRU `+0x10` and `+0x14`.
+
+```c
+while (CRU[0x14] & (1 << 11)) ;                     /* busy */
+CRU[0x10] = (CRU[0x10] & 0xFC1F0000) | 0x3000 | (select << 5);
+CRU[0x14] = (CRU[0x14] & 0x3800) | (1 << 31) | (1 << 10) | (ratio << 14);
+```
+
+`select`/`ratio` are `3`/`0x3126` for 24.576 MHz and `2`/`0x186C2` for
+22.579 MHz. The ratio is 17 bits at `[30:14]`; bit 31 above it is the enable.
+
+### The data path
+
+`0x0080D9BC` (playback) and `0x0080D964` (capture) are the same routine one
+page apart:
+
+```c
+play(handle, buf, len):
+    if (len & 3) return -1;                        /* rejected, not rounded */
+    *(u32 *)0x4000910C = buf;
+    field(0x40009108, 0xFFFF0000, len);
+    *(u32 *)0x40009104 = ((len * 3 / 4) << 16) | 1;
+    /* and, from 0x00D97A5E: */
+    *(u32 *)0x40009108 |= 0x10;
+```
+
+The three-quarter point in `+0x104` is the refill interrupt's threshold. The
+handler reads the control register and writes the same word straight back —
+so the flags are write-1-to-clear — and dispatches bit 8 and bit 10 to two
+different callbacks. Which is the watermark and which is end-of-buffer is
+inferred from the existence of the three-quarter point, not read.
+
+Full register map, with per-register provenance, is in
+[`cores/sl6806/sl6806_audio.h`](../cores/sl6806/sl6806_audio.h) and
+[docs/AUDIO.md](AUDIO.md), kept as one source of truth rather than duplicated
+here.
+
+### What is still open
+
+1. **The output route.** `+0x08` is two identical 16-bit halves (proved by
+   `0x00D93F54` and `0x00D94028` being the same function with every constant
+   shifted 16), and it has four settings selected by the driver state byte at
+   `+0x113`. The strings nearby are `-play status to spk play` and
+   `-audio switch earphone`. Which number is the speaker is unknown.
+2. **Whether the speaker has an amplifier enable.** §7k's PSMP dump has a
+   `spk_switch` key. If that is a GPIO it is not in the variant's pad map.
+3. **The sample format.** The config struct's channel and width bytes come
+   from a caller this analysis did not follow.
+4. **The coefficient RAM** at `+0x400..+0x5FC`, 128 words, cleared at init
+   under a *second* clock domain (module 32, romclk 45, and bit 2 of
+   `0x40000020`) that the init takes and gives back. The application logs
+   `hardware EQ config to %d // 0: None, 1: pop, 2: rock, ...`.
+
+## 17. The `0x400Exxxx` group's gate, decoded — and what it says about §7n
+
+Static, 2026-08-13, from `0x00D9A7FC` and the two module registrations around
+`0x00D98C9C`. This supersedes the "still unexamined" wording at the end of
+§15's Bluetooth notes.
+
+```c
+if (module_clock_is_enabled(46))   return;      /* ROM 0x1E54 — a once-guard */
+power_request();                                /* 0x00D9A7AC */
+*(u32 *)0x40080008 = 0xC0000C04;
+while (!(*(u32 *)0x40080008 & (1 << 28))) ;
+*(u32 *)0x40080008 |= 0x10000;
+module_clock_enable(46);
+delay(10);
+*(u32 *)0x4008011C = 0x31;
+delay(10);
+periph_enable(5);                               /* 0x400E0000 bit 5 */
+```
+
+and the power request, which is at the **pad-mux** base and is the only code
+in the dump that touches either register:
+
+```c
+for (i = 0; i < 10; i++)
+    if (!(*(u32 *)0x40000070 & (1 << (16 + i)))) {
+        *(u32 *)0x40000070 |= (1 << i);
+        while (!(*(u32 *)0x40000070 & (1 << (16 + i)))) ;
+    }
+*(u32 *)0x40000074 = 0;
+```
+
+Ten request bits in `[9:0]`, ten acknowledgements in `[25:16]`. The teardown
+(`0x00D9A7E4`) sets `0x40000074` bit 0, writes `0x40000070 = 0`, waits for
+zero.
+
+Four things this settles:
+
+1. **Module 46 gates the group, not the camera.** §7n measured that
+   `sl6806_module_enable(46)` makes `0x400E0000` hold bits and recorded 46 as
+   "the camera front end". It is the register clock for the whole
+   `0x400Exxxx` window — which is why one module id appeared to belong to a
+   peripheral it shares nothing else with, and why the same id turns up in
+   Bluetooth's bring-up.
+2. **`0x400E0000` bit 5 belongs to the group**, taken by the shared path
+   before any peripheral's own bit. Nothing else claims it.
+3. **`0x4008011C`'s value is `0x31`** — §14a's open item, now sighted a second
+   time from a completely different peripheral. `0x30` on the way down, one
+   bit apart, which is an enable and not a reparent.
+4. **`0x00D9A768` is `sl6806_periph_reset`** — `0x400E0008 &= ~bit; delay;
+   |= bit`. It was already in `sl6806_module.c`, named from the camera work;
+   §15's Bluetooth paragraph calling it unexamined was out of date with the
+   tree.
+
+And two new `0x400E0000` bit attributions, from the two registrations that
+call the sequence: **bit 0** for the `0x400E2000` cluster (`0x00D98CAE`) and
+**bit 1** for the `0x400E2300` cluster (`0x00D989E0`), each followed by a
+reset on the matching bit of `+0x08`. That takes the attributed bits from one
+to four, which is worth having before the walk item 4 of the README's "where
+to help" describes: a walk with four known-good answers in it can be checked.
+
+`cores/sl6806/sl6806_bt.c` performs the whole sequence, bounded at every poll,
+and `examples/BtProbe` runs it between two passes over the window.
+
+### MEASURED, 2026-08-13 — both blocks, on a P20 Player
+
+Two runs, `examples/AudioProbe` and `examples/BtProbe`, in payload mode. The
+device stayed on the USB bus throughout both.
+
+**The audio controller is real.** Cold, all 32 probed registers read
+`0x00000000`. After `sl6806_module_enable(37)` and romclk 19 — two writes,
+no PLL, nothing near `0x400E0000` — thirty of them come up at once:
+
+```
++0x018  0x00000200      +0x200  0x02300700    +0x224  0x00010801
++0x07C  0x24924924      +0x208  0x00000800    +0x228  0x0000A000
++0x080  0x24924924      +0x20C  0x00800000    +0x254/8, +0x284/8, +0x2B4/8 same
++0x100  0x00000700      +0x134  0x00010801
++0x108  0x00000800      +0x138  0x0000A1FF
++0x10C  0x00800000      +0x154/8, +0x174/8 same
+```
+
+Three readings fall out, and none of them was predicted closely enough to be
+confirmation bias:
+
+- **Playback levels reset to `0x1FF` (maximum) and capture levels to `0`.** A
+  DAC comes up open and an ADC comes up shut. This confirms both that the
+  block is audio and that §16's TX/RX assignment is the right way round.
+- **Bit 16 resets *set* on all seven channels**, and it is the one bit the
+  vendor's init clears, on exactly the three playback channels. §16 marked it
+  `[I]` from the clear alone; this makes it `[M]`.
+- **Both DMA address registers reset to `0x00800000`**, the base of SRAM.
+
+Unpredicted: `+0x108` and `+0x208` both reset with bit 11 set, which is
+neither interrupt flag; `+0x100` resets with `[10:8]` set; `+0x07C` and
+`+0x080` reset to `0x24924924`, i.e. every 3-bit field at 4.
+
+**And the write test in that run was wrong.** It reported "drops writes" for a
+block that had visibly just woken, because it wrote `0x5A5A5A50` to a DMA
+address register and compared for equality. That is not a valid SRAM address
+here. This is §14a's PWM mistake in a new costume — *a write test is only a
+test if the value is one the register is allowed to keep* — and it cost
+`ToneDemo` the run, since `sl6806_audio_begin()` was vetoing on it. Both are
+fixed: the probe prints old/written/read-back for four registers, and begin()
+no longer vetoes.
+
+**The `0x400Exxxx` gate opens from a payload.** `sl6806_bt_begin()` ran the
+whole §17 sequence:
+
+```
+0x40080008 = 0xD0010C04     written 0xC0000C04; bit 28 LOCK came back set
+0x400E0000 = 0x00000021     bits 5 and 0, both held
+0x400E0008 = 0x00000001
+```
+
+Two open items from §14a close here. **The PLL locks** — §14a read it stopped
+at `0x00000801` in bootloader mode and could not get past it. And
+**`0x4008011C = 0x31` does not reparent the core or USB clock** — the write
+§14a called "plausibly safe, but untried"; the console survived it twice.
+
+Four registers in the Bluetooth window came up from zero — `+0x078`
+= `0x0C019A14`, `+0x07C` = `0x06060502`, `+0x1B4` = `0x00003301`, `+0x21C`
+= `0x00400000` — and **they persist across a re-upload**, which a second run
+built with `-DBTPROBE_READ_ONLY=1` demonstrated by finding all four in its
+"cold" pass. Worth knowing before anyone reads a cold pass as cold.
+
+The four counters at `+0x228`..`+0x234` stayed at zero for all eight samples.
+The window is powered and partly readable; the link controller is not running.
+Nothing configured it, so that is the expected result rather than a negative.
+
+**What this unblocks.** The README's long-standing "find the PWM's bit in
+`0x400E0000`" item was blocked on a register that would not hold a bit from a
+payload. It holds them now, and four of its bits are attributed (camera 6,
+Bluetooth 0, the `0x400E2300` cluster 1, and 5 for the group), so a walk over
+the remaining 28 with the PWM counter as the witness has known-good answers to
+check itself against.
+
+### MEASURED, second run — the DMA moves a buffer, and the DAC has no path
+
+`examples/ToneDemo`, same day. Every buffer submitted through
+`sl6806_audio_play()` completed:
+
+```
+buffer 1: completion flag set after 1 ms, ctrl=0x12BC0910
+```
+
+`0x12BC` is 4796, the buffer length in bytes, so **the length register holds
+the descriptor exactly** and the completion flag raises itself. Five hundred
+buffers in a row, no failures. The digital path is confirmed end to end.
+
+No sound, and the same transcript says why in the line above: `DAC (+0x008) =
+0x0`. Nothing in the framework had ever written the output route. The
+corroborating number is the timing — 4796 bytes of 48 kHz 16-bit stereo is
+**25 ms** of audio and it completed in under 1 ms, which is what a DMA
+draining into a disconnected output stage does.
+
+`sl6806_audio_route()` now transcribes the vendor's four cases from
+`0x00D93F54` / `0x00D94028`:
+
+```
+route 0   v = (v & ~0x0041) | 0x2080 | 3   and 0x40009080[14:12] = 0
+route 1   v =  v            | 0x2040 | 3
+route 2   v = (v & ~0x2000)          | 2   and 0x40009014 |= 3
+route 3   v =  v            | 0x2040 | 3   and 0x40009014 |= 3
+```
+
+then a 2 ms wait, the 5-bit trim at `+0x08 [12:8]`, and the two DAC enables
+again. Channel 1 is every constant shifted left 16, which is what made the
+two-half reading of `+0x08` certain in the first place.
+
+Smaller results from the same pair of runs:
+
+- `+0x10C` and `+0x20C` **keep an SRAM address** written to them.
+- `+0x138`: wrote `0x1AA`, read `0x800001AA`. The 9-bit level field is where
+  §16 says; bit 31 is hardware-set and unexplained.
+- `+0x104`: wrote `0x00100001`, read `0x00100000`. The watermark field holds
+  and **bit 0 does not stick** — write-only or self-clearing. The vendor
+  writes it the same way; do not test for it.
+- **Bit 11 of `+0x108` clears when a descriptor is armed** and returns after
+  the transfer. That is an idle flag, and the cheapest witness that a transfer
+  is in progress.
+- Module 37 and romclk 19 **survive a re-upload**, so a probe's "cold" pass is
+  only cold after a power cycle. The same is true of the `0x400E0000` gate.
+
+**Next**: which of the four routes is the speaker and which the headphone
+jack. `ToneDemo` walks all four and prints a mean completion time per route; a
+route that pushes the mean towards 25000 µs is one being paced by a real
+sample clock, and that is a stronger answer than an impression of a sound.
+
+### MEASURED, third run — and the bit clock, which was never read
+
+All four output routes wrote cleanly — `+0x08` went from `0x00000000` to
+`0x20832083` and friends — and every one still retired a 25 ms buffer in a
+**mean of 10 µs**. 4796 bytes in 10 µs is 480 MB/s on a 64 MHz Cortex-M4:
+not a transfer, a descriptor being read and discarded.
+
+That run carried a methodological bug worth recording next to §14a's. The
+sweep OR'd each route on top of the last, because the vendor's setter is a
+read-modify-write and the sketch never cleared `+0x08` between attempts —
+route 1 should have been `0x2043` and read `0x20C3`. **Only route 0 was
+actually tested.** A sweep over a read-modify-write register has to reset it
+between settings, and this is the second time in these notes that a sweep
+measured something other than what it thought.
+
+**What was missing is the vendor's stream start, `0x00D9662C`** — a different
+routine from the init at `0x00D96710`, and one nothing in this project had
+read:
+
+```c
+module_clock_disable(2); delay(10);
+module_clock_enable(2);  delay(10);
+romclk_set(44, 8);       /* ROM 0x2B1A */
+romclk_enable(44);       /* 0x40080094 |= 1 */
+0x40009400 |= 0x80;
+/* and one of: 0x40009080[11:9] = 6, 0x4000907C[26:24] = 6, 0x4000907C[5:3] = 6 */
+```
+
+`ROM 0x2B1A` is in the mask ROM's **third** clock family, the setter
+dispatched from `0x289C` — id and value, as against the enable-only family at
+`0x20EC` that `sl6806_romclk.h` tabulates and the module ids at `0x1C5C`.
+That makes three distinct clock mechanisms in this ROM, and only two of them
+were known. Its whole body for id 44:
+
+```
+0x40080094[10:8] = value - 1
+```
+
+**And the arithmetic identifies it.** The vendor passes 8:
+
+    24,576,000 / 8 = 3,072,000 = 64 x 48000
+    22,579,000 / 8 = 2,822,375 = 64 x 44100
+
+Both master-clock families land on exactly 64 fs, the bit clock for 32-bit
+stereo frames. A divider producing 64 fs from either is the audio bit clock.
+
+The three 3-bit source fields the same routine touches have a reset value of
+4 — `+0x07C` and `+0x080` both come up `0x24924924`, which is every 3-bit
+field at 4 — and the vendor moves exactly one of them to 6. Which one is
+playback is unknown; `examples/ToneDemo` sweeps all three against the four
+routes and times all twelve.
+
+Deliberate deviation in `sl6806_audio_clock_start()`: the vendor cycles module
+clock 2 off and on, this only enables it. Turning off an unidentified module
+clock from the code doing the turning off is what `sl6806_module.h` has a rule
+about. If the clock needs the cycle, that is the first thing to try.
+
+### MEASURED, fourth run — twelve for twelve, and the third functional clock
+
+All twelve route/clock-source combinations, and every register holding exactly
+what was written to it:
+
+```
+PLL sel  (0x40080010) = 0x00103060    [6:5] = 3, as written
+PLL rat  (0x40080014) = 0x8C498C00    ratio [30:14] = 0x3126, bit 31, bit 10
+bitclk   (0x40080094) = 0x00000701    divider 8, enabled
+DAC      (+0x008)     = 0x20832083 / 0x20432043 / 0x00020002 per route
+ctrl     (+0x108)     = 0x12BC0910    the descriptor, every time
+```
+
+and **a mean of 10 µs, identically, in all twelve**. Neither the route nor the
+bit clock nor the source mode changes anything.
+
+This is the third time this project has met the same shape, and
+`cores/sl6806/sl6806_module.h` describes it in its own opening paragraph:
+
+> A module clock gives a peripheral its REGISTERS. It does not give it its
+> FUNCTION. That distinction cost this project two peripherals and a lot of
+> bench time, and both failures looked identical from the outside.
+
+§14a's PWM: every register write accepted, counter never ran. §7n's camera:
+full geometry configuration accepted and read back, no MCLK. Audio now: every
+register accepted, no pacing. For the camera the answer was `0x400E0000`
+bit 6; for the PWM it was a clock enable nothing in the vendor's firmware
+writes.
+
+**Only four of `0x400E0000`'s 32 bits are attributed** — camera 6, Bluetooth
+0, the `0x400E2300` cluster 1, and 5 taken by the group bring-up — and until
+this same day the register would not hold a bit from a payload, so nobody
+could walk it. `examples/BtProbe` changed that.
+
+`examples/AudioWall` walks it with the audio buffer's completion time as the
+witness: set one clear bit, play four buffers, time them, restore the
+register, move on. It only ever *sets* bits and never clears one that was
+already set — turning off a functional clock something else is using, the USB
+the console rides on for instance, is the one way that walk could take the
+device with it.
+
+It also asks something the playback direction cannot: **does the DMA engine
+touch memory at all?** A capture buffer is pre-filled with a pattern, handed
+to the RX descriptor, and checked afterwards. If the pattern survives, the
+completion flag is not a transfer, and §16's "the descriptor path runs" is
+weaker than it reads. Capture is the only direction where the engine can be
+caught in the act, which is why `sl6806_audio_capture()` exists at all.
+
+**Refactor while here:** the group bring-up moved from `sl6806_bt.c` to
+`sl6806_module.c` as `sl6806_periph_group_begin()`, with the power handshake's
+constants alongside it. Module 46 gates the whole `0x400Exxxx` window rather
+than Bluetooth, and audio now needs the same gate for the walk — keeping it in
+the Bluetooth driver had stopped being honest about what it is.
+
+### MEASURED, fifth run — RETRACTION, and what audio was actually missing
+
+`examples/AudioWall`. Three results, in order of how much they change.
+
+**1. RETRACT "the descriptor path runs".** The capture test — pre-fill a
+buffer, hand it to the RX descriptor, wait, count what changed:
+
+```
+after 100015 us: 0 of 64 words changed
+```
+
+**The engine does not touch memory.** So §16's completion flag is not
+completion: a descriptor is accepted and retired, which is exactly as
+consistent with a transfer that never happened. `SL6806_AUD_IRQ_DONE` is
+probably an error or abort flag; an instant raise on a block with no data path
+fits every observation. What survives is narrow and still real: the length
+register holds what it is given, and `+0x10C`/`+0x20C` hold an address.
+
+**2. All 32 bits of `0x400E0000`, no effect.** Every one gave an identical
+witness. `0x400E0000` is not audio's gate. (The walk's own witness was
+degraded — the baseline read 50005 µs, which is `(100000 + 100000 + 10 + 10)
+/ 4`: two of every four buffers timed out and two returned instantly, an
+alternation the earlier `ToneDemo` runs never showed. Worth understanding
+before the walk is trusted as a *sensitive* negative, though a bit that fixed
+the block would still have moved it.)
+
+**3. WITHDRAWN WITHIN THE HOUR: "the audio block does not move its own
+data".** `0x00D97ED8` claims one of eight DMA channel slots, enables module
+clock 33 and configures `0x40001000 + ch*0x40` — the block §7c describes as
+`{ctrl, src, dst, len}` and §14b found. It is the only code in the audio
+HAL's address region that loads `0x40001000`, and that was taken as evidence
+that the audio FIFO is fed by the general DMA controller.
+
+Its one caller in FIRM is `0x00D3EAC0`, whose literal pool holds
+`lcdc_dma_write`, `lcdc_set_descriptor` and `lv_lcd_init`. **It is the LCD
+controller's DMA setup.** `0x00D97ED8` is a shared HAL routine and its only
+identified user is the LCDC; "it sits in the audio region" was proximity, not
+evidence — the same mistake in kind as §7c filing `0x40009000` as the timers,
+made in the same session that corrected it.
+
+So what audio is missing remains **open**. Ruled out by measurement: the
+output route, the bit clock, and all 32 bits of `0x400E0000`. Still true and
+still not evidence about audio: there is a DMA controller at `0x40001000`
+behind module clock 33, and at least the LCDC uses it.
+
+The way to settle whether audio goes through it is to find what fills the DMA
+config struct on the audio path. `0x00D3EAC0` builds a recognisable one for
+the LCDC — request id 9, source width 32, destination width 16, burst sizes 8
+and 4, and a completion callback — so an audio equivalent would be legible if
+it exists.
+
+**Method note, third of these now.** The witness was chosen well — a capture
+into a pre-filled buffer is the one test that can catch a DMA engine in the
+act, and it overturned a conclusion three runs of playback-only evidence had
+built up. §14a's lesson was "do not trust a status bit as a success test";
+this adds two more. **A completion flag is not a transfer** - only a test that
+observes memory can say that. And **a literal's address region is not its
+owner**: the DMA claim above survived about forty minutes, and would have
+survived into a hardware run if the caller had not been checked.
+
+## 18. The PWM's register spec, re-inspected — and one row of §14a corrected
+
+Static, from the blob's accessors. Prompted by the audio work turning up a
+third mask ROM clock family nobody had used, on the theory that the PWM's
+stalled counter might have the same cause. It does not — but the inspection
+found a misattribution worth fixing.
+
+### `0x00811EC0` does not write the channel's control register
+
+§14a's channel table files `src | (div << 8)` under `+0x00`, the control
+register. `cores/sl6806/sl6806_pwm.h` files the same write under the *pair*
+register at `0x40084010 + (ch >> 1) * 4`. They cannot both be right, and the
+two readings collide on bit 8 — which §14a needs as the update trigger and
+`sl6806_pwm.h` measured as the pair clock enable.
+
+The accessors settle it. All of them fetch their target from one cached
+pointer table at SRAM `0x0082B3F8`, and they index it differently:
+
+```
+0x00811D30   update trigger    r0 = T[ch + 4]   -> 0x00811E62, sets bit 8
+0x00811D40   poll update       r0 = T[ch + 4]   -> 0x00811E6C
+0x00811D50   src | div << 8    r0 = T[ch + 1]   -> 0x00811EC0
+```
+
+Three slots apart, so **different registers**. And the layout falls out of the
+arithmetic: six channels and three pairs give `T[1..3]` = the three pair
+registers and `T[4..9]` = the six channel controls, with `T[0]` the global at
+`+0x00` of the block. The `src | (div << 8)` caller is therefore indexed *by
+pair*, not by channel, which is exactly what a per-pair register is.
+
+**So `sl6806_pwm.h` is right and §14a's table row is wrong.** The row is
+struck through above. This also retro-explains the measured writable mask:
+the pair register only retains `0x10F`, so `src` is `[3:0]` and the "divider"
+is the single bit 8 that turned out to be the pair clock enable — the bit
+twelve hardware sessions went without.
+
+### And the negative that prompted the look
+
+The PWM code in the blob (`0x00811CE4`–`0x00811EC0`) makes **no call to any of
+the three mask ROM clock families**. Scanning the blob and stage 1 for calls
+to `0x008051E8` (the setter, ROM `0x289C`), `0x008051EC` (the enable family,
+ROM `0x20EC`) and `0x008051F0` (its disable) puts every single site inside one
+region, `0x00806800`–`0x00807100`, which is the vendor's **system clock init**
+— a routine that disables a long list of clocks and then enables the ones the
+product needs.
+
+Two things follow. The PWM does not ask for a clock of its own, so the audio
+bit clock's explanation does not transfer to it. And more generally: **a
+payload never runs that clock init.** The boot ROM brings up enough for USB
+and SRAM; `0x00806800`+ is where the vendor's firmware configures the rest of
+the tree, and nothing in this framework has ever executed it or transcribed
+it. That region is worth a section of its own, and is a better lead for the
+PWM counter than anything §14a has left.
+
+## 19. The vendor's system clock init, read — and it is not the answer either
+
+Static, from the SRAM blob. Followed up because §18 found that every call site
+for all three mask ROM clock families lives in one region, `0x00806800`–
+`0x00807100`, which a payload never executes — a promising-looking explanation
+for both the stalled PWM counter and the unpaced audio DMA.
+
+**It is a clock-tree *reconfiguration* path, not a bring-up.** The shape:
+
+```
+romclk_off  17 65 18 19 56 57 20 44 51 48 37 22 36 23 24 50 25 26 34 27 35
+            28 29 30 32 40 38 52 54 61 63    (and a second, shorter sweep)
+module_off  39, 37, 88
+set         id 5 = 1, id 4 = 1, id 6 = 1, id 64 = 1
+...
+module_on   39, 37, 88
+romclk_on   0, 63, 39, 21, 2, 38, 41
+set         id 3 = 1, id 4 = 1, id 5 = 1, id 6 = 1
+```
+
+Disable a long list, change some dividers, put it back. That is a
+frequency-change or suspend/resume routine, and it reveals no enable that this
+framework is missing. Ids 3..6 and 64 are core/bus dividers set to 1.
+
+Two things worth keeping out of it:
+
+- **Module 37 (audio) and 39 and 88 are cycled here as a group**, which is at
+  least consistent with 37 being a real module id for a real block.
+- **romclk 44 — the audio bit clock divider — is in the disable sweep**, so
+  the id is genuine and known to the vendor's clock manager.
+
+Neither changes what a payload has to do. **This lead is closed.**
+
+### And a caveat on §5's capture test, which was overstated
+
+The run recorded "0 of 64 words changed" as showing the DMA engine cannot
+touch memory. `sl6806_audio_begin()` performs the vendor's *playback*
+bring-up: it sets `+0x100` bit 0 and never opens the capture direction the way
+the mode-1 open does. The codec dispatcher's only writes to `+0x200` are bits
+6, 7, 14 and 15 — no analogue of the TX enable — but "RX was never opened the
+way the vendor opens it" is still true, so the test corroborates rather than
+proves.
+
+**The load-bearing evidence is the timing, and it stands alone.** 4796 bytes
+in 10 µs is 480 MB/s; 100 MB/s would be 48 µs and 25 MB/s 192 µs. A 64 MHz AHB
+does not move half a gigabyte a second. Whatever `+0x108` retires in 10 µs, it
+is not 4796 bytes of memory.
+
+## 20. The DMA controller is the LCD controller's, and nobody else's
+
+Static, from the call graph rather than from address ranges — which is the
+point, given §19's caveat and the retraction in the commit before it.
+
+§18 raised the possibility that the audio FIFO is fed by the general DMA
+controller. Following every entry point kills it:
+
+| Entry point | Callers |
+|---|---|
+| `0x00D97ED8` channel setup (claims a slot, module clock 33, `0x40001000 + ch*0x40`) | `0x00D3EAC0`, whose literal pool holds `lcdc_dma_write`, `lcdc_set_descriptor`, `lv_lcd_init` |
+| `0x0080DA74` start (§14b) | `0x00D998CC` and `0x0080E7FE`, both on the object at SRAM `0x0082B3BC` |
+| `0x0080DAC8` abort, `0x0080DADE` enable, `0x0080DAFC` remaining | none |
+
+And `0x0082B3BC` is settled rather than inferred: `0x00D99692` is
+`strd r3, r0, [r2]` with `r2 = 0x0082B3BC` and `r3 = 0x400D9000`, so the
+object is `{ base = LCDC, cfg }`.
+
+**The general DMA controller has exactly two call paths in the entire image
+and both are the LCD controller.** Nothing in the audio path touches it. That
+is a disconfirmation, not an absence of evidence.
+
+It also says something positive about the audio block: **it moves its own
+data.** Address, length, watermark and start all live in its own register
+window, which is not the shape of a FIFO fed by an external engine. Its own
+engine is what is not running.
+
+### The elimination table for audio, as it stands
+
+| Candidate | Status |
+|---|---|
+| Output route at `+0x08` | ruled out, measured, 4 settings |
+| Bit clock at `0x40080094` | ruled out, measured, with 3 source modes |
+| A functional clock in `0x400E0000` | ruled out, measured, all 32 bits |
+| The general DMA controller | ruled out, call graph |
+| The vendor's system clock init | ruled out, §19 - it is a reconfiguration path |
+| **The EQ sub-block's clocks, held** | **untried** |
+
+The last row is the hypothesis with the most behind it. The vendor's init
+takes module clock 32, romclk 45 and bit 2 of `0x40000020`, clears the
+coefficient RAM at `+0x400..+0x5FC`, and gives all three back — and its stream
+start then sets `0x40009400` bit 7, a register inside the range it had just
+been treating as RAM. If that sub-block is in the playback path it needs those
+clocks held while streaming, and nothing in the vendor's code holds them
+because the application programs an EQ preset through a path this analysis has
+not followed.
+
+`sl6806_audio_eq_hold()` does it; `make SKETCH=examples/ToneDemo
+EXTRA_FLAGS=-DTONEDEMO_EQ_HOLD=1` tries it, with the same completion-time
+witness. If that does not move the number either, the next thing to read is
+the application's EQ path — `HAL_eq_open`, `hardware EQ open success` — which
+is the one part of the audio subsystem nobody has followed.
+
+### MEASURED — the EQ hold moves the register window, and that is the lever
+
+`examples/ToneDemo` with `-DTONEDEMO_EQ_HOLD=1`, holding module clock 32,
+romclk 45 and bit 2 of `0x40000020`. **The first thing this session to change
+the audio block's behaviour at all**, and every change points away from a fix:
+
+| | before | after |
+|---|---|---|
+| `+0x400` | `0x00000000` | `0x003378B1` |
+| `+0x108` | `0x12BC0910` | `0x00BC1F7A` |
+| `+0x008` route 0 | `0x20832083` | `0x00832083` |
+| mean completion | 10 µs | 3 µs |
+
+The two register changes are one change. The length field at `+0x108 [31:16]`
+is written `0x12BC` and reads back `0x00BC`; `+0x008`'s channel-1 half loses
+bit 13, which is register bit 29. **Bits [31:24] stop accepting writes across
+both registers.** A length truncated from 4796 to 188 bytes is why the
+transfer got faster rather than slower — 3 µs is a shorter transfer, not a
+better one.
+
+So §20's last candidate is ruled out: holding those enables is harmful, and
+the vendor's init borrows them for the length of a memset for a reason.
+
+**What it buys instead** is the only lever the block has responded to in five
+runs. Something among those three moves the register window, and
+`examples/AudioWindow` separates them: all eight combinations, a known value
+written into the length field each time, reporting whether the top byte
+survives and what `+0x400` reads.
+
+The interesting outcome would be the pad-mux bit alone. `0x40000020` is the
+pad/pin function mux (§7c), not a clock, and a mux bit that changes which
+register bits are implemented is a **window switch** — which would make
+`+0x400` a second view of the same address space rather than a coefficient
+RAM, and would explain both why the vendor holds it so briefly and why
+`+0x400` reads `0x003378B1` while it is held.
+
+This needed `sl6806_module_disable()` — ROM `0x1CE8`, whose order is the
+reverse of the enable's: **gate first, then shadow**. Turning a clock off is
+the dangerous direction, so the sketch only switches off an id it switched on
+itself.
+
+## 21. DECODED: bit 2 of `0x40000020` switches the audio block's register window
+
+Measured 2026-08-13, `examples/AudioWindow`. The first outright decode in five
+hardware runs rather than another elimination.
+
+```
+m32 rc45 pad2 |  length reads  |  +0x400
+ 0   0    0   |  0x12BC ok     |  0x80
+ 0   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 0   1    0   |  0x12BC ok     |  0x80
+ 0   1    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   0    0   |  0x12BC ok     |  0x80
+ 1   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   1    0   |  0x12BC ok     |  0x80
+ 1   1    1   |  0xBC  TRUNC   |  0x3378B1
+```
+
+Module clock 32 and romclk 45 make no difference in any of the eight
+combinations. **Bit 2 of `0x40000020` alone** decides whether the length field
+at `+0x108 [31:16]` keeps a 16-bit value or only its low byte, and whether
+`+0x400` reads back the `0x80` we wrote there or `0x003378B1`.
+
+`0x40000020` is the **pad/pin function mux** (§7c). A mux bit that changes
+which register bits are implemented is a window switch, not a clock — which is
+why §19's clock-family sweep and §20's call graph were both looking in the
+wrong place for it.
+
+This explains the vendor's init exactly. `0x00D94AA6`..`0x00D94AEA` takes
+module 32, romclk 45 and this bit, clears `+0x400..+0x5FC` one word at a time,
+and hands all three back. Only the third of those is load-bearing: it is how
+you reach the coefficient RAM, and while it is held the ordinary registers are
+not all present. Holding it during streaming — which §20 proposed and this
+disproves — truncates the DMA length from 4796 bytes to 188.
+
+**It survives a re-upload.** `AudioWindow`'s baseline line read `0xBC` before
+its own first row cleared the bit, because the previous `ToneDemo` EQ build
+left it set. That is the same persistence the module clocks and the
+`0x400E0000` gate have, and it is more dangerous here because the symptom is a
+silently shortened transfer rather than a register that reads oddly.
+`sl6806_audio_begin()` now clears it before anything else, and
+`sl6806_audio_coeff_window()` is the deliberate way in.
+
+### The question it opens
+
+A window switch implies a second view of the address space, not just an
+exposed RAM. If any register **outside** `+0x400..+0x5FC` reads differently
+with the bit set, that is a register this framework has never seen — and a
+control register nobody has touched is the right shape of explanation for a
+block that accepts every descriptor and moves no data.
+
+`AudioWindow`'s second half reads the whole map in both windows and prints
+only the differences. Read-only, one register per `loop()` call.
+
+### CORRECTED, same day — it is module 32 AND the pad bit, not the pad bit alone
+
+§21's table was taken with module clock 32 silently already on, inherited from
+the `ToneDemo` EQ build, and its `m32=0` rows never turned it off — so they
+measured `m32=1` while reporting `m32=0`. A second run from a known state:
+
+```
+m32 rc45 pad2 |  length reads  |  +0x400
+ 0   0    1   |  0x12BC ok     |  0x80        <- differs from the first run
+ 0   1    1   |  0x12BC ok     |  0x80        <- differs from the first run
+ 1   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   1    1   |  0xBC  TRUNC   |  0x3378B1
+```
+
+**The coefficient-RAM window needs module clock 32 and bit 2 of `0x40000020`
+together.** Either alone leaves the ordinary registers in place. romclk 45
+really does nothing to the window; it presumably clocks the EQ engine rather
+than the aperture. Everything else in §21 stands — the vendor's init takes all
+three for the length of a memset, holding the window during streaming
+truncates the DMA length, and both halves survive a re-upload.
+
+**Third strike for inherited state.** In this one block it has now produced:
+an `AudioProbe` "cold" pass that was not cold; a `ToneDemo` run whose length
+field was truncated before the sketch wrote anything; and a decode that named
+the wrong cause. All three came from a sketch assuming the machine was in the
+state it left the factory in.
+
+So, alongside §5's *"a completion flag is not a transfer"* and §20's *"a
+literal's address region is not its owner"*: **establish state, do not inherit
+it.** `sl6806_audio_begin()` closes the window before anything else, and
+`examples/AudioWindow` prints the state it starts from.
+
+`tests/host/test_audio.c` needed one fix for the same reason: it asserted
+"shadow before gate" by matching bare register names, and begin()'s new window
+close puts another module's gate write in the trace first. It now matches on
+module 37's own value, `0x20`. The test had been passing for a slightly wrong
+reason and started failing for the right one.
+
+## 22. The coefficient window is a 24-bit RAM over the whole aperture
+
+Measured 2026-08-13, `examples/AudioWindow` second half: all 61 mapped
+registers read in both windows.
+
+**Every single one differs**, including ones that read `0` with the window
+closed, and **every switched value fits in 24 bits** — largest seen
+`0xFB6E49`.
+
+Two arithmetic checks name it. With the window open the reads are the closed
+values masked to 24 bits:
+
+```
++0x008   closed 0x20832083   open 0x00832083    = closed & 0xFFFFFF
++0x108   closed 0x12BC0800   open 0x00BC1F6A    0x12BC0800 & 0xFFFFFF = 0xBC0800
+                                                so the length field reads 0xBC
+```
+
+So §21's "the length field truncates to 8 bits" was never a narrowed field.
+**The whole aperture is replaced by a memory 24 bits wide.** A
+read-modify-write of the length hits RAM, and `0x12BC << 16` does not fit in
+24 bits.
+
+**The fingerprint that settles it:** `+0x10C` reads `0x00827A24` with the
+window open. That is the buffer address `examples/ToneDemo` printed in the
+EQ-hold run — `buffer at 0x827A24` — and `+0x10C` is exactly where
+`sl6806_audio_play()` writes it. The write went into the window and is still
+there, several sessions later. That is memory, and it kept what it was given.
+An SRAM address in `0x800000..0x8FFFFF` needs exactly 24 bits, so it stored
+without loss.
+
+### This voids the EQ-hold run
+
+Every register write that run made — the four routes, the DAC enables, the
+descriptor, the source modes — went into this RAM instead of into the block.
+It measured nothing about the audio path. Its "3 µs mean" is the time to
+retire a descriptor the block never received, and its register read-backs were
+reads of RAM. The only durable content of that run is the evidence above.
+
+That is the fourth reading this session to need withdrawing, and the third
+caused by state rather than by reasoning. It is also the one that produced the
+decode, so the run was not wasted — but nothing in it should be cited as
+audio behaviour.
+
+### What it does and does not settle
+
+24 bits wide is what an audio DSP's coefficient memory is, which fits the
+vendor clearing `+0x400..+0x5FC` through this window and nothing else. The
+aperture is wider than those 128 words: `0x000..0x5FC` all read distinct
+values, with no aliasing at `0x200` or `0x400`.
+
+The question the second half was built to answer — is there a control register
+nobody has seen behind the switch? — is answered **no**. The aperture is
+memory while the switch is open and the block's own registers while it is
+closed. Nothing hides there.
+
+So the elimination table stands as it did, one row longer:
+
+| Candidate | Status |
+|---|---|
+| Output route at `+0x08` | ruled out, measured |
+| Bit clock at `0x40080094` | ruled out, measured |
+| A functional clock in `0x400E0000` | ruled out, measured, all 32 bits |
+| The general DMA controller | ruled out, call graph |
+| The vendor's system clock init | ruled out, §19 |
+| A hidden register behind the window | ruled out, §22 |
+
+The block accepts a descriptor and retires it in 10 µs having moved nothing,
+with every register holding exactly what the vendor's own code puts there.
+
+### Two more static leads closed, 2026-08-13
+
+**`0x00D94B0C` is a no-op in the playback path.** It was the one function in
+the audio stream setup nobody had read. It takes a three-bit mask and, per
+bit, sets bit 0 / bit 4 of `0x40009030` and polls bit 29 of `+0x50`, `+0x54`,
+`+0x58` — a power-up-and-wait for three analogue channels, i.e. the microphone
+front end. The playback path calls it from `0x00D97A4C` with **r0 = 0**, after
+a loop that exits when the state byte reaches zero, so it returns immediately.
+Nothing there for playback.
+
+**No LDO rail belongs to audio.** Every caller of the register-file write
+accessor (`0x00804E44`) in the whole of FIRM lives in `0x00CC7xxx`, which §7m
+identifies as the register-file/LDO driver itself. Nothing in the audio HAL or
+in `driver_audio` ever asks for a rail. So the "the analogue side has no
+supply" idea has no support in the vendor's code — the codec's supply, if it
+has a separate one, is not switched by software.
+
+With those two closed, the static reading of the audio subsystem is
+substantially exhausted. What is left unread is the application's EQ path
+(`HAL_eq_open`, `hardware EQ open success`, `audio_crab`), which is a
+software-side abstraction over the coefficient RAM §22 decoded, and is
+unlikely to contain a missing hardware enable.
