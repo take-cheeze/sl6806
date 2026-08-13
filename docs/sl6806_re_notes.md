@@ -5003,3 +5003,54 @@ The general lesson is the same one §"the pad input buffer is off" taught, from
 a different direction: **a two-sample test cannot tell a level from a
 transition**, and every probe in this tree that reduces an analogue reality to
 one boolean has eventually had to be rewritten.
+
+### [V] Bank 1 pins 10 and 11 are the boot ROM's two mode inputs
+
+Following the two edge-waiters found above to their callers, at ROM `0x3D8C0`
+and `0x3D922`, gives the shape of boot-mode selection:
+
+```
+0x3D8B8   loop for ~1 second:
+0x3D8C0       if edge on bank 1 pin 10  -> tail-call 0x3D750
+0x3D8E4   then sample bank 1 pin 11's LEVEL for up to 999 ms,
+0x3D90A       and store it as a byte of boot state
+0x3D922   if edge on bank 1 pin 11      -> tail-call 0x3D63C
+```
+
+So **each pin gets about a second at boot and each branches somewhere
+different**, and pin 11's level is additionally recorded as a flag. Neither
+branch is the SD bring-up at `0x3D5CC`, so these are not card-reader mode
+directly.
+
+`docs/DUMPING.md` describes entering bootloader mode as "hold a boot key while
+plugging in USB (key varies, trial and error)". This is that mechanism: two
+inputs, both on bank 1, both function 14 — pin 10 with a pull-up (so an
+active-low button) and pin 11 with a pull-down (active-high). It is the first
+thing this project has found that explains the key at all.
+
+### The card-detect result is one pin, and the measurement was defective
+
+Runs two and three of `examples/PadMap` differ in exactly one pin out of
+sixty-nine, and the conditions are now known: **boot key unchanged, card in the
+slot for the third run.** So bank 1 pin 10 is the only pin on this board that
+responded to card insertion.
+
+That is exactly the card-detect signature — and it is also the pin the ROM
+polls for a boot key, which is an awkward coincidence rather than a
+contradiction (an SD socket's detect contact and a button are the same kind of
+signal, and a boot ROM that wakes on card insertion is not unusual). Under the
+lag model the readings say the pad's resting level goes from 1 with no card to
+0 with a card, with an internal pull-up still able to drag it up slowly — a
+weak pull to ground, not a hard short.
+
+**But the numbers come from the version of the sketch that did not let the pad
+settle**, so `up=0 down=1` is a transition caught mid-flight rather than a
+level, and every "driven" verdict in those two runs is suspect. The fix is in;
+the measurement has to be retaken. Two runs of the current build, card out then
+card in, nothing else changed:
+
+| pin 10 reads | meaning |
+|---|---|
+| follows the pull with no card, LOW with one | card detect, and it goes straight into `sl6806_sd.h` |
+| the same both ways | the earlier difference was the settling bug, and the card-detect pin is still unknown |
+| `UNSTABLE` either way | something is driving it actively — the boot ROM's own interrupt path is the first suspect |
