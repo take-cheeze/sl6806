@@ -48,6 +48,30 @@
  * inside a bank's configured run is the signature of exactly that.
  *
  * ===================================================================
+ *  [M] TWO RUNS, AND EXACTLY ONE PIN DIFFERS
+ * ===================================================================
+ * Second and third runs, identical in every respect except one pin:
+ *
+ *     bank 1 pin 10:   HIGH (up=1 down=1)  ->  (up=0 down=1)
+ *
+ * Every other driven pin, and all forty-six floating ones, read the same
+ * both times. So bank 1 pin 10 is the only thing on this board that changed
+ * state between two runs of the same sketch.
+ *
+ * **It is also the pin the mask ROM waits for an edge on** (see below), which
+ * makes it the boot key as much as it makes it card detect, and those are not
+ * distinguishable from one log. Two things have to be controlled before it
+ * means anything: whether a card was in the slot, and whether the boot key
+ * was held. If the key was held for one run and not the other, this is the
+ * boot key and nothing else.
+ *
+ * And `up=0 down=1` is not a state at all - it is the exact inverse of
+ * following the pull, which is what a pad reads when it is sampled before it
+ * has settled. The first version of this sketch read the input register in
+ * the instruction after applying the pull. It now waits, and samples until
+ * the level holds still; see pad_settled().
+ *
+ * ===================================================================
  *  [M] WHAT THE SECOND RUN FOUND, empty slot
  * ===================================================================
  * Forty-six parked pads follow their pull, so the mechanism works. The ones
@@ -157,6 +181,11 @@ extern "C" {
 #define PULL_UP    11u    /* a = 2, b = 2 - the ROM's own choice for CMD/DAT */
 #define PULL_DOWN   4u    /* a = 1, b = 2 - the only clean pull-down */
 
+/* How long an internal pull gets to move a pad before it is read. A weak
+ * resistor into whatever capacitance the board puts on the pin; 500 us is
+ * far longer than that needs and still imperceptible across 69 pads. */
+#define SETTLE_US  500u
+
 static int  phase;
 static int  bank;
 static bool done;
@@ -183,6 +212,32 @@ static unsigned pad_func(uint32_t base, unsigned pin)
 static unsigned pad_level(uint32_t base, unsigned pin)
 {
     return (sl6806_mmio_read(IN_REG(base)) >> pin) & 1u;
+}
+
+/*
+ * Read a pad after giving it time to settle, and say whether it actually did.
+ * Returns 0, 1, or 2 for "never stopped changing".
+ *
+ * THIS EXISTS BECAUSE THE FIRST VERSION DID NOT HAVE IT. It applied a pull
+ * and read the input register in the next instruction, which measures the
+ * level the pad had *before* the pull was applied on any pin with enough
+ * capacitance to lag - a long trace, a switch, a connector. The signature is
+ * a pin that reports the exact inverse of its pull (up=0, down=1), and one
+ * appeared on the second run of this sketch. An internal pull is a weak
+ * resistor; it needs microseconds, not nanoseconds.
+ */
+static unsigned pad_settled(uint32_t base, unsigned pin)
+{
+    unsigned first, i;
+
+    delayMicroseconds(SETTLE_US);
+    first = pad_level(base, pin);
+    for (i = 0; i < 8u; i++) {
+        delayMicroseconds(20);
+        if (pad_level(base, pin) != first)
+            return 2u;              /* still moving, or bouncing */
+    }
+    return first;
 }
 
 /* Save and restore the two 2-bit pull fields, so a pad is left as found. */
@@ -314,9 +369,9 @@ void loop()
              * first version of this sketch did and why it measured nothing.
              */
             sl6806_pad_configure(SL6806_PAD_ID(bank, pin, 0) | PULL_UP);
-            up = pad_level(base, pin);
+            up = pad_settled(base, pin);
             sl6806_pad_configure(SL6806_PAD_ID(bank, pin, 0) | PULL_DOWN);
-            down = pad_level(base, pin);
+            down = pad_settled(base, pin);
 
             /* Park it again, exactly as found, and put its pull back. */
             sl6806_pad_set_func(SL6806_PAD_ID(bank, pin, 15), 15u);
@@ -330,7 +385,14 @@ void loop()
 
             Serial.print("pin ");
             Serial.print(pin);
-            Serial.print(up ? " HIGH " : " LOW ");
+            if (up == 2u || down == 2u)
+                Serial.print(" UNSTABLE ");
+            else if (up == 1u && down == 1u)
+                Serial.print(" HIGH ");
+            else if (up == 0u && down == 0u)
+                Serial.print(" LOW ");
+            else
+                Serial.print(" INVERTED ");   /* still settling, or worse */
             Serial.print("(up=");
             Serial.print(up);
             Serial.print(" down=");

@@ -4964,3 +4964,42 @@ bank 1 is the one bank whose function nibbles read 15 all the way to pin 31.
 Either bank 1 really has 32 bonded pads and sixteen of them are grounded, or
 the `0`/`15` reading needs refining. The card-in diff will not settle that; a
 board photograph would.
+
+### [M] Two runs, one pin different — and a bug that makes it unreadable
+
+Third run of `examples/PadMap`. Diffed against the second, **exactly one pin
+differs across the whole board**:
+
+```
+bank 1 pin 10:   HIGH (up=1 down=1)   ->   (up=0 down=1)
+```
+
+Every other driven pin, and all forty-six floating ones, read identically.
+That is a clean single-variable result, and it is still not usable, for two
+reasons — one about the board and one about the sketch.
+
+**The board reason.** Bank 1 pin 10 is the pin ROM `0x3C1F0` waits for an edge
+on: pull-up, function 14, interrupt enabled, five hundred polls. That makes it
+the boot-key candidate *and* the only pin that changed. Whether it moved
+because a card went into the slot or because the boot key was held differently
+between two power-ups cannot be told from these logs. Both runs need their
+conditions stated: card in or out, key held or not.
+
+**The sketch reason, which is a defect.** `up=0 down=1` is not a level. It is
+the exact inverse of following the pull, and that is what a pad reads when it
+is sampled *before it has settled*: the first version applied a pull and read
+the input register in the next instruction. An internal pull is a weak
+resistor into whatever capacitance the board puts on the pin — a long trace, a
+switch, a connector — and needs microseconds. Every "driven" verdict in the
+previous two runs is therefore suspect, though a pin held hard at ground will
+not lag and the forty-six that followed their pull clearly did settle.
+
+`pad_settled()` now waits 500 µs, then samples eight times and reports 2 if the
+level never holds still, and the verdicts are `HIGH`, `LOW`, `UNSTABLE` and
+`INVERTED` rather than a bare high/low. `INVERTED` appearing again would mean
+something stranger than settling.
+
+The general lesson is the same one §"the pad input buffer is off" taught, from
+a different direction: **a two-sample test cannot tell a level from a
+transition**, and every probe in this tree that reduces an analogue reality to
+one boolean has eventually had to be rewritten.
