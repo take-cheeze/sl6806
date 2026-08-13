@@ -638,6 +638,29 @@ from unpulled ones, not connected ones from empty ones.
 RESET also drives high perfectly well at the vendor's drive strength of 0, so
 "the sensor is held in reset" is ruled out too.
 
+### SETTLED: the camera module is fitted and works
+
+**The stock firmware's camera app shows a live preview on this unit.** That is
+the vendor's own driver, on the same board, driving the same sensor at the same
+address on the same bus this branch has been probing.
+
+It closes the question that was still open and reverses one of the two
+candidates outright:
+
+- **"No module fitted" is dead.** The part is there and it works.
+- **Sensor power is not the leading explanation any more, it is the
+  explanation.** Everything else about the path is now positively confirmed
+  from both ends: the pads, the bus, the address and the clock are right,
+  because the vendor reaches the same sensor over them. What the vendor does
+  and a payload does not is switch something on.
+
+The vendor's `power_on` at `0x00D44B1C` contains no such call - it is pads,
+delays and clock channel 6, nothing else (decoded above). So the rail is
+enabled further up the stack, before the sensor driver is ever entered, which
+points once more at the byte-wide register file: a ~131-entry indexed file of
+exactly the kind that carries LDO enables, reached through veneers a payload
+cannot call.
+
 What is left, in the order the evidence now supports:
 
 - **Sensor power**, now the leading explanation. Every rail a module needs is
@@ -650,10 +673,7 @@ What is left, in the order the evidence now supports:
   SRAM routines a payload cannot call. Note the camera driver *reads* two of
   its registers - indices `0x03` and `0x16`, at `0x00D44EA8` and `0x00D44F08` -
   but writes none, so if a rail is switched for it, someone else does it.
-- **No module fitted.** Still possible - one firmware image ships across
-  several hardware builds - but weaker than it looked before the nets were
-  measured, because a populated pull-up is a component someone paid for.
-  Looking for a lens settles it either way, and costs nothing.
+- ~~**No module fitted.**~~ Ruled out: the stock camera app previews live.
 
 Both readings of which power pad is RESET were tried, and neither helps -
 worth recording, because under §7h's attribution the vendor's sequence ends by
