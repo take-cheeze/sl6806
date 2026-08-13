@@ -1028,6 +1028,34 @@ the mask ROM's single most referenced base, holding some registers steady
 and busy during USB download mode, which is the only mode we can observe it
 in. A USB controller fits every one of those.
 
+### Static analysis cannot locate the file — three more sweeps say so
+
+After the retraction, three further searches, all negative, all recorded so
+they are not repeated:
+
+| sweep | result |
+|---|---|
+| every ROM byte access through an absolute `0x4xxxxxxx` literal | **17 literals, all within ±16 of `0x40040000`** - the USB cluster and nothing else |
+| the same over the HLKJ bootloader (flash `0x60`, loads to `0x0081FC00`) | one hit, `0x40001000+12`, unrelated |
+| every ROM byte access with a *register* index inside a small function | 86 candidates and no way to tell them apart - the same fishing that produced the wrong answer above |
+
+A Hough-style vote was also tried: every byte-access literal in the ROM voting
+for `literal - index` across all 43 indices the veneers are called with, on the
+theory that the true base collects votes from many different literals. Every
+candidate it produced sits within sixteen bytes of `0x40040000`, because those
+are the only literals of that shape in the image.
+
+**So the accessor does not use absolute per-register addresses, and the file is
+not a plain MMIO array.** What is left fits a computed base plus index, or a
+serial/indirect protocol - either of which is invisible to a pattern search.
+
+**But it is reachable, and cheaply, by one runtime read.** The veneers live in
+SRAM and are written at boot; the only code that is always resident to be
+written *into* them is the mask ROM. So `0x00804E44` almost certainly branches
+to a ROM address, and a single read of that veneer on a running system - four
+bytes, over SWD - decodes to the accessor, which then decodes to the base. That
+is the whole remaining problem: four bytes that cannot be read from a dump.
+
 **Still true, and independent of all this:** the camera's two enable writes at
 `0x00D44EA6` and `0x00D44F06` - registers `0x03` and `0x16` of the file,
 whatever its address - and the clock driver's use of `0x03` and `0x2C`. Those
