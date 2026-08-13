@@ -4040,3 +4040,56 @@ This needed `sl6806_module_disable()` — ROM `0x1CE8`, whose order is the
 reverse of the enable's: **gate first, then shadow**. Turning a clock off is
 the dangerous direction, so the sketch only switches off an id it switched on
 itself.
+
+## 21. DECODED: bit 2 of `0x40000020` switches the audio block's register window
+
+Measured 2026-08-13, `examples/AudioWindow`. The first outright decode in five
+hardware runs rather than another elimination.
+
+```
+m32 rc45 pad2 |  length reads  |  +0x400
+ 0   0    0   |  0x12BC ok     |  0x80
+ 0   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 0   1    0   |  0x12BC ok     |  0x80
+ 0   1    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   0    0   |  0x12BC ok     |  0x80
+ 1   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   1    0   |  0x12BC ok     |  0x80
+ 1   1    1   |  0xBC  TRUNC   |  0x3378B1
+```
+
+Module clock 32 and romclk 45 make no difference in any of the eight
+combinations. **Bit 2 of `0x40000020` alone** decides whether the length field
+at `+0x108 [31:16]` keeps a 16-bit value or only its low byte, and whether
+`+0x400` reads back the `0x80` we wrote there or `0x003378B1`.
+
+`0x40000020` is the **pad/pin function mux** (§7c). A mux bit that changes
+which register bits are implemented is a window switch, not a clock — which is
+why §19's clock-family sweep and §20's call graph were both looking in the
+wrong place for it.
+
+This explains the vendor's init exactly. `0x00D94AA6`..`0x00D94AEA` takes
+module 32, romclk 45 and this bit, clears `+0x400..+0x5FC` one word at a time,
+and hands all three back. Only the third of those is load-bearing: it is how
+you reach the coefficient RAM, and while it is held the ordinary registers are
+not all present. Holding it during streaming — which §20 proposed and this
+disproves — truncates the DMA length from 4796 bytes to 188.
+
+**It survives a re-upload.** `AudioWindow`'s baseline line read `0xBC` before
+its own first row cleared the bit, because the previous `ToneDemo` EQ build
+left it set. That is the same persistence the module clocks and the
+`0x400E0000` gate have, and it is more dangerous here because the symptom is a
+silently shortened transfer rather than a register that reads oddly.
+`sl6806_audio_begin()` now clears it before anything else, and
+`sl6806_audio_coeff_window()` is the deliberate way in.
+
+### The question it opens
+
+A window switch implies a second view of the address space, not just an
+exposed RAM. If any register **outside** `+0x400..+0x5FC` reads differently
+with the bit set, that is a register this framework has never seen — and a
+control register nobody has touched is the right shape of explanation for a
+block that accepts every descriptor and moves no data.
+
+`AudioWindow`'s second half reads the whole map in both windows and prints
+only the differences. Read-only, one register per `loop()` call.

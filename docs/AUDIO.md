@@ -167,12 +167,52 @@ So the EQ hypothesis is dead: holding those enables makes it worse, and the
 vendor borrows them briefly for a reason. But something in there moves the
 register window, and that is the only lever the block has responded to at all.
 
-`examples/AudioWindow` separates the three — module clock 32, romclk 45, and
-bit 2 of `0x40000020` — across all eight combinations, writing a known value
-into the length field each time and reporting whether the top byte survives.
-If it is the pad-mux bit alone, `+0x400` is a second *view* of the same
-address space rather than a coefficient RAM, which would explain why the
-vendor only ever holds it for the length of a memset.
+## DECODED — bit 2 of `0x40000020` is a register-window switch
+
+`examples/AudioWindow`, all eight combinations:
+
+```
+m32 rc45 pad2 |  length reads  |  +0x400
+ 0   0    0   |  0x12BC ok     |  0x80
+ 0   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 0   1    0   |  0x12BC ok     |  0x80
+ 0   1    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   0    0   |  0x12BC ok     |  0x80
+ 1   0    1   |  0xBC  TRUNC   |  0x3378B1
+ 1   1    0   |  0x12BC ok     |  0x80
+ 1   1    1   |  0xBC  TRUNC   |  0x3378B1
+```
+
+**Module clock 32 and romclk 45 do nothing in any combination.** Bit 2 of
+`0x40000020` flips it every time, and `0x40000020` is the pad/pin function mux
+(§7c) — not a clock, which is why none of the clock analysis was ever going to
+find it. This is the first outright decode in five runs rather than another
+elimination.
+
+With the switch **clear**, `+0x400` reads `0x80` — the bit
+`sl6806_audio_clock_start()` writes there, so it is an ordinary register
+holding what it was given. With it **set**, `+0x400` reads `0x3378B1` and the
+top byte of `+0x108` and `+0x008` stops accepting writes. That is exactly why
+the vendor's init takes the bit for as long as it takes to clear
+`+0x400..+0x5FC` and then gives it straight back: it is how you reach the
+coefficient RAM, and while you hold it the ordinary registers are not all
+there.
+
+**It survives a re-upload.** `AudioWindow`'s own baseline line read `0xBC`
+before its first row cleared the bit — the previous `ToneDemo` EQ build had
+left it set. A sketch that inherits it has the top byte of its length field
+silently dropped before it writes anything. `sl6806_audio_begin()` clears it
+first now, and `sl6806_audio_coeff_window()` is the one-line way to reach the
+RAM deliberately.
+
+### What it opens
+
+If bit 2 selects a *window* rather than merely exposing a RAM, the rest of the
+map may read differently too — and a control register nobody has seen is
+exactly the shape of thing that would explain a block which accepts every
+descriptor and moves no data. `AudioWindow`'s second half reads the whole
+register list in both windows and prints only the differences. Anything
+outside `+0x400..+0x5FC` would be new.
 
 That needed `sl6806_module_disable()` (ROM `0x1CE8`, whose order is the
 reverse of the enable's: gate first, then shadow). It is the dangerous

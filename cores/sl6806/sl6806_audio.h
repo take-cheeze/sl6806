@@ -347,8 +347,37 @@ extern "C" {
  */
 #define SL6806_AUD_EQ_MODULE_ID 32
 #define SL6806_AUD_EQ_ROMCLK_ID 45
+/*
+ * [M] MEASURED 2026-08-13, examples/AudioWindow - a decode rather than another
+ * elimination.
+ *
+ * **Bit 2 of 0x40000020 is a register-window switch for this block.** Eight
+ * combinations of module 32, romclk 45 and this bit; the two clocks make no
+ * difference in any of them, and this bit alone flips the window every time:
+ *
+ *     pad2 = 0    +0x108 length field holds 0x12BC   +0x400 reads 0x80
+ *     pad2 = 1    +0x108 length field holds 0x00BC   +0x400 reads 0x3378B1
+ *
+ * The 0x80 at +0x400 in the normal window is the bit sl6806_audio_clock_start()
+ * writes there, so with the switch clear +0x400 is an ordinary register
+ * holding what it was given. With it set, the top byte of at least +0x108 and
+ * +0x008 stops accepting writes and +0x400 shows something else entirely.
+ *
+ * That is why the vendor's init takes this bit for exactly as long as it takes
+ * to clear +0x400..+0x5FC and gives it straight back: it is how you reach the
+ * coefficient RAM, and while you hold it the ordinary registers are not all
+ * there.
+ *
+ * 0x40000020 is the pad/pin function mux (7c), not a clock, which is why
+ * nothing in the clock analysis was ever going to find this.
+ *
+ * [!] IT SURVIVES A RE-UPLOAD. A run that leaves it set truncates the next
+ * sketch's length field before that sketch writes anything - which is exactly
+ * what AudioWindow's own baseline line caught, after ToneDemo's EQ build left
+ * it on. sl6806_audio_begin() clears it now.
+ */
 #define SL6806_AUD_PADMUX_REG   0x40000020u
-#define SL6806_AUD_PADMUX_EQ    (1u << 2)
+#define SL6806_AUD_PADMUX_EQ    (1u << 2)   /* [M] the window switch */
 
 /*
  * =====================================================================
@@ -562,6 +591,15 @@ void sl6806_audio_clock_start(unsigned mode);
  * examples/ToneDemo takes ToneDemo EQ=1 to try it.
  */
 void sl6806_audio_eq_hold(int on);
+
+/*
+ * [M] The register-window switch on its own - bit 2 of 0x40000020, and the
+ * only one of eq_hold()'s three that does anything. Set it to reach the
+ * coefficient RAM at +0x400..+0x5FC; clear it for everything else. While it
+ * is set the length field at +0x108 is 8 bits wide instead of 16, so a
+ * transfer submitted in that state is silently truncated.
+ */
+void sl6806_audio_coeff_window(int on);
 
 /* Undo the mode select and stop the bit clock. */
 void sl6806_audio_clock_stop(void);

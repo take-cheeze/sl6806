@@ -114,6 +114,13 @@ int sl6806_audio_begin(uint32_t rate)
 {
     unsigned ch;
 
+    /*
+     * [M] Clear the register-window switch FIRST. It survives a re-upload,
+     * and a sketch that inherits it set will have the top byte of its length
+     * field silently dropped - measured, examples/AudioWindow.
+     */
+    sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
+
     /* [V] 0x00D9674A, before either clock. */
     sl6806_mmio_set(SL6806_AUD_MISC_REG, SL6806_AUD_MISC_BIT);
 
@@ -248,6 +255,23 @@ void sl6806_audio_eq_hold(int on)
     } else {
         sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
     }
+}
+
+/*
+ * [M] The window switch on its own. Set it and +0x400..+0x5FC is the
+ * coefficient RAM; clear it and the ordinary registers are all there again.
+ * Neither of the two clocks eq_hold() also takes has any effect on the
+ * window - measured across all eight combinations.
+ *
+ * Leave it clear unless you are reading or writing coefficients. While it is
+ * set the length field at +0x108 is 8 bits wide instead of 16.
+ */
+void sl6806_audio_coeff_window(int on)
+{
+    if (on)
+        sl6806_mmio_set(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
+    else
+        sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
 }
 
 void sl6806_audio_clock_stop(void)
