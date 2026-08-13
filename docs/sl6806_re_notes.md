@@ -726,12 +726,62 @@ move is to disassemble `0x00804E44` itself, and it cannot be done from
   land on a function prologue. **Zero offsets score 7 or more out of 9**, and
   the best anywhere in the image is 3.
 
-The library is therefore not stored uncompressed in flash, which is consistent
-with §7f: it comes from the mask ROM, and `maskrom.bin` is where to look next -
-the same place the pad controller turned out to be. Note that some of these
-addresses (`0x0080FF64` twi_write, `0x00811C7C` gpio_write) are above the FIRM
-segment's end at `0x0080A462` anyway, so at least part of that SRAM space is
-populated by something other than FIRM.
+The library is therefore not stored uncompressed in flash. The mask ROM was
+the obvious next place to look - it is where the pad controller turned out to
+be - and that hunt has now been run across all three binaries in the tree.
+
+### SETTLED, NEGATIVE: the SRAM library is in none of the three dumps
+
+**And there is a structural reason, which is the useful part.** The addresses
+`sl6806-ramcalls` reports are **not function entry points**. Their spacing
+gives it away: of the 251, twenty-six consecutive pairs are exactly 12 bytes
+apart and fifteen exactly 4, including the run
+
+```
+0x008051E8  0x008051EC  0x008051F0  0x008051F4  0x008051F8
+```
+
+A four-byte slot holds one instruction, and the only useful one is `b.w`. So
+this is a dispatch region - veneers forwarding to implementations elsewhere -
+which is exactly how §7h already read the four-byte block at `0x00811C78`. The
+implication is that **the targets are written at run time**, so no byte-level
+search of a static image can produce them, and every search below was doomed
+before it started:
+
+| search | over | result |
+|---|---|---|
+| 80 in-segment entry points vs function prologues, every 2-byte alignment | dump.bin, maskrom.bin, sram.bin | nothing above chance (best 19/80, in a high-entropy region) |
+| 15 four-byte-run entry points vs `B.W` encodings | all three | nothing above 70% |
+| self-referencing literals, solving for a constant load delta | dump.bin, maskrom.bin | no dominant mapping (best count 4) |
+| any literal equal to a veneer address or to `0x00804C00` | whole 4 MB | **only** the FIRM header at `0x10010` and its vector table - no installer, no copy loop |
+| runs of Thumb-odd ROM pointers that could be a target table | FIRM | one 131-entry run at `0x00C526F4`, which is repeated `0x010001` data, not pointers |
+
+`sram.bin` also settles §7f by measurement rather than inference: all nine
+addresses read as high-entropy noise in bootloader mode.
+
+So static analysis of `dump.bin`, `maskrom.bin` and `sram.bin` cannot yield
+this library. What would: reading SRAM while the **stock firmware** is running,
+which needs SWD rather than the USB path, since the veneers only exist once
+the application has installed them.
+
+**Two by-products worth keeping.** The ROM's own variables sit at
+`0x00804048`..`0x00804504`, i.e. ROM data occupies roughly
+`0x00804000`-`0x00804600`, immediately below FIRM's load address of
+`0x00804C00` - so that boundary is not arbitrary. And the mask ROM's
+peripheral map, by literal frequency, is independent evidence next to §7c's
+FIRM-derived list:
+
+| base | refs in ROM | |
+|---|---|---|
+| `0x40040000` | 125 | |
+| `0x40036000` | 92 | not in §7c's list |
+| `0x40030000` | 87 | §7c's "heavily used, 16-bit registers" |
+| `0x40020000` | 70 | |
+| `0x4010E000` | 65 | not in §7c's list |
+| `0x40080000` | 27 | the clock and reset unit |
+
+`0x40036000` and `0x4010E000` are new candidates, and one of them is a
+plausible home for the indexed register file.
 
 Note also what a working bus does *not* buy: pixels leave the sensor on the
 DVP/CSI front end above, which is undecoded. Reading the chip id proves the

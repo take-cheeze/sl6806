@@ -364,11 +364,15 @@ In rough order of how much they unlock:
    masked as bytes — a ~130-entry file addressed by index rather than by
    address, which is the shape of a PMU / analog register bank rather than an
    MMIO block. Clock channel 6 (MCLK) goes through it, and so, most likely,
-   does whatever switches the camera's supply. It is **not** in the flash
-   image at any alignment (§7h records that search so nobody repeats it), so
-   `maskrom.bin` is where to look — the same place the pad controller turned
-   out to be. Whoever finds how `0x00804E44` reaches the hardware unlocks 140
-   call sites at once.
+   does whatever switches the camera's supply. Whoever finds how
+   `0x00804E44` reaches the hardware unlocks 140 call sites at once — but
+   **not from these dumps**: those addresses are veneers whose targets are
+   written at run time, and §7h records the five searches across `dump.bin`,
+   `maskrom.bin` and `sram.bin` that establish it, so nobody repeats them.
+   What would work is reading SRAM while the stock firmware runs, which needs
+   SWD. Failing that, `0x40036000` and `0x4010E000` are the mask ROM's two
+   heavily-used bases that §7c never saw, and one of them is a plausible home
+   for the register file.
 4. **An FM driver**, now the cheapest working device on the board: an
    RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
    part, published register map, and the id read is done.
