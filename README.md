@@ -467,6 +467,22 @@ docs/             BRINGUP.md, DUMPING.md, FLASHING.md, LCD.md, BLUETOOTH.md,
                   docs/ACTIONS_CARDREADER.md)
 ```
 
+## Related projects
+
+[tytydraco/mp3c](https://github.com/tytydraco/mp3c) converts audio, images,
+video and text into the device-specific formats these players expect —
+matching orientation and rotation direction to the target chip (it names SL
+devices explicitly, alongside ATJ) and cropping to fill the screen. It is a
+content-prep tool, not a flashing or firmware tool: useful once a device is
+up and you want real media on it, orthogonal to everything in this repo.
+
+Its device spec sheet lists several stock SL6806 units, and the encode
+recipe they share: AVI container, H.264 baseline, `yuvj420p`, transpose
+counter-clockwise, crop+upscale to fill the panel, ~1-2 Mbps / GOP 8-12,
+`pcm_s16le` audio up to 48 kHz — via a patched FFmpeg (`ffmpeg-yp3-patch`).
+That is what the stock firmware's decoder was built against, and worth
+knowing if video decode is ever taken on here.
+
 ## Credit
 
 The USB protocol, the boot ROM entry points and the payload mechanism are all
