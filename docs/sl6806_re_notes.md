@@ -4131,3 +4131,73 @@ it.** `sl6806_audio_begin()` closes the window before anything else, and
 close puts another module's gate write in the trace first. It now matches on
 module 37's own value, `0x20`. The test had been passing for a slightly wrong
 reason and started failing for the right one.
+
+## 22. The coefficient window is a 24-bit RAM over the whole aperture
+
+Measured 2026-08-13, `examples/AudioWindow` second half: all 61 mapped
+registers read in both windows.
+
+**Every single one differs**, including ones that read `0` with the window
+closed, and **every switched value fits in 24 bits** — largest seen
+`0xFB6E49`.
+
+Two arithmetic checks name it. With the window open the reads are the closed
+values masked to 24 bits:
+
+```
++0x008   closed 0x20832083   open 0x00832083    = closed & 0xFFFFFF
++0x108   closed 0x12BC0800   open 0x00BC1F6A    0x12BC0800 & 0xFFFFFF = 0xBC0800
+                                                so the length field reads 0xBC
+```
+
+So §21's "the length field truncates to 8 bits" was never a narrowed field.
+**The whole aperture is replaced by a memory 24 bits wide.** A
+read-modify-write of the length hits RAM, and `0x12BC << 16` does not fit in
+24 bits.
+
+**The fingerprint that settles it:** `+0x10C` reads `0x00827A24` with the
+window open. That is the buffer address `examples/ToneDemo` printed in the
+EQ-hold run — `buffer at 0x827A24` — and `+0x10C` is exactly where
+`sl6806_audio_play()` writes it. The write went into the window and is still
+there, several sessions later. That is memory, and it kept what it was given.
+An SRAM address in `0x800000..0x8FFFFF` needs exactly 24 bits, so it stored
+without loss.
+
+### This voids the EQ-hold run
+
+Every register write that run made — the four routes, the DAC enables, the
+descriptor, the source modes — went into this RAM instead of into the block.
+It measured nothing about the audio path. Its "3 µs mean" is the time to
+retire a descriptor the block never received, and its register read-backs were
+reads of RAM. The only durable content of that run is the evidence above.
+
+That is the fourth reading this session to need withdrawing, and the third
+caused by state rather than by reasoning. It is also the one that produced the
+decode, so the run was not wasted — but nothing in it should be cited as
+audio behaviour.
+
+### What it does and does not settle
+
+24 bits wide is what an audio DSP's coefficient memory is, which fits the
+vendor clearing `+0x400..+0x5FC` through this window and nothing else. The
+aperture is wider than those 128 words: `0x000..0x5FC` all read distinct
+values, with no aliasing at `0x200` or `0x400`.
+
+The question the second half was built to answer — is there a control register
+nobody has seen behind the switch? — is answered **no**. The aperture is
+memory while the switch is open and the block's own registers while it is
+closed. Nothing hides there.
+
+So the elimination table stands as it did, one row longer:
+
+| Candidate | Status |
+|---|---|
+| Output route at `+0x08` | ruled out, measured |
+| Bit clock at `0x40080094` | ruled out, measured |
+| A functional clock in `0x400E0000` | ruled out, measured, all 32 bits |
+| The general DMA controller | ruled out, call graph |
+| The vendor's system clock init | ruled out, §19 |
+| A hidden register behind the window | ruled out, §22 |
+
+The block accepts a descriptor and retires it in 10 µs having moved nothing,
+with every register holding exactly what the vendor's own code puts there.

@@ -224,14 +224,55 @@ the state it starts from rather than assuming one. **Establish state; do not
 inherit it** is now a rule in this block, alongside "a completion flag is not
 a transfer" and "a literal's address region is not its owner".
 
+### It is a 24-bit RAM over the whole aperture, not a narrowing
+
+`AudioWindow`'s second half read all 61 mapped registers in both windows.
+**Every one differs**, including those that read `0` with the window closed,
+and **every switched value fits in 24 bits** (largest `0xFB6E49`).
+
+Two checks say what it is:
+
+| offset | closed | open | |
+|---|---|---|---|
+| `+0x008` | `0x20832083` | `0x00832083` | = closed `& 0xFFFFFF` |
+| `+0x108` | `0x12BC0800` | `0x00BC1F6A` | `0x12BC0800 & 0xFFFFFF = 0xBC0800`, so the length reads `0xBC` |
+
+So "the length field truncates to 8 bits" was never a narrowed field. **The
+whole aperture is replaced by a memory 24 bits wide**; a read-modify-write of
+the length hits RAM, and `0x12BC << 16` does not fit in 24 bits.
+
+And the fingerprint that settles it: **`+0x10C` reads `0x00827A24` with the
+window open** — the buffer address `ToneDemo` printed in the EQ-hold run
+(`buffer at 0x827A24`). `+0x10C` is exactly where `sl6806_audio_play()` writes
+that address. The write went into the window and is still there, sessions
+later. That is memory, and it kept what it was given.
+
+**This voids the EQ-hold run entirely.** Every register write it made — the
+routes, the DAC enables, the descriptor — went into this RAM instead of the
+block. That run measured nothing about the audio path; its "3 µs" is the time
+to retire a descriptor the block never saw. Its only real content is the
+evidence above.
+
+24 bits is what an audio DSP's coefficient memory is, which fits the vendor
+clearing `+0x400..+0x5FC` through this window and nothing else. The aperture is
+wider than those 128 words though — `0x000..0x5FC` all read distinct values,
+with no aliasing at `0x200` or `0x400`.
+
 ### What it opens
 
-If bit 2 selects a *window* rather than merely exposing a RAM, the rest of the
-map may read differently too — and a control register nobody has seen is
-exactly the shape of thing that would explain a block which accepts every
-descriptor and moves no data. `AudioWindow`'s second half reads the whole
-register list in both windows and prints only the differences. Anything
-outside `+0x400..+0x5FC` would be new.
+The question was whether a control register nobody has seen hides behind the
+switch — the right shape of thing to explain a block that accepts every
+descriptor and moves no data.
+
+**Answered: no.** All 61 registers differ because the aperture *is* memory
+while the switch is open, not a second set of registers. There is nothing
+hidden there.
+
+So the window question is closed and audio's is not. Ruled out so far: the
+output route, the bit clock, all 32 bits of `0x400E0000`, the general DMA
+controller, the vendor's system clock init, and now the coefficient window.
+The block accepts a descriptor and retires it in 10 µs having moved nothing,
+with every register holding exactly what the vendor's own code puts there.
 
 That needed `sl6806_module_disable()` (ROM `0x1CE8`, whose order is the
 reverse of the enable's: gate first, then shadow). It is the dangerous

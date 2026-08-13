@@ -359,6 +359,42 @@ extern "C" {
  *     window closed   +0x108 length holds 0x12BC   +0x400 reads 0x80
  *     window open     +0x108 length holds 0x00BC   +0x400 reads 0x3378B1
  *
+ * =====================================================================
+ *  [M] AND THE WINDOW IS NOT A NARROWING - IT IS A 24-BIT RAM
+ * =====================================================================
+ * Reading all 61 mapped registers in both windows: **every single one
+ * differs**, including ones that read 0 with the window closed, and **every
+ * switched value fits in 24 bits** (largest seen 0xFB6E49).
+ *
+ * Two arithmetic checks say what it is. With the window open the reads are
+ * the same values masked to 24 bits:
+ *
+ *     +0x008  closed 0x20832083   open 0x00832083   = value & 0xFFFFFF
+ *     +0x108  closed 0x12BC0800   open 0x00BC1F6A   length reads 0xBC
+ *                                 because 0x12BC0800 & 0xFFFFFF = 0xBC0800
+ *
+ * So the "length field truncated to 8 bits" was never a narrowed field. The
+ * whole aperture is replaced by a memory 24 bits wide, a read-modify-write of
+ * the length hits RAM, and 0x12BC << 16 simply does not fit in 24 bits.
+ *
+ * And the fingerprint that settles it: **+0x10C reads 0x00827A24 with the
+ * window open**, which is the buffer address examples/ToneDemo printed in the
+ * EQ-hold run ("buffer at 0x827A24"). +0x10C is exactly where
+ * sl6806_audio_play() writes that address. The write went into the window and
+ * is still sitting there, sessions later. That is memory, and it kept what it
+ * was given.
+ *
+ * [!] CONSEQUENCE, AND IT VOIDS A RUN. Every register write the EQ-hold
+ * ToneDemo made went into this RAM instead of into the block - the routes,
+ * the DAC enables, the descriptor, all of it. That run measured nothing about
+ * the audio path, and its "3 us" is the time to retire a descriptor the block
+ * never saw. Its only real content is the evidence above.
+ *
+ * 24 bits wide is also what an audio DSP's coefficient memory is, which fits
+ * the vendor clearing +0x400..+0x5FC through this window and nothing else.
+ * The aperture is wider than those 128 words, though: offsets 0x000..0x5FC
+ * all read distinct values, with no aliasing at 0x200 or 0x400.
+ *
  * [!] The first run of this experiment said the pad-mux bit did it alone, and
  * its table showed exactly that. Module 32 was silently already on, inherited
  * from a previous sketch, and the rows meant to have it off never turned it
