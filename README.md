@@ -467,6 +467,15 @@ docs/             BRINGUP.md, DUMPING.md, FLASHING.md, LCD.md, BLUETOOTH.md,
                   docs/ACTIONS_CARDREADER.md)
 ```
 
+## Related projects
+
+[tytydraco/mp3c](https://github.com/tytydraco/mp3c) converts audio, images,
+video and text into the device-specific formats these players expect —
+matching orientation and rotation direction to the target chip (it names SL
+devices explicitly, alongside ATJ) and cropping to fill the screen. It is a
+content-prep tool, not a flashing or firmware tool: useful once a device is
+up and you want real media on it, orthogonal to everything in this repo.
+
 ## Credit
 
 The USB protocol, the boot ROM entry points and the payload mechanism are all
