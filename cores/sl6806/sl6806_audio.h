@@ -551,6 +551,18 @@ void sl6806_audio_route(unsigned ch, unsigned route, unsigned trim);
  */
 void sl6806_audio_clock_start(unsigned mode);
 
+/*
+ * Hold the EQ sub-block's three clocks - module 32, romclk 45 and bit 2 of
+ * 0x40000020 - instead of borrowing them for an init the way the vendor does.
+ *
+ * [?] A hypothesis with a witness, and the last one standing: everything else
+ * that could explain a descriptor retiring in 10 us has been eliminated (the
+ * route, the bit clock, all 32 bits of 0x400E0000, and the general DMA
+ * controller, whose only two call paths in the image are the LCDC's).
+ * examples/ToneDemo takes ToneDemo EQ=1 to try it.
+ */
+void sl6806_audio_eq_hold(int on);
+
 /* Undo the mode select and stop the bit clock. */
 void sl6806_audio_clock_stop(void);
 

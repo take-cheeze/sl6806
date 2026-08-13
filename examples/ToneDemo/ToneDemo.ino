@@ -242,6 +242,18 @@ void setup()
     report("PLL rat  (40080014)", sl6806_mmio_read(SL6806_AUD_PLL_RATIO));
 
     mode = 1;
+    /*
+     * The EQ sub-block's clocks, held rather than borrowed. Off by default so
+     * this sketch keeps measuring the same thing it measured before; build
+     * with -DTONEDEMO_EQ_HOLD=1 to add them. See sl6806_audio_eq_hold().
+     */
+#ifdef TONEDEMO_EQ_HOLD
+    sl6806_audio_eq_hold(1);
+    Serial.println("EQ sub-block clocks HELD (module 32, romclk 45, padmux 2)");
+    report("  0x40000020", sl6806_mmio_read(SL6806_AUD_PADMUX_REG));
+    report("  +0x400     ", sl6806_mmio_read(SL6806_AUD_EQ_CTRL));
+#endif
+
     route = 0;
     startCombo(mode, route);
 }

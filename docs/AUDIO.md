@@ -99,33 +99,51 @@ Three smaller things the same runs settled, which do stand:
 And **bit 11 of `+0x108`** clears when a descriptor is armed and returns
 afterwards — an idle flag.
 
-## RETRACTED IMMEDIATELY — "the audio block does not move its own data"
+## The DMA-controller hypothesis, raised and then disconfirmed
 
-Written and then withdrawn within the hour, before it could cost anyone a
-hardware run. The claim was that `0x00D97ED8` — which claims a DMA channel,
-enables module clock 33 and configures `0x40001000 + ch*0x40` — is the audio
-path's data mover, on the strength of it being the only code in the audio
-HAL's address region that loads `0x40001000`.
+Raised on the strength of `0x00D97ED8` — which claims a DMA channel, enables
+module clock 33 and configures `0x40001000 + ch*0x40` — being the only code in
+the audio HAL's address region that loads `0x40001000`. That was proximity,
+not evidence, and following the calls kills it twice over.
 
-Its one caller in FIRM is `0x00D3EAC0`, and that function's literal pool
-contains `lcdc_dma_write`, `lcdc_set_descriptor` and `lv_lcd_init`. **It is
-the LCD controller's DMA setup.** `0x00D97ED8` is a shared HAL routine, and
-"it is in the audio region" was proximity, not evidence — the same mistake in
-kind as §7c filing this block as the timers.
+**Every DMA entry point in the image, and who uses it:**
 
-What stands, and what does not:
-
-| | |
+| Entry point | Callers |
 |---|---|
-| The playback path moves no memory | **Inferred, strongly.** 4796 bytes in 10 µs is 480 MB/s. The capture test agrees but had RX unopened, so it is corroboration rather than proof. |
-| `0x400E0000` is not audio's gate | **Measured.** All 32 bits, no effect. |
-| A DMA controller exists at `0x40001000`, module clock 33 | **True**, and used by at least the LCDC. |
-| Audio is fed by that controller | **Unknown.** No evidence either way. |
+| `0x00D97ED8` channel setup | `0x00D3EAC0`, whose literal pool holds `lcdc_dma_write`, `lcdc_set_descriptor`, `lv_lcd_init` |
+| `0x0080DA74` start (§14b) | `0x00D998CC` and `0x0080E7FE` — both operate on the object at SRAM `0x0082B3BC` |
+| `0x0080DAC8` abort, `0x0080DADE` enable, `0x0080DAFC` remaining | nothing at all |
 
-The way to settle it is to find what fills the DMA config struct on the audio
-path — the struct `0x00D3EAC0` builds for the LCDC has a request id, source
-and destination widths and burst sizes, so an audio equivalent would be
-recognisable — not to reason from which region a literal sits in.
+And `0x0082B3BC` is not a guess: `0x00D99692` is `strd r3, r0, [r2]` with
+`r2 = 0x0082B3BC` and `r3 = 0x400D9000`. The object is `{ base = LCDC, cfg }`.
+
+**So the general DMA controller has exactly two call paths in the whole image
+and both are the LCD controller. Nothing in the audio path touches it.** That
+is a disconfirmation rather than an absence of evidence, and it was reached by
+following a base assignment instead of an address range — the method the
+earlier version of this section got wrong.
+
+It also says something positive: **the audio block moves its own data.** It
+has its own address, length, watermark and start registers, which is not what
+a FIFO fed by an external engine looks like. Its own engine is the thing that
+is not running.
+
+### What that leaves
+
+Ruled out by measurement: the output route, the bit clock, all 32 bits of
+`0x400E0000`. Ruled out by call-graph: the general DMA controller.
+
+The candidate with the most behind it is the **EQ sub-block at `+0x400`**. The
+vendor's init takes module clock 32, romclk 45 and bit 2 of `0x40000020`,
+clears the 128-word coefficient RAM, and *gives all three back* — and then its
+stream start sets `0x40009400` bit 7, which this driver does. If that
+sub-block sits in the playback path, it needs those clocks **held** while
+streaming rather than borrowed for an init. Nothing in the vendor's code holds
+them, but nothing in the vendor's code needed to: the application configures
+an EQ preset and the vendor's own path may take them again there.
+
+That is testable with the same witness — `sl6806_audio_eq_hold()` and
+`examples/ToneDemo` — and is the next thing to run.
 
 ## MEASURED, third run — the routes take, and the DMA is still not paced
 

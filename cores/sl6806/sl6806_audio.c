@@ -219,6 +219,37 @@ void sl6806_audio_clock_start(unsigned mode)
     }
 }
 
+/*
+ * [V] The EQ sub-block's three clocks, held rather than borrowed.
+ *
+ * The vendor's hardware init (0x00D94AA6..0x00D94AEA) takes module clock 32,
+ * romclk 45 and bit 2 of 0x40000020, clears the 128-word coefficient RAM at
+ * +0x400..+0x5FC one word at a time, and hands all three straight back. Its
+ * stream start then sets 0x40009400 bit 7 - a register inside the range it
+ * just finished treating as RAM.
+ *
+ * [?] So either +0x400 is a control register and the array starts at +0x404,
+ * or the sub-block is both. Either way, if it sits in the playback path it
+ * needs these clocks *while streaming*, and the vendor's own code never holds
+ * them - it does not have to, because the application programs an EQ preset
+ * through a path this analysis has not followed, which would take them again.
+ *
+ * [M] Offered as a hypothesis with a witness, not as a fix. Everything else
+ * that could explain a descriptor retiring in 10 us has been eliminated: the
+ * route, the bit clock, all 32 bits of 0x400E0000, and the general DMA
+ * controller (whose only two call paths in the whole image are the LCDC).
+ */
+void sl6806_audio_eq_hold(int on)
+{
+    if (on) {
+        sl6806_module_enable(SL6806_AUD_EQ_MODULE_ID);
+        romclk_enable(SL6806_AUD_EQ_ROMCLK_ID);
+        sl6806_mmio_set(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
+    } else {
+        sl6806_mmio_clr(SL6806_AUD_PADMUX_REG, SL6806_AUD_PADMUX_EQ);
+    }
+}
+
 void sl6806_audio_clock_stop(void)
 {
     sl6806_mmio_clr(SL6806_AUD_EQ_CTRL, SL6806_AUD_EQ_CTRL_START);

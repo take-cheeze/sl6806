@@ -3946,3 +3946,56 @@ proves.
 in 10 µs is 480 MB/s; 100 MB/s would be 48 µs and 25 MB/s 192 µs. A 64 MHz AHB
 does not move half a gigabyte a second. Whatever `+0x108` retires in 10 µs, it
 is not 4796 bytes of memory.
+
+## 20. The DMA controller is the LCD controller's, and nobody else's
+
+Static, from the call graph rather than from address ranges — which is the
+point, given §19's caveat and the retraction in the commit before it.
+
+§18 raised the possibility that the audio FIFO is fed by the general DMA
+controller. Following every entry point kills it:
+
+| Entry point | Callers |
+|---|---|
+| `0x00D97ED8` channel setup (claims a slot, module clock 33, `0x40001000 + ch*0x40`) | `0x00D3EAC0`, whose literal pool holds `lcdc_dma_write`, `lcdc_set_descriptor`, `lv_lcd_init` |
+| `0x0080DA74` start (§14b) | `0x00D998CC` and `0x0080E7FE`, both on the object at SRAM `0x0082B3BC` |
+| `0x0080DAC8` abort, `0x0080DADE` enable, `0x0080DAFC` remaining | none |
+
+And `0x0082B3BC` is settled rather than inferred: `0x00D99692` is
+`strd r3, r0, [r2]` with `r2 = 0x0082B3BC` and `r3 = 0x400D9000`, so the
+object is `{ base = LCDC, cfg }`.
+
+**The general DMA controller has exactly two call paths in the entire image
+and both are the LCD controller.** Nothing in the audio path touches it. That
+is a disconfirmation, not an absence of evidence.
+
+It also says something positive about the audio block: **it moves its own
+data.** Address, length, watermark and start all live in its own register
+window, which is not the shape of a FIFO fed by an external engine. Its own
+engine is what is not running.
+
+### The elimination table for audio, as it stands
+
+| Candidate | Status |
+|---|---|
+| Output route at `+0x08` | ruled out, measured, 4 settings |
+| Bit clock at `0x40080094` | ruled out, measured, with 3 source modes |
+| A functional clock in `0x400E0000` | ruled out, measured, all 32 bits |
+| The general DMA controller | ruled out, call graph |
+| The vendor's system clock init | ruled out, §19 - it is a reconfiguration path |
+| **The EQ sub-block's clocks, held** | **untried** |
+
+The last row is the hypothesis with the most behind it. The vendor's init
+takes module clock 32, romclk 45 and bit 2 of `0x40000020`, clears the
+coefficient RAM at `+0x400..+0x5FC`, and gives all three back — and its stream
+start then sets `0x40009400` bit 7, a register inside the range it had just
+been treating as RAM. If that sub-block is in the playback path it needs those
+clocks held while streaming, and nothing in the vendor's code holds them
+because the application programs an EQ preset through a path this analysis has
+not followed.
+
+`sl6806_audio_eq_hold()` does it; `make SKETCH=examples/ToneDemo
+EXTRA_FLAGS=-DTONEDEMO_EQ_HOLD=1` tries it, with the same completion-time
+witness. If that does not move the number either, the next thing to read is
+the application's EQ path — `HAL_eq_open`, `hardware EQ open success` — which
+is the one part of the audio subsystem nobody has followed.
