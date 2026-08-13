@@ -271,6 +271,7 @@ enum {
 };
 
 static uint8_t  step = STEP_ANNOUNCE;
+static uint8_t  sub;                  /* item within a paced phase      */
 static uint32_t step_at;
 
 static int      attempt;              /* index into attempts[]          */
@@ -1173,6 +1174,25 @@ void setup()
     heartbeat_at = step_at;
 }
 
+/*
+ * Is there room to print the next block without losing it?
+ *
+ * The console is a 2 KB ring that only drains when the host polls, and this
+ * sketch prints far more than any other example here - the sweep alone is two
+ * 90-character lines, and the diagnostics that follow are a few hundred bytes
+ * each. Runs came back with "[lost output]" holes in exactly those places.
+ *
+ * Pacing one item per loop() call fixed most of it, but "one item" is not a
+ * number of bytes and the poll rate is the host's business, not ours. So ask:
+ * hold the next block until the ring is at least half empty. That is honest
+ * back-pressure rather than a guessed delay, and it costs nothing when the
+ * monitor is keeping up.
+ */
+static int roomToPrint(void)
+{
+    return sl6806_console_space() >= (int)(SL6806_CONSOLE_SIZE / 2);
+}
+
 void loop()
 {
     uint32_t now;
@@ -1182,6 +1202,15 @@ void loop()
      * outside a transfer. */
     if (mclk_mode == MCLK_TOGGLE)
         mclkSpin(MCLK_BURST_US);
+
+    /*
+     * Every phase below prints, and several print a lot. Waiting here rather
+     * than inside each one keeps the back-pressure in a single place - and
+     * the MCLK service above still runs, so a sensor being clocked does not
+     * lose its clock while the monitor catches up.
+     */
+    if (!roomToPrint())
+        return;
 
     switch (step) {
 
@@ -1197,8 +1226,27 @@ void loop()
         break;
 
     case STEP_PULL_SWEEP: {
-        unsigned a = sweepPulls(CAM_PAD_A, "pin 13");
-        unsigned b = sweepPulls(CAM_PAD_B, "pin 12");
+        static unsigned a, b;
+
+        /*
+         * One pad per loop() call. The console is a 2 KB ring that only
+         * drains when the host polls, and this phase used to print the sweep,
+         * four drive tests, three driven-high tests and four hold tests
+         * without ever returning - which overran it and cost real evidence:
+         * runs came back with "[lost output]" where the sweep should have
+         * been. Returning between items is what lets the host catch up.
+         */
+        if (sub == 0) {
+            a = sweepPulls(CAM_PAD_A, "pin 13");
+            sub++;
+            break;
+        }
+        if (sub == 1) {
+            b = sweepPulls(CAM_PAD_B, "pin 12");
+            sub++;
+            break;
+        }
+        sub = 0;
 
         /*
          * Prefer the vendor's own selector if it works, since that is what
@@ -1233,66 +1281,72 @@ void loop()
     }
 
     case STEP_DRIVE_TEST:
-        Serial.println("can software move them?");
-        driveTest(CAM_PAD_A, "SDA/SCL pin 13");
-        driveTest(CAM_PAD_B, "SDA/SCL pin 12");
-        /*
-         * The control pads deserve the same test and never got it. Everything
-         * this sketch concludes about the sensor assumes RESET and PWDN
-         * actually move: a sensor held in reset by a pad that does nothing is
-         * silent for a reason that has no more to do with MCLK than with the
-         * bus. The bus pads were verified from the first version; these were
-         * taken on faith.
-         *
-         * What it can and cannot show: this reads the pad's own input
-         * register, so it proves the pad drives, not that the trace reaches a
-         * module. That is still the half that is testable from here.
-         */
-        driveTest(CAM_PAD_RESET, "RESET pin 14");
-        driveTest(CAM_PAD_PWDN, "PWDN pin 15");
-
-        /*
-         * And the half that decides whether the sensor can ever leave reset.
-         * The vendor configures both control pads with drive 0; if that
-         * cannot hold the line high against whatever is pulling it down,
-         * drive 3 is a one-field change and worth knowing about.
-         */
-        Serial.println();
-        Serial.println("and can they be driven high?");
-        if (driveHighTest(CAM_PAD_RESET, "RESET pin 14", 0)) {
-            ctrl_drive = 0;
-            Serial.println("    the vendor's drive 0 reaches the pin.");
-        } else if (driveHighTest(CAM_PAD_RESET, "RESET pin 14", 3)) {
-            ctrl_drive = 3;
-            Serial.println("    drive 0 does not reach the pin but drive 3 does. Using 3");
-            Serial.println("    below - the vendor's own value would leave the sensor in");
-            Serial.println("    reset, which would explain everything so far.");
-        } else {
-            ctrl_drive = 3;
-            reset_stuck = true;
-            Serial.println("    NEITHER DRIVE STRENGTH CAN PULL THIS LINE HIGH.");
-            Serial.println("    A part wired to it is held in reset permanently, and that");
-            Serial.println("    is a complete explanation for a silent 0x68 - no clock or");
-            Serial.println("    bus question needed. Something drives this net low, or it");
-            Serial.println("    is shorted to ground, or nothing is on the other end.");
+        /* Paced one item per call, for the reason given in STEP_PULL_SWEEP. */
+        switch (sub) {
+        case 0:
+            Serial.println("can software move them?");
+            driveTest(CAM_PAD_A, "SDA/SCL pin 13");
+            sub++;
+            break;
+        case 1:
+            driveTest(CAM_PAD_B, "SDA/SCL pin 12");
+            sub++;
+            break;
+        case 2:
+            driveTest(CAM_PAD_RESET, "RESET pin 14");
+            sub++;
+            break;
+        case 3:
+            driveTest(CAM_PAD_PWDN, "PWDN pin 15");
+            sub++;
+            break;
+        case 4:
+            Serial.println();
+            Serial.println("and can they be driven high?");
+            if (driveHighTest(CAM_PAD_RESET, "RESET pin 14", 0)) {
+                ctrl_drive = 0;
+                Serial.println("    the vendor's drive 0 reaches the pin.");
+            } else if (driveHighTest(CAM_PAD_RESET, "RESET pin 14", 3)) {
+                ctrl_drive = 3;
+                Serial.println("    drive 0 does not reach the pin but drive 3 does. Using");
+                Serial.println("    3 below - the vendor's own value would leave the sensor");
+                Serial.println("    in reset, which would explain everything so far.");
+            } else {
+                ctrl_drive = 3;
+                reset_stuck = true;
+                Serial.println("    NEITHER DRIVE STRENGTH CAN PULL THIS LINE HIGH.");
+                Serial.println("    A part wired to it is held in reset permanently, and");
+                Serial.println("    that is a complete explanation for a silent 0x68 - no");
+                Serial.println("    clock or bus question needed. Something drives this net");
+                Serial.println("    low, or it is shorted to ground, or nothing is there.");
+            }
+            sub++;
+            break;
+        case 5:
+            (void)driveHighTest(CAM_PAD_PWDN, "PWDN pin 15", ctrl_drive);
+            Serial.println();
+            Serial.println("what is on these nets? (charge held with nothing driving)");
+            sub++;
+            break;
+        case 6:
+            (void)holdTest(CAM_PAD_B, "SDA/SCL pin 12");
+            sub++;
+            break;
+        case 7:
+            (void)holdTest(CAM_PAD_A, "SDA/SCL pin 13");
+            sub++;
+            break;
+        case 8:
+            reset_floats = holdTest(CAM_PAD_RESET, "RESET pin 14");
+            sub++;
+            break;
+        default:
+            pwdn_floats = holdTest(CAM_PAD_PWDN, "PWDN pin 15");
+            sub = 0;
+            printAttempt();
+            step = STEP_POWER_LOW;
+            break;
         }
-        (void)driveHighTest(CAM_PAD_PWDN, "PWDN pin 15", ctrl_drive);
-
-        /*
-         * And the question those two answers raise between them: if RESET
-         * keeps whichever level it was last given, is anything out there at
-         * all? The bus pads are the control - they are known to have external
-         * pull-ups, so their lows must decay.
-         */
-        Serial.println();
-        Serial.println("what is on these nets? (charge held with nothing driving)");
-        (void)holdTest(CAM_PAD_B, "SDA/SCL pin 12");
-        (void)holdTest(CAM_PAD_A, "SDA/SCL pin 13");
-        reset_floats = holdTest(CAM_PAD_RESET, "RESET pin 14");
-        pwdn_floats  = holdTest(CAM_PAD_PWDN, "PWDN pin 15");
-
-        printAttempt();
-        step = STEP_POWER_LOW;
         break;
 
     case STEP_POWER_LOW:
