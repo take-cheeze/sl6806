@@ -289,6 +289,28 @@ void loop()
         } else if (++cand < NCANDIDATES) {
             beginCandidate();
         } else {
+            /*
+             * Sample a few registers repeatedly. A configuration file holds
+             * still; a status or counter register does not, and telling those
+             * apart is what decides whether this window is the register file
+             * at all.
+             */
+            int k, r;
+            static const unsigned watch[] = { 0x03, 0x16, 0x2C, 0x60 };
+
+            Serial.println();
+            Serial.println("do these registers hold still? (0x40040000, 8 samples)");
+            for (r = 0; r < 4; r++) {
+                Serial.print("  reg 0x");
+                Serial.print(watch[r], HEX);
+                Serial.print(":");
+                for (k = 0; k < 8; k++) {
+                    Serial.print(" ");
+                    Serial.print(*(volatile uint8_t *)(0x40040000u + watch[r]), HEX);
+                    delayMicroseconds(200);
+                }
+                Serial.println();
+            }
             Serial.println();
             Serial.println("all candidates read. Nothing was written.");
             done = true;

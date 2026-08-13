@@ -358,13 +358,14 @@ In rough order of how much they unlock:
    Four pads came out that way already — the touch panel's reset and
    interrupt, and the camera's reset and power-down — so the method works;
    see §7h of the notes. The buttons are the ones still open.
-3. **Power the camera from a payload.** The indexed register file behind the
-   clock and camera drivers has been found: it is at **`0x40040000`, one byte
-   per register** (§7l), and the four writes that enable the sensor's clock
-   and rail are known to the bit. Everything else in the chain is already
-   built and verified on hardware. What is left is to write them and re-run
-   `examples/CameraDemo` — a write into a register file that plausibly carries
-   rail control, so do it deliberately, with a verified dump in hand.
+3. **Where the indexed register file lives.** The camera's own enable writes
+   are now known to the bit — `reg 0x03` field [4:3] = 01 and `reg 0x16` bit 7,
+   from the sensor driver at `0x00D44EA6` / `0x00D44F06` — and the clock
+   driver's channel handling uses the same file. So the camera is fully
+   specified *except* for that one base address. `0x40040000` looked like it
+   and is not (§7l records the failed identification and the write test that
+   disproved it, so nobody repeats either). Finding it finishes the camera and
+   unlocks 140 call sites besides.
 4. **An FM driver**, now the cheapest working device on the board: an
    RDA5807 at `0x10` on a bus that already reads correctly (§7i). Standard
    part, published register map, and the id read is done.

@@ -977,72 +977,61 @@ means writing an index and seeing the data register change - and writing to a
 suspected power/clock file is exactly what should not be done casually. That
 is the wall this line of attack reaches.
 
-## 7l. FOUND: the indexed register file is at `0x40040000`, one byte per register
+## 7l. RETRACTED: `0x40040000` is not the indexed register file
 
-Register **N is at `0x40040000 + N`**. Not `base + N*4`, and not an index/data
-pair - the reason it looked indirect is that the vendor's *veneer* takes an
-index at run time, while the mask ROM, knowing the register at build time,
-loads its absolute address as a literal.
+An earlier revision of this section claimed the file had been found at
+`0x40040000`, one byte per register. **That was wrong**, and the way it failed
+is worth more than the claim was.
 
-That is what gives it away. A sweep of the ROM for byte read-modify-writes
-through a `0x4xxxxxxx` literal finds a cluster at `0x04E00`-`0x05800` working
-on `0x40040001`, `0x40040004`, `0x4004000A`, `0x4004000B`, `0x4004000E` and
-`0x40040060` - every one of them `0x40040000` plus a number inside the file's
-`0x00`..`0x82` index range. One of them is a plain bit setter:
+**The evidence that looked good.** Sweeping the mask ROM for byte
+read-modify-writes through a `0x4xxxxxxx` literal finds a cluster at
+`0x04E00`-`0x05800` working on `0x40040001`, `0x40040004`, `0x4004000A`,
+`0x4004000B`, `0x4004000E` and `0x40040060` - each `0x40040000` plus a number
+inside the file's `0x00..0x82` index range, one of them a bare `ldrb` / `uxtb`
+/ set-bit-3 / `strb` setter in exactly the veneers' idiom. That part is real
+and still stands; it is simply a different peripheral with byte registers.
 
-```
-0x00004E38   ldrb r3, [r2]        ; r2 = 0x4004000B
-             uxtb r3, r3
-             cbz  r0, clear
-             orr  r3, r3, #8      ; set bit 3
-   strb:     strb r3, [r2]
-             bx lr
-   clear:    and  r3, r3, #0xF7
-             b    strb
-```
-
-`uxtb` on a byte load, one bit set or cleared, written back - the same idiom
-the veneer callers use, and the reason the values are masked to bytes
-everywhere.
-
-### Confirmed against the live chip
-
-`examples/RegFileProbe` reads the window as bytes in bootloader mode, where the
-camera is off and some clocks are running. Four registers whose meaning is
-known independently all agree:
-
-| reg | reads | expected, camera off | |
-|---|---|---|---|
-| `0x03` | `0x00` | field [4:3] clear | ✓ camera not enabled |
-| `0x16` | `0x01` | bit 7 clear | ✓ camera enable off |
-| `0x2C` | `0x4A` = `01001010` | clock driver sets bit (channel-2) | ✓ channels 3 and 5 on, **bit 4 clear - channel 6, the camera's MCLK, is off** |
-| `0x0B` | `0x0F` | ROM's bit-3 setter | ✓ bit 3 set |
-
-The `0x2C` reading is the strongest: the one clock channel known to belong to
-the camera is the one that is off, on a device where the camera is off.
-
-### What a payload now has to do to power the camera
-
-Every step is known, and all of it is `0x40040000 + N`:
+**Why the confirmation was worthless.** Four registers were checked against
+their supposed meanings, and three of them - `0x03` reading `0x00`, `0x16`
+reading `0x01`, `0x0B` having bit 3 set - are satisfied by very nearly any
+window. The fourth carried the argument: `0x2C` read `0x4A`, which was
+interpreted as the clock driver's channel bitmask with channels 3 and 5 on and
+channel 6, the camera's, off. Sampling it eight times in a row settles it:
 
 ```
-reg 0x03 = (reg 0x03 & 0x5D) | 0x20      ; clock channel frequency = 2800
-reg 0x2C |= 1 << (6 - 2)                 ; start clock channel 6
-reg 0x03 = (reg 0x03 & 0xE7) | 0x08      ; camera field [4:3] = 01
-reg 0x16 |= 0x80                         ; camera enable
-                                         ; then the pad and reset sequence
-                                         ; examples/CameraDemo already runs
+reg 0x2C:  6A DB 31 C4 B5 6A DB 94
 ```
 
-Register `0x03` carrying both the clock frequency selector and the camera field
-is why the two drivers mask it differently - `0x5D` for the clock, `0xE7` for
-the camera.
+It changes on every read. It is a counter or a status register, and `0x4A` was
+one sample of a moving target. A single reading of a register that never holds
+still was the load-bearing evidence for the whole identification.
 
-**Untested.** Writing these is the experiment that would confirm the whole
-chain, and it is a write into a register file that plausibly carries rail
-control, so it wants deliberate consent rather than curiosity. Every value
-above is a read-modify-write with the vendor's own mask, so nothing is touched
-that the stock firmware does not touch.
+**The write test.** Writing the vendor's own four values - clock frequency and
+channel into `0x03` and `0x2C`, camera field and enable into `0x03` and `0x16` -
+was harmless and conclusive:
+
+```
+reg 0x03: 0x00 -> 0x20   reads back 0x00   ignored
+reg 0x2C: 0x85 -> 0x95   reads back 0x67   changed, but not to what was written
+reg 0x03: 0x00 -> 0x08   reads back 0x00   ignored
+reg 0x16: 0x01 -> 0x81   reads back 0x01   ignored
+```
+
+Nothing stuck, the device stayed up, USB stayed enumerated and the FM tuner
+still answered afterwards. Read-back verification is what turned a wrong guess
+into a clean negative instead of a mystery, and it is the reason the write was
+worth doing at all.
+
+**What `0x40040000` probably is.** A live peripheral with byte-wide registers,
+the mask ROM's single most referenced base, holding some registers steady
+(`0x60` reads `0x99` every time, `0x16` reads `0x01`) while others free-run -
+and busy during USB download mode, which is the only mode we can observe it
+in. A USB controller fits every one of those.
+
+**Still true, and independent of all this:** the camera's two enable writes at
+`0x00D44EA6` and `0x00D44F06` - registers `0x03` and `0x16` of the file,
+whatever its address - and the clock driver's use of `0x03` and `0x2C`. Those
+come from the drivers' own code. What remains unknown is where the file lives.
 
 ## 7k. PSMP — the settings partition, decoded
 

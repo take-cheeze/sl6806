@@ -924,6 +924,108 @@ static void pullTimeReport(uint32_t id, const char *name)
     Serial.println();
 }
 
+/* ------------------------------------------- powering the sensor up */
+
+/*
+ * ===================================================================
+ *  THE ONLY WRITES IN THIS SKETCH THAT ARE NOT ON THE I2C BUS
+ * ===================================================================
+ * Four bytes into the indexed register file at 0x40040000 (§7l), which is
+ * where the clock and camera drivers switch the sensor's clock and rail on.
+ * Everything else in this sketch is read-only or drives a pad.
+ *
+ * Why this is safe enough to run, stated rather than assumed:
+ *
+ *   - Each one is a read-modify-write with the vendor's own mask, so only the
+ *     bits the stock firmware touches are touched.
+ *   - The base is confirmed against four registers whose meaning is known
+ *     independently, read live in bootloader mode (§7l).
+ *   - Payload mode never writes flash, so the worst outcome is a device that
+ *     stops responding until it is unplugged.
+ *
+ * DEFAULT OFF, BECAUSE THE BASE IS WRONG. This ran on hardware and all four
+ * writes were ignored: 0x40040000 is not the register file, it is a live
+ * peripheral - probably the USB controller - whose 0x2C free-runs (§7l). The
+ * machinery is kept because it is correct in every part except the address,
+ * and switching it back on is the experiment to run the day that address is
+ * known. Read-back verification is what made the failure legible; keep it.
+ *
+ * The register map, all of it from the vendor's own code:
+ *
+ *   0x03  bit 5      clock channel frequency selector, 2800 (§7h)
+ *         bits [4:3] the camera's field, set to 01
+ *   0x2C  bit 4      clock channel 6 running (bit = channel - 2)
+ *   0x16  bit 7      the camera's enable
+ */
+#define CAMERA_POWER_WRITES 0
+
+#define REGFILE_BASE 0x40040000u
+
+#if CAMERA_POWER_WRITES
+
+static inline uint8_t regRead(unsigned idx)
+{
+    return *(volatile uint8_t *)(REGFILE_BASE + idx);
+}
+
+static inline void regWrite(unsigned idx, uint8_t v)
+{
+    *(volatile uint8_t *)(REGFILE_BASE + idx) = v;
+}
+
+/*
+ * One read-modify-write, announced before it happens and verified after.
+ * Announcing first means a device that dies mid-sequence names the register
+ * that killed it; verifying after means a register that ignores the write is
+ * reported rather than assumed to have taken it.
+ */
+static void regSet(unsigned idx, uint8_t keep, uint8_t set, const char *what)
+{
+    uint8_t before, want, after;
+
+    before = regRead(idx);
+    want   = (uint8_t)((before & keep) | set);
+
+    Serial.print("  reg 0x");
+    Serial.print(idx, HEX);
+    Serial.print(": 0x");
+    Serial.print(before, HEX);
+    Serial.print(" -> 0x");
+    Serial.print(want, HEX);
+    Serial.print("  (");
+    Serial.print(what);
+    Serial.println(")");
+
+    regWrite(idx, want);
+    after = regRead(idx);
+
+    if (after != want) {
+        Serial.print("    reads back 0x");
+        Serial.print(after, HEX);
+        Serial.println(" - the write did not stick.");
+    }
+}
+
+static void powerTheSensor(void)
+{
+    Serial.println();
+    Serial.println("powering the sensor through the register file at 0x40040000,");
+    Serial.println("with the vendor's own masks (notes 7l):");
+
+    /* Clock first, exactly as the vendor's power_on does: set the channel
+     * frequency, then start the channel. */
+    regSet(0x03, 0x5D, 0x20, "clock channel frequency 2800");
+    regSet(0x2C, 0xFF, 1u << (6 - 2), "start clock channel 6 - MCLK");
+
+    /* Then the camera's own two writes, from 0x00D44EA6 and 0x00D44F06. */
+    regSet(0x03, 0xE7, 0x08, "camera field [4:3] = 01");
+    regSet(0x16, 0xFF, 0x80, "camera enable");
+
+    Serial.println();
+}
+
+#endif /* CAMERA_POWER_WRITES */
+
 /* ----------------------------------------------------------- reporting */
 
 static void printAttempt(void)
@@ -1394,6 +1496,9 @@ void loop()
             break;
         default:
             pullTimeReport(CAM_PAD_PWDN, "PWDN pin 15");
+#if CAMERA_POWER_WRITES
+            powerTheSensor();
+#endif
             sub = 0;
             printAttempt();
             step = STEP_POWER_LOW;
