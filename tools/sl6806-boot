@@ -1,0 +1,232 @@
+#!/usr/bin/env python3
+"""
+sl6806-boot - map the HLKJ bootloader out of a flash dump and disassemble it.
+
+WHY THIS EXISTS. tools/sl6806-sram does this for the application's SRAM-
+resident half; nothing did it for the bootloader, and the bootloader turns out
+to be where a lot of the interesting code is. The SD/MMC investigation (notes
+23) ran entirely on a hand-extracted copy of it sitting in a scratch
+directory, which is not a thing anyone else can reproduce.
+
+The bootloader matters for three reasons:
+
+  - **It is a small self-contained program that touches each peripheral
+    once**, so its uses of a block are legible where the application's are
+    buried under a scene framework (7c says this and then only half uses it).
+  - **Its strings are below file 0x10000**, outside FIRM, so tools that scan
+    the application - including tools/sl6806-xref - cannot see them. Every
+    `sdio(...)` and `hal_sd(...)` string in the image is in here.
+  - **It runs from SRAM at a different base than flash**, so a literal that
+    looks like nothing at 0x00C0xxxx resolves at 0x0082xxxx.
+
+    tools/sl6806-boot dump.bin                     # verify and print the map
+    tools/sl6806-boot dump.bin --strings sdio      # strings, at run addresses
+    tools/sl6806-boot dump.bin 0x00822768 --dis 96 # disassemble a routine
+    tools/sl6806-boot dump.bin --xref 0x40003000   # who loads this literal?
+    tools/sl6806-boot dump.bin --extract boot.bin  # the segment, for Ghidra
+
+THE MAPPING, from the HLKJ header (notes 4):
+
+    file 0x60 .. 0x60+seglen   ->   SRAM 0x0081FC00 ..
+
+so a run address is `file offset + 0x81FBA0`, and Ghidra wants the extracted
+segment loaded at 0x0081FC00 as ARM:LE:32:Cortex.
+
+--dis needs arm-none-eabi-objdump on PATH; everything else is pure Python.
+"""
+
+import argparse
+import struct
+import subprocess
+import sys
+
+HDR_MAGIC = b'HLKJ'
+SEG_OFF = 0x60
+
+
+def crc16(buf, crc=0xFFFF):
+    """CRC16-CCITT-FALSE, the one both HLKJ checksums use (notes 4)."""
+    for b in buf:
+        crc ^= b << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+class Boot:
+    def __init__(self, blob):
+        if blob[:4] != HDR_MAGIC:
+            raise ValueError('not an SL6806 flash dump: no HLKJ magic at 0')
+        self.blob = blob
+        self.load = struct.unpack_from('<I', blob, 0x04)[0]
+        self.entry = struct.unpack_from('<I', blob, 0x08)[0]
+        self.seglen = struct.unpack_from('<I', blob, 0x10)[0]
+        self.seg_crc = struct.unpack_from('<I', blob, 0x14)[0]
+        self.hdr_crc = struct.unpack_from('<I', blob, 0x5C)[0]
+        self.seg = blob[SEG_OFF:SEG_OFF + self.seglen]
+
+    # --- addresses ---------------------------------------------------
+
+    @property
+    def bias(self):
+        """run address = file offset + bias"""
+        return self.load - SEG_OFF
+
+    def a2o(self, addr):
+        return addr - self.bias
+
+    def o2a(self, off):
+        return off + self.bias
+
+    def contains(self, addr):
+        o = self.a2o(addr)
+        return SEG_OFF <= o < SEG_OFF + self.seglen
+
+    # --- checks ------------------------------------------------------
+
+    def verify(self):
+        return (crc16(self.seg) == self.seg_crc,
+                crc16(self.blob[0x00:0x5C]) == self.hdr_crc)
+
+    # --- literals ----------------------------------------------------
+
+    def literal_loads(self):
+        """(instruction addr, literal addr) for Thumb PC-relative loads.
+
+        Same two encodings tools/sl6806-xref decodes, over the segment rather
+        than over FIRM.
+        """
+        seg, base = self.seg, self.o2a(SEG_OFF)
+        n = len(seg)
+        for off in range(0, n - 3, 2):
+            hw = seg[off] | (seg[off + 1] << 8)
+            if 0x4800 <= hw <= 0x4FFF:
+                yield base + off, ((base + off + 4) & ~3) + (hw & 0xFF) * 4
+            elif (hw & 0xFF7F) == 0xF85F:
+                hw2 = seg[off + 2] | (seg[off + 3] << 8)
+                imm = hw2 & 0xFFF
+                pc = (base + off + 4) & ~3
+                yield base + off, pc + imm if (hw >> 7) & 1 else pc - imm
+
+    def word(self, addr):
+        o = self.a2o(addr) - SEG_OFF
+        if 0 <= o <= len(self.seg) - 4:
+            return struct.unpack_from('<I', self.seg, o)[0]
+        return None
+
+    def xref(self, target):
+        for ia, la in self.literal_loads():
+            if self.word(la) == target:
+                yield ia, la
+
+    # --- strings -----------------------------------------------------
+
+    def strings(self, minlen=4):
+        """(run address, text) for printable runs inside the segment."""
+        cur, start = [], None
+        for i, b in enumerate(self.seg):
+            if 0x20 <= b < 0x7F:
+                if start is None:
+                    start = i
+                cur.append(chr(b))
+            else:
+                if start is not None and len(cur) >= minlen:
+                    yield self.o2a(SEG_OFF + start), ''.join(cur)
+                cur, start = [], None
+        if start is not None and len(cur) >= minlen:
+            yield self.o2a(SEG_OFF + start), ''.join(cur)
+
+
+def disassemble(boot, addr, count, objdump):
+    off = boot.a2o(addr) - SEG_OFF
+    if not (0 <= off < len(boot.seg)):
+        sys.exit('error: %#010x is not in the bootloader segment' % addr)
+
+    import tempfile, os
+    fd, path = tempfile.mkstemp(suffix='.bin')
+    try:
+        os.write(fd, boot.seg)
+        os.close(fd)
+        out = subprocess.run(
+            [objdump, '-D', '-b', 'binary', '-m', 'arm', '-M', 'force-thumb',
+             '--adjust-vma=%#x' % boot.o2a(SEG_OFF),
+             '--start-address=%#x' % addr,
+             '--stop-address=%#x' % (addr + count), path],
+            capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+
+    if out.returncode != 0:
+        sys.exit(out.stderr.strip() or 'objdump failed')
+    for line in out.stdout.splitlines():
+        if ':\t' in line:
+            print(line)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('dump', help='flash dump (dump.bin)')
+    p.add_argument('address', nargs='?', help='run address to disassemble')
+    p.add_argument('--dis', type=int, metavar='N',
+                   help='disassemble N bytes at `address`')
+    p.add_argument('--xref', metavar='VALUE',
+                   help='find the code that loads this 32-bit literal')
+    p.add_argument('--strings', nargs='?', const='', metavar='SUBSTRING',
+                   help='print strings, optionally filtered')
+    p.add_argument('--extract', metavar='FILE',
+                   help='write the raw segment out for a disassembler')
+    p.add_argument('--objdump', default='arm-none-eabi-objdump')
+    args = p.parse_args()
+
+    with open(args.dump, 'rb') as f:
+        boot = Boot(f.read())
+
+    seg_ok, hdr_ok = boot.verify()
+
+    if args.extract:
+        with open(args.extract, 'wb') as f:
+            f.write(boot.seg)
+        print('wrote %s: %d bytes, load at %#010x'
+              % (args.extract, len(boot.seg), boot.load))
+        return
+
+    if args.strings is not None:
+        want = args.strings.lower()
+        for addr, text in boot.strings():
+            if not want or want in text.lower():
+                print('%#010x  %s' % (addr, text))
+        return
+
+    if args.xref:
+        target = int(args.xref, 0)
+        hits = list(boot.xref(target))
+        print('%#010x referenced by %d literal load(s)' % (target, len(hits)))
+        for ia, la in hits:
+            print('   loaded at %#010x   (pool %#010x)' % (ia, la))
+        return
+
+    if args.address:
+        addr = int(args.address, 0)
+        if args.dis:
+            disassemble(boot, addr, args.dis, args.objdump)
+        else:
+            print('%#010x -> file %#08x' % (addr, boot.a2o(addr)))
+        return
+
+    print('HLKJ bootloader')
+    print('  segment      file %#08x .. %#08x  (%d bytes)'
+          % (SEG_OFF, SEG_OFF + boot.seglen, boot.seglen))
+    print('  loads at     %#010x' % boot.load)
+    print('  entry        %#010x  (Thumb, runs at %#010x)'
+          % (boot.entry, boot.entry & ~1))
+    print('  run address  = file offset + %#08x' % boot.bias)
+    print('  segment CRC  %s' % ('ok' if seg_ok else 'MISMATCH'))
+    print('  header CRC   %s' % ('ok' if hdr_ok else 'MISMATCH'))
+    print()
+    print('  Ghidra: load the --extract output as raw binary,')
+    print('          ARM:LE:32:Cortex, base %#010x' % boot.load)
+
+
+if __name__ == '__main__':
+    main()

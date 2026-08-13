@@ -11,7 +11,7 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
 TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
-         test_regfile test_audio test_bt
+         test_regfile test_audio test_bt test_sd
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -41,6 +41,9 @@ run-test_audio: test_audio
 	./$<
 
 run-test_bt: test_bt
+	./$<
+
+run-test_sd: test_sd
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -93,6 +96,15 @@ test_audio: test_audio.c $(CORE)/sl6806_audio.c $(CORE)/sl6806_module.c
 # so the order is the whole content and every poll in it has to be bounded -
 # the PLL's lock bit is known not to set in bootloader mode.
 test_bt: test_bt.c $(CORE)/sl6806_bt.c $(CORE)/sl6806_module.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
+
+# The SD host against a model of the controller, a card, and the gate pair in
+# front of both. Nothing in this driver has run on hardware, so these check
+# that it performs the mask ROM's sequence: the command-word table, the order
+# of identification, the two clock configurations, eight words per FIFO
+# acknowledgement, and byte addressing for everything but SDHC.
+test_sd: test_sd.c $(CORE)/sl6806_sd.c $(CORE)/sl6806_module.c \
+         $(CORE)/sl6806_padctl.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:

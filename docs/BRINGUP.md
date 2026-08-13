@@ -146,7 +146,43 @@ reasoning and its consequences for your own `loop()`.
 The console is bidirectional. Type into the monitor and the characters arrive
 at `Serial.read()`. `tools/sl6806-monitor --send TEXT` does it in one shot.
 
-## Step 4 — the highest-value thing on the bench right now
+## Step 4 — the card slot, which needs a card and five minutes
+
+```
+make SKETCH=examples/SdProbe RUN_MODE=poll run
+```
+
+The SD host was found in the mask ROM on 2026-08-13 and run the same day.
+What it says so far: the block is there — the cold registers read back the
+ROM's own bring-up values, including the CMD0 command word in `CMD` — and
+**no command completes**, not this driver's and not the ROM's own at boot.
+So the useful run today is the wall:
+
+```
+make SKETCH=examples/SdWall RUN_MODE=poll run
+```
+
+It walks `0x400E0000` with "does CMD0 complete" as the witness, which is a
+sharper test than the audio one: CMD0 needs no card, no data path and no
+response. A card in the slot changes nothing and is not needed.
+
+`SdProbe` is still worth a run with a card in, and now checks first whether
+writes to the block stick at all — the measurement its first version was
+missing, and the one that separates a live block from a gated one reading
+plausible leftovers. If it ever gets past CMD0, look at:
+
+1. **The card type, and the capacity.** A capacity that comes out as a real
+   card size out of four words of CSD is the strongest evidence a probe can
+   produce, for the same reason the register file's rails decoding to 2.8 V
+   was: bytes with no reason to produce a recognisable number.
+2. **Sector 0, twice.** The `0x55AA` at the end of it and a partition table
+   or a FAT boot sector at the start of it, identical on a re-read. That pair
+   is the data path working; a stale FIFO would not produce it.
+
+[SD.md](SD.md) has the register map and reads the three possible outcomes of
+the walk.
+
+## Step 5 — the register file and the camera
 
 ```
 make SKETCH=examples/RegFileProbe RUN_MODE=poll run
@@ -217,7 +253,7 @@ on an unexplained hardware result, not on your setup.
 | `shiftOut` / `shiftIn` / `pulseIn` | Built on the digital calls, so exactly as available as those are. |
 | `analogRead` / `analogWrite` / `tone` / `attachInterrupt` | No registers known. These report rather than silently doing nothing. |
 | Touch panel coordinates | The interrupt pad and reset have run on hardware; the CST816 register read that produces X/Y has not been confirmed there yet. See `examples/TouchDemo`. |
-| Camera — an actual image | The sensor's bus, address, pads and now its supply rail are all reachable, and step 4 above is the test. What is *not* decoded is the DVP/CSI front end the pixels leave on: the firmware reaches it as a named channel resource, not as a register block. So finding the sensor is in reach; capturing a frame is not. |
+| Camera — an actual image | The sensor's bus, address, pads and now its supply rail are all reachable, and step 5 above is the test. What is *not* decoded is the DVP/CSI front end the pixels leave on: the firmware reaches it as a named channel resource, not as a register block. So finding the sensor is in reach; capturing a frame is not. |
 | `MODE=firmware` | Unproven, and the only thing here that can leave a non-booting device. Nothing in this document needs it. See [FLASHING.md](FLASHING.md). |
 
 ## Recovery
