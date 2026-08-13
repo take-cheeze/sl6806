@@ -599,9 +599,31 @@ Every call is a delay, a pad, or the clock. There is no fourth thing - no
 regulator enable, no power-domain call - so if sensor power is the problem it
 is on the module and not in this routine.
 
-`clk(channel, op, arg)` at **`0x00CC769C`** is called three times: `(6, 1, 0)`,
-then `(6, 2, &2800)` after a 5 ms wait, then `(6, 0, 0)`. That dispatcher is
-ordinary flash and it decodes:
+**The op codes fall out of the power-*down* routine.** `0x00D44AB2` is the
+camera's teardown, and it is short enough to read whole:
+
+```
+rom_1EC4(80)                       ; unattributed
+gpio_write(PWDN, 0); gpio_write(RESET, 0)
+delay_ms(10)
+clk(6, 1, 0)                       ; the only clk call here
+pad_configure(0x00047780)          ; RESET \
+pad_configure(0x00047F80)          ; PWDN   > all three parked on function 15
+pad_configure(0x00041F80)          ; MCLK  /
+```
+
+Power-up runs `(6,1,0)`, `(6,2,&2800)`, `(6,0,0)`; power-down runs `(6,1,0)`
+alone. So **op 1 stops the channel, op 2 sets its frequency, op 0 starts it** -
+which is the ordering both routines need and neither contradicts.
+
+It also settles the three pad ids §7g had left as "the rest of that selector
+group, role unknown": `0x00041F80`, `0x00047780` and `0x00047F80` are MCLK,
+RESET and PWDN again, with the function nibble at 15 - the parked state, input
+buffer off. Not three more pads.
+
+`clk(channel, op, arg)` at **`0x00CC769C`** is called three times on the way
+up: `(6, 1, 0)`, then `(6, 2, &2800)` after a 5 ms wait, then `(6, 0, 0)`.
+That dispatcher is ordinary flash and it decodes:
 
 ```
 channel 0..1  ->  0x00CC75F0

@@ -126,7 +126,13 @@ const uint8_t sl6806_nvendor_pins =
  *       All four are alternate functions, so they are pads to leave alone
  *       rather than pins to drive.
  *   0x41F80 0x47780 0x47F80
- *       the rest of that selector group, role still unknown.
+ *       not three more pads: these are MCLK, RESET and PWDN again - bank 4
+ *       pins 3, 14 and 15 - with the function nibble set to 15, which §7g
+ *       measured as a state with the input buffer off. The camera's
+ *       power-down routine at 0x00D44AB2 parks all three that way after
+ *       driving RESET and PWDN low and stopping clock channel 6. So the
+ *       "unknown selector group" was the off-state of the pads directly
+ *       above it.
  *
  * See docs/sl6806_re_notes.md §7h for the touch and camera devices these
  * belong to, register by register.

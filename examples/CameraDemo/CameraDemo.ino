@@ -194,10 +194,11 @@
  * before call overhead, and slower is always safe. */
 #define I2C_HALF_US    5
 
-/* Half a bit as a number of MCLK pulses, when MCLK is being toggled. Each
- * pulse is two pad writes, so this sets both the clock the sensor sees and
- * the bus rate; both end up well under their limits, which is fine. */
-#define I2C_HALF_PULSES 24
+/* How long to keep MCLK running after the power-up before asking the sensor
+ * anything. A part of this family brings its register block up off MCLK, so
+ * a clock that only exists during the transfer may be a clock that arrives
+ * too late; this gives it a settled one first. */
+#define MCLK_SETTLE_MS  30
 
 /* How long to wait for a slave that is stretching the clock. Generous: this
  * is an error path, and in poll mode it still has to return promptly. */
@@ -208,10 +209,11 @@
  * too early would report every pull-up as broken. */
 #define PULL_SETTLE_US 500
 
-/* A burst of MCLK to run inside one loop() call while a power-up delay is
- * being waited out. Short enough that poll mode's SCSI handler still returns
- * in time, long enough that the sensor sees a clock rather than an edge. */
-#define MCLK_BURST_PULSES 400
+/* How long to run MCLK inside one loop() call while a power-up delay is being
+ * waited out. Short enough that poll mode's SCSI handler still returns in
+ * time, long enough that the gaps between loop() calls are the only breaks in
+ * the clock. */
+#define MCLK_BURST_US   1000
 
 /* ---------------------------------------------------------- the sketch */
 
@@ -291,27 +293,95 @@ static uint8_t bus_error;
 
 /* ------------------------------------------------------------ the MCLK */
 
-/* One MCLK cycle. Two pad writes, each a bank lookup and a store, so the pad
- * ends up somewhere around a megahertz - orders below what clock channel 6
- * would give it, and a great deal more than nothing. */
-static inline void mclk_pulse(void)
+/*
+ * The fast path to one pad.
+ *
+ * sl6806_pad_write() decodes the packed id, looks the bank base up and range
+ * checks it on every call, which is right for a GPIO API and wrong for a
+ * clock: it put MCLK somewhere around a megahertz, which is at the bottom of
+ * what a sensor of this family will run its register block on. The bank base
+ * table and the set/clear offsets are both public (sl6806_padctl.h), so the
+ * two addresses can be worked out once and the edge becomes a single store.
+ */
+static volatile uint32_t *mclk_set;
+static volatile uint32_t *mclk_clr;
+static uint32_t           mclk_mask;
+
+static void mclkFastInit(void)
 {
-    sl6806_pad_write(CAM_MCLK_GPIO, 1);
-    sl6806_pad_write(CAM_MCLK_GPIO, 0);
+    uint32_t base = sl6806_pad_bank_base[SL6806_PAD_BANK(CAM_MCLK_GPIO)];
+
+    /* +0x034 sets a pin, +0x038 clears it; one bit per pin. [V], ROM 0x6DE. */
+    mclk_set  = (volatile uint32_t *)(base + 0x034u);
+    mclk_clr  = (volatile uint32_t *)(base + 0x038u);
+    mclk_mask = 1u << SL6806_PAD_PIN(CAM_MCLK_GPIO);
 }
 
-/* Run MCLK for a while, if this attempt drives it in software. Called
- * wherever the sketch would otherwise idle: the clock stops whenever the
- * sketch is not in one of these loops, which is the honest weakness of the
- * whole approach. */
-static void mclkService(unsigned pulses)
+static inline void mclk_pulse(void)
 {
-    unsigned i;
+    *mclk_set = mclk_mask;
+    *mclk_clr = mclk_mask;
+}
 
-    if (mclk_mode != MCLK_TOGGLE)
+/*
+ * Run MCLK for a length of *time* rather than a number of edges.
+ *
+ * This is the fix for the second half of the problem. Counting pulses meant
+ * the clock ran for however long that many edges happened to take, so making
+ * the edges faster made the clock stop sooner - the duty cycle of the whole
+ * scheme stayed just as bad. Spinning on micros() instead means the pad is
+ * clocked for the entire interval, and the interval is also the I2C bit
+ * timing, so the sensor gets a clock during precisely the transfers that need
+ * one.
+ */
+static void mclkSpin(uint32_t us)
+{
+    uint32_t start;
+
+    if (mclk_mode != MCLK_TOGGLE) {
+        delayMicroseconds(us);
         return;
-    for (i = 0; i < pulses; i++)
-        mclk_pulse();
+    }
+
+    /* Never spin on a clock that is not running: if no counter advances,
+     * micros() is frozen and this would never return - and in poll mode that
+     * takes the device off the USB bus until it is unplugged. */
+    if (!sl6806_tick_mask()) {
+        delayMicroseconds(us);
+        return;
+    }
+
+    start = micros();
+    do {
+        int i;
+        /* A batch between clock reads: micros() costs far more than an edge,
+         * and reading it every cycle would halve the frequency. */
+        for (i = 0; i < 32; i++)
+            mclk_pulse();
+    } while (micros() - start < us);
+}
+
+/* Measure what the pad is actually being given, because "a software square
+ * wave" is not a specification and the answer decides whether MCLK stays a
+ * suspect. Counts edges across a fixed window and returns kHz. */
+static uint32_t mclkMeasure(void)
+{
+    uint32_t start, elapsed, pulses = 0;
+
+    if (!sl6806_tick_mask())
+        return 0;
+
+    start = micros();
+    do {
+        int i;
+        for (i = 0; i < 32; i++)
+            mclk_pulse();
+        pulses += 32;
+    } while ((elapsed = micros() - start) < 10000u);
+
+    if (!elapsed)
+        return 0;
+    return (pulses * 1000u) / elapsed;      /* cycles per ms = kHz */
 }
 
 /* ------------------------------------------------------- the I2C lines */
@@ -328,10 +398,9 @@ static inline int  sda_read(void)    { return sl6806_pad_read(pad_sda); }
  */
 static void half(void)
 {
-    if (mclk_mode == MCLK_TOGGLE)
-        mclkService(I2C_HALF_PULSES);
-    else
-        delayMicroseconds(I2C_HALF_US);
+    /* mclkSpin() falls back to a plain delay when MCLK is not being toggled,
+     * so the bus timing is the same either way. */
+    mclkSpin(I2C_HALF_US);
 }
 
 /* Release SCL and wait for it to actually rise: a slave is allowed to hold it
@@ -349,10 +418,7 @@ static int scl_release(void)
             bus_error = BUS_SCL_STUCK;
             return 0;
         }
-        if (mclk_mode == MCLK_TOGGLE)
-            mclk_pulse();
-        else
-            delayMicroseconds(1);
+        mclkSpin(1);
         waited++;
     }
     return 1;
@@ -937,6 +1003,7 @@ void setup()
      * display, so it does it itself. Everything here goes through the pad API
      * by id - see the note on CAM_PAD_RESET. */
     sl6806_gpio_vendor_register(sl6806_padctl_vendor());
+    mclkFastInit();
 
     if (!sl6806_gpio_available())
         Serial.println("GPIO reports unavailable - nothing below will mean anything.");
@@ -968,7 +1035,8 @@ void loop()
     /* Keep MCLK alive across whatever wait we are in. In mux mode this costs
      * nothing; in toggle mode it is the only reason the sensor sees a clock
      * outside a transfer. */
-    mclkService(MCLK_BURST_PULSES);
+    if (mclk_mode == MCLK_TOGGLE)
+        mclkSpin(MCLK_BURST_US);
 
     switch (step) {
 
@@ -1065,6 +1133,40 @@ void loop()
     case STEP_SETTLE:
         if (millis() - step_at < 20)
             break;
+
+        /*
+         * The vendor's 20 ms is up. Before asking anything, give a
+         * software-clocked sensor a settled run of MCLK and say how fast it
+         * actually is - the whole "is it MCLK?" question turns on a number
+         * that was never measured, only assumed to be "slow".
+         */
+        if (mclk_mode == MCLK_TOGGLE) {
+            uint32_t khz = mclkMeasure();
+
+            Serial.print("  MCLK measured at ");
+            if (khz >= 1000) {
+                Serial.print(khz / 1000);
+                Serial.print(".");
+                Serial.print((khz % 1000) / 100);
+                Serial.print(" MHz");
+            } else {
+                Serial.print(khz);
+                Serial.print(" kHz");
+            }
+            Serial.print(", settling it for ");
+            Serial.print(MCLK_SETTLE_MS);
+            Serial.println(" ms");
+
+            /* All of it inside this one loop() call. That is deliberate - the
+             * point is a clock with no gaps in it - and 30 ms is well inside
+             * what poll mode can spend in the ROM's USB handler. */
+            {
+                uint32_t spun;
+                for (spun = 0; spun < MCLK_SETTLE_MS; spun++)
+                    mclkSpin(1000);
+            }
+        }
+
         step = STEP_SCAN;
         break;
 
