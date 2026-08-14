@@ -253,21 +253,37 @@ void loop()
     /* Give the host one more poll to collect that before USB disappears. */
     delay(50);
 
+    /*
+     * COPY FIRST. The copy reads XIP flash, and the next step switches off
+     * every module clock including the flash controller's. Doing it the other
+     * way round copies garbage out of an unclocked controller and branches
+     * into it - measured 2026-08-14, and the device simply did nothing.
+     */
+    {
+        int err = sl6806_firm_copy(&firm);
+
+        if (err != SL6806_FIRM_OK) {
+            Serial.print("copy refused: ");
+            Serial.println(why(err));
+            parsed = 0;
+            return;
+        }
+    }
+
 #if FIRMBOOT_CLOCKS
     /*
-     * hardware_init's order, and the first step is the one that was missing:
-     * every module clock off, then the clock tree, then the jump. Both take
-     * the console with them - USB's module clock is among the ninety-six -
-     * which is why they come after the flush and immediately before the
-     * handover.
+     * Now hardware_init's order, with flash no longer needed: every module
+     * clock off, then the clock tree. Both take the console with them - USB's
+     * module clock is among the ninety-six - which is why they come after the
+     * flush and immediately before the handover.
      */
     sl6806_hwinit_modules_off();
     sl6806_hwinit_clocks();
 #endif
 
-    sl6806_firm_boot(&firm);
+    sl6806_firm_enter(&firm);
 
-    /* Only reached if the boot refused, which parse should have prevented. */
-    Serial.println("sl6806_firm_boot() refused - nothing was entered.");
+    /* Only reached if the entry refused, which parse should have prevented. */
+    Serial.println("sl6806_firm_enter() refused - nothing was entered.");
     parsed = 0;
 }

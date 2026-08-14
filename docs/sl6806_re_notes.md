@@ -6129,3 +6129,35 @@ finally be asked. If it is not, what is left of `hardware_init` is fully read
 and the difference is somewhere else entirely — and the instrument for finding
 it is the serial port, because the application *prints* its own startup, in
 detail, to `0x40091000`.
+
+### CORRECTION: the copy reads flash, so it cannot come after the clocks go off
+
+Adding `sl6806_hwinit_modules_off()` to `FirmBoot` stopped it booting at all —
+no panel, nothing. The cause is entirely mine and is the plainest possible
+ordering mistake.
+
+`sl6806_firm_boot()` did two things: copy the application out of **XIP flash**
+into SRAM, then jump. `FirmBoot` called `sl6806_hwinit_modules_off()`
+immediately before it. That switches off every module clock on the chip — and
+**one of the ninety-six is the flash controller's**. So the copy read an
+unclocked controller, wrote whatever it got into `0x00804800`, and branched
+into it.
+
+The two halves are now separate, and the order is stated where it cannot be
+missed:
+
+```
+sl6806_firm_copy(&f)          while flash still answers
+sl6806_hwinit_modules_off()   every module clock off, as ROM 0x3BFC does
+sl6806_hwinit_clocks()        the tree
+sl6806_firm_enter(&f)         quiesce, VTOR, MSP, branch - needs no flash
+```
+
+Nothing about §"ROM 0x3BFC switches off every module clock" is retracted: it
+is still the first thing `hardware_init` does and still the likeliest reason
+the application's USB was unstable. What was wrong was doing it one step too
+early.
+
+This is the same class of error as §"the order is the operation" in
+`sl6806_module.h`, and the third time in this investigation that a correct
+step in the wrong place looked like the step being wrong.

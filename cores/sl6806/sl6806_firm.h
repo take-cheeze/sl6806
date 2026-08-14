@@ -135,13 +135,32 @@ int sl6806_firm_parse(const uint8_t *header, const uint8_t *vectors,
 int sl6806_firm_read(sl6806_firm_t *out);
 
 /*
- * Copy the segment into SRAM and enter it. Does not return, and takes the USB
- * link with it.
+ * THE TWO HALVES, AND WHY THEY ARE SEPARATE.
  *
- * Returns only on failure - a `f` that did not come from a successful parse,
- * or a load address that would overwrite this code. Everything else is a
- * one-way trip ending in a power cycle.
+ * The copy reads the application out of XIP flash. Entering it wants the chip
+ * in the state the application expects, which - per ROM 0x3BFC, the first
+ * thing the bootloader's hardware_init does - means **every module clock
+ * switched off**, and one of those clocks is the flash controller's.
+ *
+ * So the order is not negotiable: copy while flash still answers, then
+ * quiesce, then enter. Doing it the other way copies garbage out of a
+ * controller that is no longer clocked and branches into it, which is a
+ * device that does nothing at all - measured, 2026-08-14, when
+ * sl6806_firm_boot() did both halves and examples/FirmBoot switched the
+ * modules off in between.
  */
+
+/* Copy the segment into SRAM. Needs XIP flash to be clocked. Returns
+ * SL6806_FIRM_OK, or an error if `f` is not from a successful parse or the
+ * destination would overlap this code. */
+int sl6806_firm_copy(const sl6806_firm_t *f);
+
+/* Enter what sl6806_firm_copy() put there: quiesce the NVIC and SysTick, set
+ * VTOR and MSP, branch. Does not return, and takes the USB link with it.
+ * Needs no flash. */
+int sl6806_firm_enter(const sl6806_firm_t *f);
+
+/* Both, in order, for a caller that has nothing to do in between. */
 int sl6806_firm_boot(const sl6806_firm_t *f);
 
 #ifdef __cplusplus

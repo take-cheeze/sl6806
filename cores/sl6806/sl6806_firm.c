@@ -83,7 +83,7 @@ int sl6806_firm_read(sl6806_firm_t *out)
     return sl6806_firm_parse(hdr, seg, out);
 }
 
-int sl6806_firm_boot(const sl6806_firm_t *f)
+int sl6806_firm_copy(const sl6806_firm_t *f)
 {
     const uint32_t *src;
     uint32_t *dst;
@@ -101,10 +101,22 @@ int sl6806_firm_boot(const sl6806_firm_t *f)
     if (f->load + f->length > 0x0081F000u)
         return SL6806_FIRM_ERR_LENGTH;
 
+    /* Reads XIP flash. Whatever else a caller intends to switch off, this
+     * has to happen while the flash controller is still clocked. */
     src = (const uint32_t *)(SL6806_FIRM_XIP + SL6806_FIRM_SEG_OFF);
     dst = (uint32_t *)f->load;
     for (n = 0; n < (f->length + 3u) / 4u; n++)
         dst[n] = src[n];
+
+    return SL6806_FIRM_OK;
+}
+
+int sl6806_firm_enter(const sl6806_firm_t *f)
+{
+    uint32_t n;
+
+    if (!f || (f->entry & 1u) == 0u)
+        return SL6806_FIRM_ERR_HDR;
 
     /*
      * Hand over a quiet machine.
@@ -115,13 +127,6 @@ int sl6806_firm_boot(const sl6806_firm_t *f)
      * SysTick ticking. Anything still enabled here fires into the
      * application's vector table between the jump and its own NVIC setup -
      * with the ROM's handler expectations and the application's stack.
-     *
-     * A bootloader is expected to do this and this one was not. It is the
-     * second candidate for why the application's USB came up unstable, after
-     * the clock tree (which examples/FirmBoot now sets and which did not fix
-     * it): a USB interrupt left pending by the ROM would be delivered to the
-     * application's USB handler before the application had configured its own
-     * controller.
      */
     for (n = 0; n < 4u; n++) {
         ((volatile uint32_t *)0xE000E180u)[n] = 0xFFFFFFFFu;   /* NVIC_ICER */
@@ -148,6 +153,15 @@ int sl6806_firm_boot(const sl6806_firm_t *f)
         : "memory");
 
     return SL6806_FIRM_OK;              /* not reached */
+}
+
+int sl6806_firm_boot(const sl6806_firm_t *f)
+{
+    int err = sl6806_firm_copy(f);
+
+    if (err != SL6806_FIRM_OK)
+        return err;
+    return sl6806_firm_enter(f);
 }
 
 #endif /* SL6806_FIRM_HOSTED */
