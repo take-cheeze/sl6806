@@ -953,3 +953,50 @@ The sine still plays throughout, so a success is audible before it is
 readable — but **the ratio is the result**. Five rounds of the PWM work were
 lost to trusting an impression over a number, and one of them to a panel that
 was blinking rather than dimming.
+
+### [M] `ToneDemo` first run — the census earned its keep, phases B–D did not
+
+**The census found the thing it was built to find.**
+
+| Register | implemented | holds | implemented but **never written** |
+|---|---|---|---|
+| `0x40080094` bit clock | `0x00000711` | `0x00000701` | **bit 4** |
+| `0x4009B040` | `0x80000039` | `0x80000001` | bits 3, 4, 5 |
+| `0x4009B04C` | `0x3FFFFFFF` | `0x0E900000` | 25 bits |
+| `0x4009B050` | `0x000000FF` | `0x0000001B` | bits 2, 5, 6, 7 |
+
+`0x40080094` implements bit 0 (enable), bits [10:8] (divider) and **bit 4**,
+and nothing in this tree or in the vendor's code has ever written bit 4.
+
+Put that next to the PWM's clock register. `0x400800F4` is bit 0 = enable,
+**bit 4 = source select** — and on the PWM, setting bit 4 swaps a 24 MHz source
+for a 25 kHz one. Same CRU, same family, same bit position, same role for
+bit 0. If `0x40080094` follows the family then **bit 4 selects what feeds the
+bit clock**, and a bit clock fed from nothing is precisely a DMA that drains
+without being paced. `ToneDemo` phase `e` tries it both ways.
+
+**Phases B, C and D measured nothing.** `pace()` used `small = 4796` and
+`big = sizeof(wave)` — and `sizeof(wave)` *is* 4796, because `FRAMES` is
+`PERIOD * 11` = 1199 frames = 4796 bytes. It timed the same length twice. So
+the divider sweep and the module-2 cycle each compared one length against
+itself, and neither says anything about pacing.
+
+That is the third instrument of this kind in this investigation, after the
+`PwmMode` sweep that measured inside the settling window and the `AudioLen`
+rows that were all rejected on alignment. The fix is the same shape as before:
+the two lengths are now 480 and 4796 from the same buffer, the ratio is printed
+so a broken pair is visible as `1.0:1`, and the long row is deliberately not
+made bigger — at real time 4796 bytes is 25 ms, inside the 60 ms poll bound,
+whereas a 10× buffer would be 250 ms and would read as a timeout on the very
+run where pacing finally worked.
+
+**And one real observation fell out of the bug.** Two descriptors submitted
+back to back with nothing between them: the first completed in 10–11 µs and
+**the second timed out at 60 ms, on all ten rows**. `examples/AudioLen`, which
+prints between transfers, never saw it. That is either a genuine re-arm
+requirement between descriptors or an artifact of the gap — worth knowing
+either way, so `pace()` now puts an explicit 2 ms settle between the two
+timings rather than depending on `printf` for it.
+
+No sound, which is expected: nothing is paced, and the only thing that has ever
+been established about the output stage is that it is configured.

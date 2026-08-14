@@ -181,10 +181,40 @@ static unsigned long timeLen(uint32_t len)
     return 60000ul;
 }
 
+/* Let the engine settle between descriptors. The first run submitted two
+ * back to back with nothing in between and the SECOND timed out every time,
+ * on all ten rows, while examples/AudioLen - which prints between transfers -
+ * had no such trouble. That is either a real re-arm requirement or an
+ * artifact of the gap; either way a probe should not depend on printf timing,
+ * so the gap is explicit and the anomaly is reported rather than absorbed. */
+static void settle(void)
+{
+    unsigned long t = micros();
+
+    while (micros() - t < 2000ul)
+        ;
+}
+
 static void pace(const char *tag)
 {
-    const uint32_t small = 4796u, big = (uint32_t)sizeof(wave);
-    unsigned long a = timeLen(small), b = timeLen(big);
+    /*
+     * [!] TWO LENGTHS FROM ONE BUFFER, and they must actually differ. The
+     * first run used 4796 and sizeof(wave) - which IS 4796 - so it timed the
+     * same length twice and phases B, C and D measured nothing.
+     *
+     * The short row is a tenth of the long one. Both are submitted from the
+     * same buffer, which is also why the long row is not simply made bigger:
+     * at real time 4796 bytes is 25 ms, comfortably inside the 60 ms poll
+     * bound, whereas a 10x larger buffer would be 250 ms and would read as a
+     * timeout on the very run where pacing finally worked.
+     */
+    const uint32_t small = 480u, big = (uint32_t)sizeof(wave);
+    unsigned long a, b;
+
+    a = timeLen(small);
+    settle();
+    b = timeLen(big);
+    settle();
 
     Serial.printf("  %-22s %5lu B/%lu us   %5lu B/%lu us",
                   tag, (unsigned long)small, a, (unsigned long)big, b);
@@ -192,9 +222,14 @@ static void pace(const char *tag)
         Serial.println("   REJECTED - not a measurement");
         return;
     }
-    Serial.printf("   %lu B/us  %lux real time\n",
+    /* The ratio of the two is the result: a transfer's time is proportional
+     * to its length, so short/long should be about 10:1 here. Anything else
+     * means the timing is not measuring a transfer. */
+    Serial.printf("   %lu B/us  %lux real time  ratio %lu.%lu:1\n",
                   (unsigned long)(big / (b ? b : 1)),
-                  (unsigned long)((big * 1000ul / 192ul) / (b ? b : 1)));
+                  (unsigned long)((big * 1000ul / 192ul) / (b ? b : 1)),
+                  (unsigned long)(b * 10ul / (a ? a : 1) / 10u),
+                  (unsigned long)((b * 10ul / (a ? a : 1)) % 10u));
 }
 
 /*
@@ -253,7 +288,7 @@ void setup()
     sl6806_audio_clock_start(1);
 
     Serial.println("'a' state+census  'b' baseline pace  'c' divider sweep"
-                   "  'd' module 2 cycle  'q' stop");
+                   "  'd' module 2 cycle  'e' bit clock bit 4  'q' stop");
 }
 
 void loop()
@@ -336,6 +371,35 @@ void loop()
         Serial.printf("  module 2 on: %s\n",
                       sl6806_module_enable(2) ? "acked" : "REFUSED");
         pace("after the cycle");
+        phase = -1;
+        break;
+
+    case 'e':
+        /*
+         * [M] THE LEAD FROM THE CENSUS. 0x40080094 implements bits 0, 4 and
+         * [10:8], and holds 0x701 - enable plus divider 7. **Bit 4 is
+         * implemented and nothing has ever written it.**
+         *
+         * That is the same layout as the PWM's clock register: 0x400800F4 has
+         * bit 0 as the enable and bit 4 as a SOURCE SELECT, and setting bit 4
+         * there swaps a 24 MHz source for a 25 kHz one. If 0x40080094 follows
+         * the family, bit 4 selects what feeds the bit clock - and a bit clock
+         * fed from the wrong source, or from nothing, is exactly a DMA that
+         * drains without being paced.
+         *
+         * Tried both ways, because the ROM's setter for the PWM's id used bit
+         * 4 for "the other source" and the vendor leaves it clear there.
+         */
+        Serial.println("\n--- bit clock source select, 0x40080094 bit 4");
+        sl6806_mmio_clr(SL6806_AUD_BITCLK_REG, 1u << 4);
+        Serial.printf("  bit 4 clear: %08x\n",
+                      (unsigned)sl6806_mmio_read(SL6806_AUD_BITCLK_REG));
+        pace("bit 4 clear");
+        sl6806_mmio_set(SL6806_AUD_BITCLK_REG, 1u << 4);
+        Serial.printf("  bit 4 set:   %08x\n",
+                      (unsigned)sl6806_mmio_read(SL6806_AUD_BITCLK_REG));
+        pace("bit 4 SET");
+        Serial.println("  if either row moves off 2667x, that is the pacing.");
         phase = -1;
         break;
 
