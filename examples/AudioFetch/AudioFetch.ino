@@ -173,7 +173,8 @@ void setup()
     sl6806_audio_clock_start(1);
     Serial.println("'b' baseline  'm' module ids  'r' romclk ids"
                    "  'c' census the audio block\n"
-                   "'a' TX_ADDR advance  'x' BUS CONTENTION  'q' stop");
+                   "'a' TX_ADDR advance  'x' bus contention\n"
+                   "'t' TX_CTRL's unwritten bits 2/5/6  'q' stop");
 }
 
 void loop()
@@ -183,11 +184,11 @@ void loop()
     if (!up)
         return;
     if (key == 'q') { phase = -1; Serial.println("stopped."); return; }
-    if (key == 'b' || key == 'm' || key == 'r' || key == 'c' || key == 'a' || key == 'x') {
+    if (key == 'b' || key == 'm' || key == 'r' || key == 'c' || key == 'a' || key == 'x' || key == 't') {
         phase = key; idx = 0; hits = 0; announced = false;
         Serial.printf("\n[%c]\n", key);
     } else if (key >= 0 && key != '\r' && key != '\n') {
-        Serial.printf("unknown key '%c' - try b m r c a x q\n", key);
+        Serial.printf("unknown key '%c' - try b m r c a x t q\n", key);
         return;
     }
     if (phase < 0)
@@ -393,31 +394,42 @@ void loop()
         Serial.println("\n--- bus contention: does a transfer slow the CPU?");
         Serial.println("    loop is sized to run INSIDE the transfer window");
 
-        for (rep = 0; rep < 8; rep++) {
-            t = micros();
-            for (i = 0; i < 400u; i++)
-                sink += ((volatile uint32_t *)wave)[i];
-            idle += micros() - t;
-            settle();
-        }
-
+        /*
+         * [!] INTERLEAVED, and the previous version was not. Running all eight
+         * idle reps first and all eight busy reps after made the busy half 10%
+         * FASTER - which a DMA cannot do. That was warm-up, and it buried any
+         * contention smaller than the drift. Alternate within each rep, and
+         * flip which side goes first on alternate reps so residual drift
+         * cancels rather than accumulating into one column.
+         */
         for (rep = 0; rep < 8; rep++) {
             unsigned long us;
+            int busy_first = (rep & 1);
+            int half;
 
-            if (sl6806_audio_play(wave, 0xFFFCu) != 0) {
-                Serial.println("    play() refused 0xFFFC - not a measurement");
-                phase = -1;
-                break;
+            for (half = 0; half < 2; half++) {
+                int do_busy = busy_first ? (half == 0) : (half == 1);
+
+                if (do_busy && sl6806_audio_play(wave, 0xFFFCu) != 0) {
+                    Serial.println("    play() refused 0xFFFC - not a measurement");
+                    phase = -1;
+                    break;
+                }
+                t = micros();
+                for (i = 0; i < 400u; i++)
+                    sink += ((volatile uint32_t *)wave)[i];
+                if (do_busy) {
+                    busy += micros() - t;
+                    us = 0;
+                    while (us < 60000ul && !sl6806_audio_done())
+                        us = micros() - t;
+                } else {
+                    idle += micros() - t;
+                }
+                settle();
             }
-            t = micros();
-            for (i = 0; i < 400u; i++)
-                sink += ((volatile uint32_t *)wave)[i];
-            busy += micros() - t;
-            /* Confirm the transfer really was in flight across the loop. */
-            us = 0;
-            while (us < 60000ul && !sl6806_audio_done())
-                us = micros() - t;
-            settle();
+            if (phase < 0)
+                break;
         }
         if (phase < 0)
             break;
@@ -435,6 +447,67 @@ void loop()
             Serial.println("    loop inside the window. The block counts the length");
             Serial.println("    down and never reaches memory.");
         }
+        phase = -1;
+        break;
+    }
+
+    case 't': {
+        /*
+         * [M] THE CENSUS NARROWED THIS TO THREE BITS.
+         *
+         * +0x108 implements 0xFFFF0874. The low half is bits 2, 4, 5, 6 and 11.
+         * The driver writes bit 4 (START) and [31:16] (the length); bit 11 is
+         * the status seen holding 0x800 before any transfer. That leaves
+         * **bits 2, 5 and 6 implemented and written by nobody** - not by this
+         * framework and not by the vendor.
+         *
+         * Eight combinations. After a year of "configured and not running",
+         * the whole unexplored space in the control register of the direction
+         * that does something is eight rows.
+         *
+         * Scored on the retire time, because it is the one observable that has
+         * never been in doubt: ~9 us is the counter running down, and anything
+         * that changes it at all is worth knowing - a paced transfer would be
+         * 4796/192 = 25 ms, three orders away.
+         */
+        unsigned combo;
+        unsigned long t;
+
+        Serial.println("\n--- TX_CTRL bits 2/5/6: implemented, never written");
+        for (combo = 0; combo < 8u; combo++) {
+            uint32_t extra = ((combo & 1u) ? (1u << 2) : 0u)
+                           | ((combo & 2u) ? (1u << 5) : 0u)
+                           | ((combo & 4u) ? (1u << 6) : 0u);
+            unsigned long us;
+            uint32_t back;
+
+            sl6806_mmio_write(SL6806_AUD_TX_ADDR, (uint32_t)(uintptr_t)wave);
+            sl6806_mmio_field(SL6806_AUD_TX_CTRL, SL6806_AUD_LEN_SHIFT, 16,
+                              TESTLEN);
+            sl6806_mmio_set(SL6806_AUD_TX_CTRL, extra);
+            back = sl6806_mmio_read(SL6806_AUD_TX_CTRL);
+            sl6806_mmio_write(SL6806_AUD_TX_TRIG,
+                              (((TESTLEN * 3u) / 4u) << SL6806_AUD_LEN_SHIFT));
+            sl6806_mmio_set(SL6806_AUD_TX_CTRL, SL6806_AUD_START);
+
+            t = 0;
+            us = micros();
+            while ((t = micros() - us) < 60000ul)
+                if (sl6806_audio_done())
+                    break;
+            Serial.printf("    bits %s%s%s  CTRL %08x  retired in %6lu us%s\n",
+                          (extra & (1u << 2)) ? "2" : "-",
+                          (extra & (1u << 5)) ? "5" : "-",
+                          (extra & (1u << 6)) ? "6" : "-",
+                          (unsigned)back, t,
+                          (t > 100ul) ? "   <<< CHANGED" : "");
+            /* Clear them again so each row is the bits it names, not the
+             * union of every row before it - the mistake the route sweep in
+             * this document made and had to redo. */
+            sl6806_mmio_clr(SL6806_AUD_TX_CTRL, (1u << 2) | (1u << 5) | (1u << 6));
+            settle();
+        }
+        Serial.println("    ~9 us is the counter. 25000 us would be real time.");
         phase = -1;
         break;
     }

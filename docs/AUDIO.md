@@ -1682,3 +1682,46 @@ totals rather than single samples. Each rep also waits for the transfer to
 retire, so the log shows it really was in flight. The threshold drops to +2%,
 and a DMA saturating the bus across the loop would be a 50–100% effect: two
 orders of magnitude of headroom rather than none.
+
+### [!] The contention test was confounded by ordering — and the census gives a three-bit target
+
+```
+8 reps: idle 510 us   during transfer 459 us   -10%
+per rep: 63 us idle vs 57 us busy, in a ~123 us window
+```
+
+The loop is correctly sized now — 57–63 µs inside a 123 µs window. But the
+result is **not "identical"**: the busy half is **10% faster**, and a DMA cannot
+speed the CPU up. All eight idle reps ran first and all eight busy reps after,
+so that is warm-up, and any real contention smaller than the drift is buried
+under it.
+
+Fixed by interleaving: idle and busy alternate *within* each rep, and which
+goes first flips on alternate reps so residual drift cancels instead of
+accumulating into one column.
+
+### [M] Three bits, and that is the whole remaining space in TX_CTRL
+
+```
++0x108 TXctl  implemented FFFF0874
+```
+
+The low half is bits **2, 4, 5, 6 and 11**. The driver writes bit 4 (START) and
+`[31:16]` (the length). Bit 11 is the status seen holding `0x800` before any
+transfer. That leaves:
+
+> **bits 2, 5 and 6 — implemented, and written by nobody.** Not by this
+> framework, and not by the vendor.
+
+Eight combinations. After a year of "configured and not running", the entire
+unexplored space in the control register of the direction that does something
+is eight rows. `examples/AudioFetch` phase `t` walks them, scored on the retire
+time — the one observable never in doubt, where ~9 µs is the counter running
+down and a paced transfer would be 25 ms, three orders away.
+
+Each row clears the three bits again afterwards, so a row is the bits it names
+rather than the union of every row before it — the mistake the route sweep in
+this document made and had to redo.
+
+Also unwritten, for after that: `+0x000` bits [11:0] and [31:26], `+0x07C` and
+`+0x080`'s spare source fields, and most of `+0x200`/`+0x208`.
