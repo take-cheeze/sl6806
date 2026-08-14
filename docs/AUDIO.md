@@ -880,3 +880,38 @@ rate, and three things are worth trying in order:
 
 The length sweep is now the standing instrument for all three: real time is
 1×, and anything that introduces pacing moves the slope by a factor of 2667.
+
+### [!] Correction to the section above — the audio PLL was already ours
+
+Two claims in the preceding section overstate what was new, and the mistake is
+the one this project keeps making: publishing a novelty claim without grepping
+for the thing first.
+
+**The audio PLL registers were already decoded here.** `sl6806_audio.h` has
+carried `SL6806_AUD_PLL_SEL` (`0x40080010`) and `SL6806_AUD_PLL_RATIO`
+(`0x40080014`) with the identical `KEEP`/`SET` masks, the identical
+`ratio << 14` placement, and the `rate % 8000` family selection, for as long as
+this document has existed. `0x00807300` is the routine those constants were
+read out of. Calling it "a second PLL, distinct from the `0x40080008` one" is
+right; implying it was newly found is not.
+
+**And `sl6806_audio_begin()` already writes it.** `audio_pll_set()` is called
+from line 179 of `sl6806_audio.c`. So when `examples/AudioPll` reported the
+PLL "already programmed for exactly 24.576 MHz", what it had actually
+confirmed is that **the driver's own write, performed seconds earlier in
+`setup()`, landed correctly**. That is a useful result — `audio_pll_set()`
+demonstrably works, and the `0x8C498C00` readback validates the whole
+`KEEP`/`SET`/shift decode against hardware — but it is not evidence about how
+the chip comes up, and the section above reads as though it were.
+
+One further detail the comparison turned up: the driver's busy loop is bounded
+and then **writes anyway**, while the probe's returned early on timeout. The
+driver's behaviour is why the register holds a correct value at all; had the
+probe's early return been the driver's, the PLL would never have been set.
+
+**What is genuinely new from the XIP read stands:** `romclk_enable(0)`,
+`module_enable(87)`, `romclk_enable(31)` (a ROM no-op), `romclk_enable(56)`,
+and the three registers in `0x4009B000` — that block really is unnamed
+anywhere in this tree, and none of that chain is performed by
+`sl6806_audio_begin()`. So does the negative: applying all of it, with
+readback confirming each step, moved the length sweep not at all.
