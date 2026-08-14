@@ -107,6 +107,30 @@ int sl6806_firm_boot(const sl6806_firm_t *f)
         dst[n] = src[n];
 
     /*
+     * Hand over a quiet machine.
+     *
+     * The application expects to start the way it does after a reset, and it
+     * is not starting after a reset: the boot ROM has been running for
+     * however long, with USB enumerated, its own interrupts enabled, and
+     * SysTick ticking. Anything still enabled here fires into the
+     * application's vector table between the jump and its own NVIC setup -
+     * with the ROM's handler expectations and the application's stack.
+     *
+     * A bootloader is expected to do this and this one was not. It is the
+     * second candidate for why the application's USB came up unstable, after
+     * the clock tree (which examples/FirmBoot now sets and which did not fix
+     * it): a USB interrupt left pending by the ROM would be delivered to the
+     * application's USB handler before the application had configured its own
+     * controller.
+     */
+    for (n = 0; n < 4u; n++) {
+        ((volatile uint32_t *)0xE000E180u)[n] = 0xFFFFFFFFu;   /* NVIC_ICER */
+        ((volatile uint32_t *)0xE000E280u)[n] = 0xFFFFFFFFu;   /* NVIC_ICPR */
+    }
+    *(volatile uint32_t *)0xE000E010u = 0;                     /* SysTick off */
+    *(volatile uint32_t *)0xE000E018u = 0;                     /* and clear   */
+
+    /*
      * Point the vector table at the copy before entering it. The application
      * assumes the bootloader did this; an interrupt arriving between here and
      * its own setup would otherwise vector through whatever the ROM left.

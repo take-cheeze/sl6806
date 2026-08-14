@@ -6045,3 +6045,45 @@ PLL rate afterwards. §30 measured that ROM `0x3A6C` does **not** move
 `0x40080000`, so if it still reads 192 MHz after the vendor's own sequence,
 the 384 MHz the bootloader asks for is going somewhere this project has not
 found — which would be worth more than the boot.
+
+### [M] The clock sequence did not fix it — and the likeliest cause is the handover
+
+Second `FirmBoot` run, with `sl6806_hwinit_clocks()` performing the vendor's
+whole sequence before the jump: **the application's USB is still unstable.**
+
+So the clock tree is not the difference, which also means the run is worth
+reporting for a different reason — the sketch prints the PLL rate before
+jumping, and §30 predicted that ROM `0x3A6C` would not move it. If it read
+192 MHz there after the vendor's own sequence, then the 384 MHz the bootloader
+asks for goes somewhere this project has not found, and that is a bigger
+finding than the boot.
+
+Two things changed in response, and the second is not code.
+
+**The handover now quiesces the machine.** `sl6806_firm_boot()` disables all
+NVIC interrupts, clears all pending ones, and stops SysTick before setting
+VTOR. The application expects to start the way it does after a reset, and it
+is not starting after a reset: the boot ROM has been running with USB
+enumerated, its interrupts enabled and SysTick ticking. A USB interrupt left
+pending by the ROM is delivered into the application's handler before the
+application has configured its own controller. Any bootloader is expected to
+do this; this one was not.
+
+**And the likeliest cause is simpler than any of that.** The application is
+re-initialising USB *on a link that is already enumerated*. In a normal boot
+the host has never seen the device — power up, bootloader, application, and
+only then does anything appear on the bus. Here the ROM has been `301a:2800`
+for the whole session, with an open connection and a host-side device object,
+and the application reconfigures the controller underneath it with no
+disconnect. A host shown a device that stops answering and starts answering
+differently, with no detach in between, behaves exactly as observed.
+
+The fix costs nothing: **unplug the cable after the jump and plug it back
+in.** This is a player with a battery, so the application keeps running and
+the host gets a clean enumeration of whatever the device now is. If
+`301a:2801` appears then the instability was the handover, not the firmware,
+and the card question can finally be asked.
+
+Detaching properly before jumping would need the USB controller's registers,
+which this project does not have — §7l looked at `0x40040000`, called it
+"most likely a USB controller", and left it there.

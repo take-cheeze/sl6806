@@ -53,6 +53,32 @@
  * over. See FIRMBOOT_CLOCKS below.
  *
  * ===================================================================
+ *  IF ITS USB IS UNSTABLE, TRY THE CABLE
+ * ===================================================================
+ * [M] It was, twice - once without the clock sequence and once with it. The
+ * likeliest reason has nothing to do with what this sketch configures.
+ *
+ * **The application is re-initialising USB on a link that is already
+ * enumerated.** In a normal boot the host has never seen this device: power
+ * comes up, the bootloader runs, the application starts, and only then does
+ * anything appear on the bus. Here the boot ROM has been enumerated as
+ * `301a:2800` for the whole session, with an open connection and a host-side
+ * device object, and the application reconfigures the controller underneath
+ * all of that without a disconnect. A host presented with a device that stops
+ * answering and starts answering differently, with no detach in between, does
+ * exactly what you saw.
+ *
+ * **So unplug the USB cable after the jump and plug it back in.** This is a
+ * player with a battery: the application keeps running, and the host gets a
+ * clean enumeration of whatever the device now is. It costs nothing and needs
+ * no code, and if `301a:2801` appears afterwards then the instability was the
+ * handover and not the firmware.
+ *
+ * The alternative - detaching USB properly before jumping - needs the USB
+ * controller's registers, and this project does not have them: 7l looked at
+ * `0x40040000`, called it "most likely a USB controller", and left it there.
+ *
+ * ===================================================================
  *  WHAT IT CHECKS BEFORE JUMPING
  * ===================================================================
  * The load address is not in the header. The header names an entry, and the
@@ -183,7 +209,11 @@ void setup()
     Serial.println("--- what to watch after the jump ---");
     Serial.println("  the panel: the P20 interface means it booted");
     Serial.println("  the host:  301a:2801 mass storage means the card works");
-    Serial.println("  neither:   it needs more of hardware_init than this does");
+    Serial.println();
+    Serial.println("  IF USB IS UNSTABLE: unplug the cable and plug it back");
+    Serial.println("  in. The application keeps running on the battery, and");
+    Serial.println("  the host gets a clean enumeration instead of a device");
+    Serial.println("  that changed shape without detaching. See the header.");
     Serial.println();
     Serial.print("Jumping in ");
     Serial.print(COUNTDOWN);
