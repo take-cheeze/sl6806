@@ -6318,3 +6318,1011 @@ they separate the outcomes cleanly:
 
 Worth stating because this session has twice read a tooling message as a
 hardware result, and once the other way round.
+
+## 32. [V] The PWM's counter clock, found in FIRM's XIP half — romclk 39
+
+Static, 2026-08-14, from `dump.bin` alone. **Not yet run on hardware.** It is
+the missing half of §14a, and it was missing because §18 looked for it in the
+wrong half of the image.
+
+### `0x00D99C34` opens with three clock steps, not one
+
+§14a lifted the register layout out of `0x00D99C34` and stopped at the first
+literal. Read from the top instead, and the routine's first act — before it
+caches the pointer table, before it touches a single PWM register — is:
+
+```
+d99c3e  movs r0,#68 ; bl 0x1e54     module_is_enabled(68)
+d99c46  movs r0,#68 ; bl 0x1ec0     module_enable(68)
+d99c4c  movs r1,#16                 (arg2 != 0)
+d99ca4  movs r1,#10                 (arg2 == 0)
+d99c4e  movs r0,#39 ; bl 0x8050f2   clk_setsrc(39, 16 | 10)
+d99c56  movs r0,#39 ; bl 0x8051ec   romclk_enable(39)
+```
+
+`0x00D99C34` has exactly **one** caller in the whole image — the driver's
+configure op at `0x00D45394` — so this is the complete bring-up for a channel,
+not a fragment of one.
+
+### Both of the last two land on `0x400800F4`
+
+`0x008050F2` is byte-identical to the bootloader's `0x008206AE` (§27): it
+enables romclk 8 or 9 if that is what was asked for, then tail-calls **ROM
+`0x2E5C`**, the clock-source select. That routine is a `tbh` table on `id - 3`;
+index 36 sends id 39 to **ROM `0x3174`**, whose entire body is:
+
+| `src` | Effect |
+|---|---|
+| 16 | `0x400800F4 \|= 0x10` |
+| 59 | `0x400800F4 &= ~0x10` |
+| anything else, **10 included** | falls through to `bx lr` — a no-op |
+
+`0x008051EC` is §7d's `module_clock_enable` veneer, which §18 correctly
+identifies as **ROM `0x20EC`**, the romclk family. Its table sends id 39 to
+**ROM `0x2338`**: `0x400800F4 |= 0x01`. That agrees exactly with
+`cores/sl6806/sl6806_romclk.h`'s generated row `{39, 0x400800F4, 0x1}` — two
+independent derivations of the same register, one by hand and one by the
+table generator.
+
+Clock id 39 appears **nowhere else in the image**. It is the PWM's alone.
+
+So the pairing is the same shape as every other block here — SD is module 36 +
+romclk 17, audio is module 37 + romclk 19 — and **the PWM is module 68 +
+romclk 39**. Module 68 makes the registers writable. Romclk 39 is what clocks
+the counter behind them. That is precisely the "configured and not running"
+signature, and it is the first time the missing half has been *found* rather
+than guessed at.
+
+### Why §18 concluded the opposite
+
+§18 wrote: "The PWM code in the blob (`0x00811CE4`–`0x00811EC0`) makes **no
+call** to any of the three mask ROM clock families. Scanning the blob and
+stage 1 … puts every single site inside one region, `0x00806800`–`0x00807100`."
+
+Both sentences are true. The conclusion drawn from them is not. The PWM's
+clock calls are at `0x00D99C50`/`0x00D99C56`, in **XIP**, which that scan did
+not cover — the blob holds only the register accessors, and the bring-up that
+calls them lives in flash. §19 then spent a section on `0x00806800` on the
+strength of it.
+
+**The lesson is §14a's own, in a new costume:** a negative is only as wide as
+the region it was taken over, and this image has four of them — mask ROM,
+stage 1, the SRAM blob, and XIP.
+
+### `0x40084000` is the interrupt enable, and `+0x04` is a witness
+
+`sl6806_pwm.h` had `SL6806_PWM_GLOBAL` as "role unknown". It is the interrupt
+enable. `0x00811D60` ORs `1 << ch` into it and, the first time it goes
+non-zero, installs `0x0080EE45` on **IRQ 73** and enables it; when it returns
+to zero the IRQ is disabled again. The handler at `0x0080EE44` is four lines:
+
+```c
+pend = REG(0x40084004) & REG(0x40084000);
+if (pend & 0x3F3F) { REG(0x40084004) = pend; if (cb) cb(pend); }
+```
+
+So `+0x00` is a per-channel enable mask, `+0x04` is write-1-to-clear status,
+and `0x3F3F` is two banks of six — six channels × two event sources. The
+callback slot is `T[10]`, SRAM `0x0082B420`, written by `0x0080EE50`; that is
+what `/dev/pwm_ch3`'s `pwm1_event_callback` hangs off.
+
+Nothing in this build calls `0x00811D60`, so the stock firmware never enables
+the PWM interrupt. That does not make `+0x04` useless: a raw status register
+normally latches whether or not the interrupt is unmasked, and **a bit
+appearing there means a period boundary happened**, which is the one thing a
+stopped counter cannot fake. It is a *positive* test, unlike CTRL bit 28,
+which has produced several confident wrong negatives.
+
+There is a second candidate witness at `+0x08`: `0x00811EF6` reads it as two
+16-bit halves selected by an index. Nothing calls that thunk either, so what
+the halves hold is unestablished — but next to period/duty at `+0x04` they
+read like a live counter and its capture.
+
+### Two things retracted, and one narrowed
+
+**Retracted: the pair register's `[3:0]` is a divider off 24 MHz.** It is not.
+That belongs to `0x00811F58`, which writes `[rec->reg]` where `rec->reg` is
+`0x40089000` or `0x4008A000` — two *other* clock generators, installed into a
+different table (`0x0082B470`) by `0x00D9A310`. `0x00811F00`, its only caller
+via `fm_clk_init` at `0x00D3D5C0`, never touches the PWM at all. The 24 MHz
+parent and the `÷2^(k+1)` ladder are those blocks', not the PWM's; the PWM's
+parent is still unknown. (Those two generators are worth their own note:
+`[0]` bit 31 is a self-clearing apply, `0x00D9A3B4` writes `[+0x10] = 0xC000`,
+and FM runs generator 0 at 100 kHz on bank 4 pins 12/13 function 2.)
+
+**Narrowed: the pair register's bit 8.** The thunk that reaches `0x00811EC0`
+is `0x00811D50`, and a scan of the blob, stage 1 *and all of XIP* finds **no
+caller**. So the vendor genuinely never writes that register on any path —
+which `sl6806_pwm.h` already said, and which is now established over the whole
+image rather than two thirds of it. That leaves bit 8 needing an explanation
+other than "clock enable", because a clock the vendor's own driver never
+enables cannot be how the vendor's backlight runs. What was measured is
+exactly "the panel lights and duty makes no difference", and that is also what
+an output force or bypass looks like. `examples/PwmClock` separates the two by
+enabling romclk 39 with bit 8 **clear**.
+
+**Corrected: the backlight's config bytes.** `sl6806_pwm.h` said the open
+passes `c0=3` into CTRL bit 4. It does not — that leading 3 in
+`0x00D10354`'s `{03 00 01 0F}` is the **channel number**, which `0x00D453E8`
+compares against the channel-id table at `0x00C7DE94`. The byte that becomes
+bit 4 is a hardcoded `1` stored by `0x00D453C0`. CTRL still comes out `0x7F`,
+so the constant was right by luck. The rest of that 20-byte block: byte 4 is
+the `use_high` clock flag and it is **zero**, so the stock backlight takes the
+src-10 no-op branch and relies on `0x400800F4` bit 0 alone; bytes 8–11 are the
+callback `0x00D102D5`; bytes 16–19 are `0x5DC0BB80` = period 48000, duty
+24000. Bytes 5–7 and 12–15 are never written — `0x00D45394` hands
+`0x00811E08` a stack frame in which only offset 13 is initialised, so the
+`+0x10`/`+0x14`/`+0x18`/`+0x1C` writes get junk. Whatever those registers do,
+the backlight does not depend on them.
+
+### And a red herring closed
+
+`pwm_is_sd_exist`, `pwm_is_jack_exist`, `pwm_test_time`, `pwmTask` and
+`-pmu mgr send to pwm queue error !` have nothing to do with the PWM
+peripheral, as §15 suspected. `0x00D1DB60` is `pwm_is_sd_exist`, and its body
+is `ioctl(key_dev, 0, &0x00018800)` — a *pad* id, bank 1 pin 17 as an input —
+followed by `key ioctl err` on failure. This `pwm` is a power/peripheral
+manager task that polls GPIO through the key device.
+
+### What to run
+
+`examples/PwmClock`. Five configurations across `0x400800F4` bit 0, bit 4 and
+the pair register's bit 8, each reported with three witnesses — the `+0x08`
+readback, the `+0x04` interrupt status, and whether any word in the channel
+block moves — and each followed by a duty sweep. **The panel is still the
+detector that matters**; the console only says whether the counter moved.
+
+Everything is written unconditionally: uploading a payload does not reset the
+clock tree, and §14a already lost a run to a sketch that returned early on
+"already set".
+
+### [M] RESOLVED, 2026-08-14 — the counter runs, and three things above are corrected
+
+`examples/PwmClock` on a P20 Player. Five configurations, one condition:
+
+```
+     0x400800F4  bit0  bit4   pair bit8   CTRL b28   counter
+  A   0x00000000   0     0        1           1       stopped
+  B   0x00000001   1     0        0           0       RUNNING
+  C   0x00000001   1     0        1           0       RUNNING
+  D   0x00000011   1     1        0           1       stopped
+  E   0x00000011   1     1        1           1       stopped
+
+  counter runs  <=>  0x400800F4 bit 0 set AND bit 4 clear
+```
+
+**Romclk 39 is the counter's clock.** A and B differ in exactly that bit, and
+that is the difference between stopped and running. §14a's twelve sessions
+were missing one OR into one CRU register, and it was in the vendor's own code
+the whole time.
+
+**Bit 4 — `clk_setsrc(39, 16)` — stops it.** D and E have the clock enabled
+and are stopped anyway, so bit 4 reparents the block to a source that is not
+running in bootloader mode. The PLL is the obvious candidate and has not been
+checked. This retro-explains why `0x00D10354` passes `use_high = 0`: the stock
+backlight deliberately takes the branch that leaves bit 4 alone.
+
+**Pair bit 8 is not the counter's clock enable.** B runs with the pair
+register at zero; A stays stopped with bit 8 set. What the 2026-08-07 sweep
+found is real but is an *output force* — it drives the pad to a level with the
+counter stopped, which is precisely the "lights but never dims" this section
+has been about. `sl6806_backlight_begin()` no longer writes it, which also
+makes the driver's bring-up identical to the vendor's.
+
+**CTRL bit 28 never lied, and §14a's module walk was a correct negative.**
+Bit 28 tracks "not running" across all five rows without a single
+disagreement. The 2026-08-07 reading that made this file call it a liar was
+taken with the panel lit by the pair force and the counter stopped — lit was
+read as running, and the bit took the blame. Which means the walk over all 128
+module ids, declared void in `sl6806_pwm.h`, was **asking a bit that answers
+and getting the right answer**: no module id starts this counter, because the
+clock is not in the module family. It is also why `0x00811E74` spins on bit 28
+before writing period and duty — with no clock the vendor's own setter would
+hang there, and `0x00D99C34` turning the clock on first is what stops that
+happening.
+
+Two of the three witnesses this section proposed were wrong, and it is worth
+recording which:
+
+| Witness | Result |
+|---|---|
+| any word in the channel block changing | **worked** — the dumbest of the three |
+| `0x40084004` interrupt status | read 0 on a running counter: the block does **not** latch a masked event, so `+0x00` must be armed first |
+| `+0x08` as a live counter | flat `0000/0000` in all five rows, running or not — **retracted** |
+
+The `+0x04` result is the useful correction. `sl6806_pwm_irq_arm()` now sets
+the channel's enable bit before `sl6806_pwm_irq_fired()` reads anything; it
+touches only the PWM register and never the NVIC, so it needs no handler.
+
+Still open: what the two halves at `+0x08` hold, what source bit 4 selects,
+and why CTRL comes back `0x1000017F` in D and E — bit 8, the update trigger,
+latched and unable to retire. The last of those is consistent with a commit
+that cannot complete without a running counter, but nothing in the sketch
+requested one, so it is [?] rather than [I].
+
+#### And a harness lesson, paid for twice in one session
+
+The second run of `examples/PwmClock` **wedged the USB link**: `unexpected
+status` on the run command, then `LIBUSB_ERROR_TIMEOUT` and
+`LIBUSB_ERROR_BUSY` from the monitor until the device was unplugged. The
+payload was fine — the backlight visibly swept through all five
+configurations while the host could not talk to it at all.
+
+The cause is in `cores/sl6806/startup_payload.c`, which says it plainly: in
+`RUN_MODE=poll` the ROM's USB handler is installed at the bottom of `_start`,
+**after** `sl6806_run_setup()`. So nothing can poll while `setup()` runs, and
+a `setup()` that outlasts the host's timeout on the run command abandons the
+transaction mid-flight and desynchronises the endpoint. The sketch ran all
+five configurations from `setup()`; widening the sweep from 22 steps to 82
+took that from about eleven seconds to about forty, and forty was past it.
+
+`SL6806_POLL_BLOCK_LIMIT_MS` does not help here. It caps a *single* `delay()`,
+and every one of these was 50 ms — under the cap, no warning, and the
+cumulative time is what the host actually sees.
+
+The rule the same file gives is the fix, and the sketch now follows it: **a
+probe does its work from `loop()`, one step per call, announcing each step and
+returning so the host drains that line before the risky write happens.**
+`setup()` prints four lines and returns; the sweep is paced with `millis()`
+and there is no `delay()` in the sketch at all. `examples/PadScope` was
+already built this way and says why.
+
+Worth noting for anyone reading a wedged run as a result: it is not one. The
+three USB errors say the link died, not that the experiment failed, and in
+this case the panel was the only thing still reporting.
+
+#### [M] Second session, cold chip — reproduced, and one witness withdrawn
+
+`cru+F4 on entry: 00000000`, so this run was genuinely cold and the first
+session's A row was not contaminated by a warm clock tree. The table
+reproduces exactly, thirteen configuration runs including repeats: A, D and E
+stopped; B and C running; never a disagreement.
+
+**But naming the mover retired one of the witnesses.** The sketch now prints
+*which* word changed between the two snapshots, and on every running row it is
+the same line:
+
+```
+moved: +00 1000007f->0000007f
+```
+
+That is CTRL bit 28 settling — once, shortly after the clock is enabled — and
+CTRL bit 28 is what the verdict line already reports. So "any word in the
+block changed" was never independent of it, and the earlier claim that two
+witnesses agreed was counting one observation twice. It is also not a tick: it
+is a single transient.
+
+**So no register in this block counts.** `+0x08` is flat, `+0x04` never
+latched, and the eight-word sweep only ever catches bit 28's settling edge.
+The block exposes no running value at all.
+
+What is left that is mechanically different from bit 28 is the **commit**:
+retiring CTRL bit 8 requires the counter to reach a period boundary, where bit
+28 only reports what the block believes about its own clock. `sl6806_pwm_commit()`
+now returns whether it retired, and the sketch reports four attempts per
+configuration. That is the test that should have been run first.
+
+**And bit 4 is exonerated for the stuck update bit.** §32 blamed
+`0x1000017F` — bit 8 latched — on `src_high`. This run shows the same `0x17F`
+under configuration A, with bit 4 clear and the clock off entirely, and shows
+D both with and without it:
+
+```
+  A: [0, 1, 1, 1]      B: [0, 0]      C: [0, 0]
+  D: [0, 0, 1]         E: [0, 1]
+```
+
+The narrower statement is the true one: **the update bit is stuck only while
+the counter is stopped, and never while it runs.** Why it appears in some
+stopped snapshots and not others is [?].
+
+The interrupt enable is also now armed on *both* of a channel's bits —
+`0x3F3F` is two banks of six, so channel 3 owns bits 3 and 11, and the first
+probe armed only bit 3. That the status stayed at `000` therefore proves less
+than it looked like, and the readback of `+0x00` is printed so a write that
+does not stick can be told from an event that does not latch.
+
+#### [!] RETRACTED, 2026-08-14 — the counter does not run, and romclk 39 is not enough
+
+The third session ran the commit witness and asked which configuration lit the
+panel. Both answers go against the section above.
+
+```
+     0x400800F4  bit0  bit4   pair bit8   CTRL b28   commits   PANEL
+  A   0x00000000   0     0        1           1        0/4     bright
+  B   0x00000001   1     0        0           0        0/4     DARK
+  C   0x00000001   1     0        1           0        0/4     bright
+  D   0x00000011   1     1        0           1        0/4     DARK
+  E   0x00000011   1     1        1           1        0/4     bright
+
+  the panel tracks PAIR BIT 8, exactly and only
+  the counter runs in NO configuration
+```
+
+**`commits` is 0/4 everywhere, including both rows where bit 28 says
+"running".** Retiring CTRL bit 8 requires the counter to reach a period
+boundary; it never retires. The interrupt status stayed at zero with the
+enable confirmed armed on both of channel 3's bits (`irqen 0808`). `+0x08` is
+flat. Nothing counts, nothing retires, nothing fires.
+
+**And the panel tracks pair bit 8 alone.** Keys 1/3/5 — A, C, E, bit 8 set —
+lit it; 2/4 — B, D, bit 8 clear — blacked it out. B is the row where bit 28
+claimed the block was running, and B is dark.
+
+So **CTRL bit 28 is not a run flag.** It responds to romclk 39 and to nothing
+else, which is real and is the only register effect that clock produces — but
+it means something nearer "the block has a clock" than "the counter is
+turning". This file has now built two opposite wrong conclusions on that one
+bit: first that it lies, then that it is authoritative.
+
+**What survives.** Romclk 39 is the PWM's — that is [V] out of `0x00D99C34`
+and does not depend on any measurement. It is necessary-looking and harmless,
+`sl6806_backlight_begin()` still enables it, and §18's scoping error is still
+an error. Bit 4 still holds bit 28 set. §14a's module walk is still a correct
+negative about bit 28. What is retracted is only the claim that any of this
+starts the counter.
+
+**A regression was shipped and reverted.** `sl6806_backlight_begin()` had its
+pair bit 8 write removed on the strength of the retracted claim, which turns
+the backlight off. It is back, with a comment and a host test that assert it
+by name. Nothing in the vendor's image writes that register, so it will look
+removable again to the next reader; it is not.
+
+##### How three witnesses became zero
+
+Worth recording as method, because each failure had a different shape:
+
+| Witness | Why it failed |
+|---|---|
+| "any word in the block changed" | it was CTRL bit 28's own settling edge — one observation counted as two |
+| the `+0x04` interrupt status | never latches; armed correctly and still silent |
+| `+0x08` as a live counter | flat zero, running or not |
+| **the panel** | "brightness changed" was A/C/E bright alternating with B/D dark — a blinking panel read as a dimming one |
+
+The one that worked is the one that observes an **effect** rather than asking
+the block about itself: a commit that retires needs a period boundary to
+happen. It should have been the first test, not the fourth.
+
+##### The two leads left
+
+Both are register fields this driver has never written and the vendor does,
+reached through `0x00811E08`:
+
+- **MODE `[3:1]`.** `0x00811E9A` writes `(x << 16) | (mode << 1) | enable`.
+  This driver sets bit 0 and leaves the mode field at zero. If zero is an idle
+  or static-level mode, that alone explains a stopped counter and a pad that
+  only answers the force bit.
+- **CTRL `[19:16]`.** `0x00811ED0` assembles four bits there. Never written.
+
+`0x00D45394` calls `0x00811E08` with an **uninitialised stack frame**, so the
+stock firmware's own values for these are junk and cannot be copied. They have
+to be swept — and unlike every sweep in §14a, there is now a witness worth
+sweeping against.
+
+##### [M] Fourth session — bit 28 is not even deterministic
+
+The retraction above treated CTRL bit 28 as a reliable function of
+`0x400800F4`: clear when bit 0 is set and bit 4 clear, set otherwise. A fourth
+run shows it is not a function of that register at all.
+
+```
+cfg  0x400800F4   bit 28 seen
+A      0x00       {1}
+B      0x01       {0}
+C      0x01       {0}
+D      0x11       {0, 1}      <- same register value, both outcomes
+E      0x11       {1}
+```
+
+Configuration D produced bit 28 both set and clear with an identical clock
+register, in the same session, from the same predecessor. So the reading is
+timing-dependent — the bit settles some time after the clock is enabled, and
+20 ms is evidently near the boundary.
+
+Two consequences. **"Bit 4 selects a dead source" is weaker than §32 states**:
+what is measured is that bit 4 makes bit 28 slower or less likely to clear,
+which is equally consistent with a *slow* source as with a stopped one. And
+bit 28 is now disqualified as evidence for anything on its own — it has been
+read as a liar, then as an authority, and is in fact a settling flag with a
+race in it. `commits` stayed 0/4 in every row of this session too.
+
+##### What is being tried next: `examples/PwmMode`
+
+The two fields the vendor writes and this driver never has, swept against the
+commit witness — 168 rows, 160 distinct:
+
+- **MODE `[3:1]`**, eight values. `0x00811E9A` clears bit 0 before changing
+  this field, which is the shape of something you may not reconfigure while
+  running — i.e. a field that selects what the counter *does*. Leaving it at 0
+  would account for every measurement in §32 by itself. Leading suspect.
+- **CTRL `[19:16]`**, sixteen values, from `0x00811ED0`.
+- A third phase loading `+0x14`/`+0x18`/`+0x1C` — three more registers the
+  vendor writes and this driver leaves at zero. A compare register sitting at
+  zero is a plausible way to get a counter that will not move.
+
+The pair register's force bit is held **clear** throughout, so the pad is not
+pinned and a hit is confirmable by eye; the panel is therefore dark for the
+whole sweep, which is expected and is not the result. Everything is written
+from scratch per row rather than OR'd, because §32 already lost a reading to a
+helper that only set bits.
+
+##### [!] The first `PwmMode` sweep was void — 168 rows measured before the clock arrived
+
+The run came back `0 hit(s) in 168 combinations`, which looks like a clean
+negative over the whole unwritten register space. It is not one. Every row
+reported `CTRL 1000017f` — **bit 28 still set** — and romclk 39 reliably
+clears that bit in `examples/PwmClock`. So the clock had not arrived on any
+row.
+
+The cause is a one-line error with a comment that lied about it:
+
+```c
+/* Give a slow clock a chance before asking, then ask four times */
+due = millis() + 20;
+for (int k = 0; k < 4; k++)
+    commits += sl6806_pwm_commit(CH);
+```
+
+`due` schedules the *next* `loop()` call. It does not pause this one. The
+commits ran microseconds after the clock was enabled, inside a settling window
+the fourth session had already measured at around 20 ms and racing either side
+of it.
+
+**What saved it was the constant column.** `CTRL 1000017f` on all 168 rows is
+not what a working sweep looks like: the register that was supposed to vary
+was identical everywhere. A sweep whose observable never moves has not tested
+anything, and printing the raw value rather than only the verdict is what made
+that visible. Print the register, not just the conclusion.
+
+The sweep now splits each row across two `loop()` calls and **waits for bit 28
+to clear, verified, with a 100 ms deadline**. A row whose clock never settles
+prints as `?? NOCLK` and is counted separately: it is a hole in the coverage,
+not a negative. The summary refuses to claim "neither field starts it" unless
+every row settled.
+
+The write order was also brought into line with the vendor's while it was open
+— `0x00D99C34` writes CTRL first and only then does `0x00811E08` write
+`+0x14`, `+0x18`, MODE and `+0x1C`. The sweep had CTRL last. Order has mattered
+at every step of this investigation and there was no reason to keep a
+gratuitous difference.
+
+##### [M] The `PwmMode` sweep, re-run and valid — and still empty
+
+`clock settled` on all 168 rows, 0 holes, 0 hits. `CTRL 0000017f` throughout:
+bit 28 clear, so the clock arrived, and bit 8 set, because the commit never
+retires. **MODE[3:1], CTRL[19:16] and `+0x14`/`+0x18`/`+0x1C` do not start the
+counter.**
+
+[!] With one caveat that has to be closed before this counts as a negative
+over the *space* rather than over the *writes*: **nothing has ever read those
+fields back.** The progress line prints one row in sixteen, and `idx % 16 == 0`
+selects exactly the `ctrl_hi == 0` rows, so the log contains no evidence that
+a single CTRL[19:16] write ever landed. If the field does not retain, the
+128-row phase was an 8-row MODE sweep; if MODE[3:1] does not retain either, it
+was one row run 168 times. §14a's rule was "a write test is only a write
+test" - this is its mirror, and it had not been applied.
+`examples/PwmSrc` phase 0 closes it in four lines.
+
+##### [V] The mask ROM has nothing left to say about clock 39
+
+Its three families expose exactly two operations on this id:
+
+| Family | Entry | Effect on id 39 |
+|---|---|---|
+| `romclk_enable`, ROM `0x20EC` | ROM `0x2338` | `0x400800F4 \|= 1` |
+| `clk_setsrc`, ROM `0x2E5C` | ROM `0x3174` | src 16 → `\|= 0x10`; src 59 → `&= ~0x10`; anything else, no-op |
+| `romclk_setdiv`, ROM `0x289C` | ROM `0x2958` | **`pop {r4, r5, r6, pc}` — a no-op** |
+
+So there is no divider setter for this clock anywhere in the ROM, and neither
+the bootloader nor the application writes `0x400800F4` by any other route. If
+that register carries a divider or a second source select, it is sitting at
+its reset value and always has been. That is a register-shape question, and
+the audio and SD work both got their answers from exactly that kind of census.
+
+##### The remaining hypothesis: the gate is open onto a source that is not running
+
+Everything measured fits it. CTRL bit 28 clears, so the block sees a clock
+domain; nothing counts, no commit retires, no event latches. A gate with
+nothing behind it looks precisely like that, and it would also explain why bit
+28 settles on a racy ~20 ms timescale rather than immediately.
+
+`examples/PwmSrc` tests it: census `0x400800F4` a bit at a time - announced
+before each write and restored after, so an implemented-bit map falls out
+without holding an unknown CRU bit for more than one step - then hold bit 0
+plus each writable bit in turn against the commit witness.
+
+If that comes back empty too, the next place to look is outside the PWM
+entirely: **the vendor's system clock init at `0x00806800`**, which §19 read as
+"a reconfiguration, not a bring-up" and set aside. §18 was wrong about this
+peripheral for exactly the same reason - a conclusion drawn from the wrong
+region - so that judgement is worth re-testing rather than inheriting.
+
+##### [M] `PwmSrc` — the sweep was valid, the clock register is bare, and the pair register is bigger than recorded
+
+Three results, and the third is the lead.
+
+**1. `PwmMode`'s negative stands.** MODE[3:1] retained `0x0E` and CTRL[19:16]
+retained `0x000F0000` — both fully writable. So the 168 rows really did visit
+168 distinct hardware configurations, and neither field starts the counter.
+
+**2. `0x400800F4` implements bits 0 and 4 and nothing else.** A bit-walk of all
+31 non-enable bits found exactly one writable: bit 4. There is no hidden
+divider, no second source select, nothing at reset value waiting to be set.
+That confirms on hardware what the ROM already said — `romclk_setdiv` sends id
+39 to a bare `pop` — and it kills the "the gate has a divider nobody set"
+hypothesis. Holding bit 0 + bit 4 gives `commits 0/4` as before.
+
+**3. [!] The pair register's writable mask is `0x1FF`, not `0x10F`.**
+
+`sl6806_pwm.h` has recorded `0x10F` since 2026-08-07, measured by writing
+`0x3F0F` and reading back. `0x3F0F` **does not set bits [7:4] at all**, so that
+measurement was consistent and blind: it probed bits [3:0] and [13:8] and
+reported what it found. Writing all ones retains `0x1FF` — nine bits, [8:0] —
+and **[7:4] have never been written by anything**: not by this framework, not
+by the bootloader, not by the application.
+
+Put that next to the vendor's accessor. `0x00811EC0` is
+
+```
+[pair] = src | (div << 8)
+```
+
+and if `src` is a byte it occupies exactly [7:0], with `div` the single bit 8
+above it. That is a perfect fit for the nine implemented bits, and it means
+**[7:0] is a source select that every run in this project's history has left
+at zero.**
+
+If zero selects no source, that is the entire stopped counter, and it accounts
+for every measurement without residue:
+
+- the block's own gate is open — CTRL bit 28 clears with romclk 39 — because
+  romclk 39 really is the PWM's clock *domain*;
+- nothing counts, no commit retires, no event latches, because nothing is
+  arriving to count;
+- the pad answers bit 8 alone, because with `src = 0` there is no waveform and
+  `div` degenerates to a level.
+
+It also retires the last confusion about bit 8: it is not a clock enable and
+not an override of a waveform. It is `div`, and there has never been anything
+for it to divide.
+
+`examples/PwmPair` sweeps all 256 values of [7:0] with bit 8 held clear, so
+the pad is not driven by bit 8 and anything reaching it came from the counter.
+
+##### An unexplained observation to resolve
+
+The `PwmSrc` run ended with the report **"backlight is blinking"**. Nothing in
+that sketch should leave the panel doing anything: phase 2's baseline clears
+the pair register's bit 8, and the run ends in `ST_IDLE` with no further
+writes. A blink is a slow toggle, which is what a *running* counter at a very
+low source frequency would look like — but it is equally consistent with the
+phase-0 census flashing bit 8 on and off once, or with state left over from an
+earlier payload in the same power session.
+
+Not resolved, and deliberately not written up as a result. What distinguishes
+the cases is when it started, whether it is still going, and its rate.
+
+##### [M] The blink is the counter — and every `commits 0/4` was a timescale artifact
+
+`examples/PwmSrc` finished, went idle and wrote nothing more, and **the panel
+is blinking.** Tracing what it left behind settles what that means:
+
+```
+0x400800F4 = 0x11     bit 0 enable AND bit 4 source select
+pair register = 0     the force bit is CLEAR
+CTRL = 0x7F, MODE = 1, period/duty = 48000/24000
+```
+
+The pad is toggling with bit 8 clear. It is not being held at a level by the
+`div` bit — **it is being driven by the counter.** The counter is running. It
+is running slowly enough that one period is a visible blink.
+
+**Which makes every `commits 0/4` in this section an artifact of the
+deadline, not a negative.** `sl6806_pwm_commit()` polls 1000 iterations —
+microseconds. At 48000 counts against a source in the tens of kHz, one period
+is of the order of a second, so the poll gives up roughly a million times too
+early. It did that in `PwmClock`'s five configurations, in all 168 rows of
+`PwmMode`, and in `PwmSrc`'s phase 2. The witness was sound; its deadline was
+wrong by six orders of magnitude, and it was wrong identically everywhere,
+which is exactly why the results looked so clean.
+
+Two more claims fall out of the same error:
+
+- **"Bit 4 selects a source that is not running" is retracted.** It selects a
+  source that is SLOW. The reading was taken from a 100 ms settle window and
+  four microsecond polls, and both were far inside one period.
+- **CTRL bit 28's racy settling is explained.** At a slow source it takes
+  longer to settle than the 20 ms the probes allowed, which is why
+  configuration D produced it both set and clear from an identical register
+  value.
+
+`examples/PwmSlow` measures it properly: set the update bit, time how long it
+takes to retire with a deadline in *seconds*, and derive
+`f_source = period / retire_seconds`. The control is linearity — **halve the
+period and the time must halve** — run over four period values per clock
+setting. A real counter scales; nothing else this block could be doing does.
+The pair register's bit 8 is held clear so the visible blink and the measured
+retire time are two independent readings of the same number.
+
+The method lesson, which is the fourth of its kind in this section: a bounded
+poll encodes an assumption about timescale, and an assumption that is wrong
+everywhere produces a consistent, confident, uniform result. `0/4` on 168 rows
+should have read as *suspicious* for the same reason `CTRL 1000017f` on 168
+rows did — an observable that never varies is usually a broken instrument, not
+a discovery.
+
+##### [M] RESOLVED — the counter has been running all along, and every negative was one instrument
+
+`examples/PwmSlow`, first results. Every retire time is an integer multiple of
+~115 ms — 1, 3, 5 and 9 of them — and 115 ms is not a hardware time. It is the
+`RUN_MODE=poll` `loop()` interval, because the sketch timed across `loop()`
+calls with `millis()`. Take that floor out and the data says:
+
+| `0x400800F4` | retire, by period 6000 / 12000 / 24000 / 48000 | reading |
+|---|---|---|
+| `0x11` | 3, 5, 9, 9 polls | **scales with period** → source 23.4–26.1 kHz |
+| `0x01` | 1, 1, 1, 1 poll | below the floor → source > 417 kHz |
+
+The `0x11` rows scale, which is the control this test was built around. The
+bounds intersect at 23.4–26.1 kHz and **24 MHz / 1024 = 23437 Hz** sits inside
+it. The `0x01` rows are constant at every period, which is not a counter — it
+is the floor — so that source retires 48000 counts in under 115 ms and is fast;
+24 MHz would put it at 2 ms.
+
+**So the counter runs in both settings, and always has.** Bit 4 selects a slow
+source, bit 0 alone a fast one.
+
+Which means `sl6806_pwm_commit()`'s 1000-iteration bound — tens of
+microseconds — timed out in every configuration ever tested, including the
+fast one, where a period needs about 2 ms. **Every `commits 0/4` in this
+section was that single wrong deadline**, and because it was wrong uniformly,
+the results looked clean.
+
+Retracted with it:
+
+- **"Bit 4 selects a source that is not running."** It is slow, not dead.
+- **"The counter runs in NO configuration."** It runs in all of them.
+- **CTRL bit 28's raciness** is just a slow source settling past a 20 ms window.
+- **`PwmMode`'s 168-row negative** is void again — for the third distinct
+  reason, and this one is the underlying one. It has to be re-run with the
+  two-tier timer.
+
+The still-standing results are the ones that never depended on the commit
+deadline: romclk 39 is the PWM's clock, `0x400800F4` implements only bits 0 and
+4, MODE[3:1] and CTRL[19:16] are fully writable, the pair register's mask is
+`0x1FF` with `[7:0]` never written, and the panel tracks the pair's bit 8.
+
+###### The method failure, stated plainly
+
+Four probes in this section reported a clean negative, and all four were the
+same instrument reporting its own limit:
+
+| Symptom | The limit being reported |
+|---|---|
+| `CTRL 1000017f` on all 168 rows | measured inside the clock's settling window |
+| `commits 0/4` everywhere | poll bound six orders of magnitude too short |
+| retire `= 115 ms` at every period | the host's poll interval |
+| "the backlight brightness changed" | a blinking panel read as a dimming one |
+
+The tell was available every time and is the same tell: **an observable that
+does not vary across a sweep is usually a broken instrument, not a
+discovery.** A constant column should be read as a fault until proven
+otherwise. This section now has four instances of ignoring that and one of
+catching it — the `CTRL 1000017f` column — and catching it only worked because
+the raw register was printed rather than a verdict derived from it.
+
+##### [M] 24.000 MHz, exactly — the fast source measured with microsecond resolution
+
+`examples/PwmSlow`, re-run with a tight `micros()` spin inside one `loop()`
+call and a discard commit ahead of each measurement:
+
+```
+ clk 0x00000001   period 48000 -> 2002 us      period 12000 ->  502 us
+                  period 24000 -> 1002 us      period  6000 ->  252 us
+```
+
+Fit `t = period / f + overhead`: the three pairwise slopes are identical at
+`1/24` µs per count and the residual against **`period / 24 MHz + 2 µs`** is
+**zero on all four rows**. The 2 µs is the probe's own read loop.
+
+So romclk 39 with bit 4 clear clocks the PWM counter at **exactly 24.000 MHz**,
+and the vendor's period of 48000 gives a **500 Hz** output — which is what a
+backlight PWM should be, and is a good independent check that the whole decode
+is right. Bit 4's source is near 25 kHz, so the same period there is a
+half-hertz blink: that is what was on the bench.
+
+The `0x11` rows remain poll-quantised and are printed as upper bounds. Their
+first row is still anomalous (period 48000 retiring in ~1 poll) because the
+discard commit's own 40 ms tight spin cannot flush a 1.9 s period; that row is
+measuring a partial in-flight period, and it is a limitation of the probe, not
+a hardware result.
+
+###### What this costs, ledger form
+
+| Claim | Status |
+|---|---|
+| romclk 39 is the PWM's clock | **stands**, and now measured at 24.000 MHz |
+| `0x400800F4` implements only bits 0 and 4 | stands (31-bit walk) |
+| MODE[3:1], CTRL[19:16] fully writable | stands |
+| pair register mask is `0x1FF`, `[7:0]` never written | stands |
+| §14a's 128-module-id walk is a correct negative about bit 28 | stands |
+| "bit 4 selects a source that is not running" | **retracted** — it is slow |
+| "the counter runs in NO configuration" | **retracted** — it runs in both |
+| `PwmMode`'s 168-row negative | **void** — scored on the short deadline |
+| CTRL bit 28 as a run flag | still not one; it tracks the clock domain |
+| pair bit 8 lights the panel | stands, and is the open question |
+
+Four probes, four clean-looking negatives, one root cause each time: the
+instrument reporting its own limit. The remaining question — whether the panel
+follows the duty now, and whether bit 8 is still needed — is deliberately
+being answered by *looking at the panel* with one variable changed, rather
+than by another inference. `examples/PwmDim`.
+
+##### [!] The `PwmDim` run was inconclusive — the transcript proves the test never ran
+
+Reported as "1 and 0 power off the backlight, 2 makes it bright", which reads
+like a clean answer. It is not one. The log contains **twenty-four ramp
+headers and zero `done:` lines**.
+
+Any keypress in that sketch set `step = 0`, which restarts the ramp and
+reprints the header. A ramp is 200 steps advanced one per `loop()` call, and
+in `RUN_MODE=poll` `loop()` advances at the host's ~115 ms poll — so a row
+needs about 23 uninterrupted seconds and never got more than a few. **The duty
+never climbed off zero.** "Bit 8 clear is dark" is precisely what 0% duty looks
+like whether or not the pad carries the waveform.
+
+Row 2 being bright is consistent with everything already known and adds
+nothing: bit 8 lights the pad by itself.
+
+Three fixes, and the third is the general one:
+
+1. keys are ignored while a row is running;
+2. the ramp is short enough to finish;
+3. **the duty is printed as it goes**, so the transcript is itself evidence
+   that the sweep happened. A test whose log cannot show it ran is not a test —
+   the absence of `done:` was the only reason this was caught at all.
+
+###### And the control that should have been there from the start
+
+Every measurement in this section has lacked a positive control, which is why
+four of them reported the instrument's own limit as a hardware negative.
+`PwmDim` now carries one: **slow source, bit 8 clear** — the exact state
+`PwmSrc` left behind when the panel was observed blinking, and therefore the
+one configuration known to put the counter onto the pad. At ~25 kHz over 48000
+counts it is a half-hertz blink, which needs no brightness judgement.
+
+- Row 3 blinks → the rig works, and row 1 being dark is a real result.
+- Row 3 does not blink → the sketch measures nothing, rows 1 and 2 are void,
+  and the earlier blink had another cause.
+
+That single row converts every subsequent negative from "nothing happened" to
+"nothing happened, and here is proof the apparatus could have seen it".
+
+##### [M] The first controlled result — the pad is not gated by bit 8, and the panel is frequency-limited
+
+`examples/PwmDim`, re-run with the ramp completing (`step 30/60 duty 100%`
+and a `done:` line on every row) and with a positive control:
+
+| Row | Configuration | Panel |
+|---|---|---|
+| 1 | fast 24 MHz, bit 8 **clear**, duty 0→100→0 | **BLACK at every duty** |
+| 2 | fast 24 MHz, bit 8 **set** | bright |
+| 3 | slow ~25 kHz, bit 8 **clear**, duty 50% | **BLINKS** ← control |
+
+**Row 3 blinking is what makes rows 1 and 2 mean anything.** It proves the
+counter reaches the pad with bit 8 *clear*, so the pad is not gated by bit 8
+and the waveform is real. Rows 1 and 3 then differ in exactly one thing:
+
+```
+row 1 output = 24 MHz  / 48000 = 500 Hz
+row 3 output = 25 kHz  / 48000 = 0.5 Hz
+```
+
+The panel follows one and not the other. **That is no longer a question about
+the PWM.** The PWM works and its clock is measured at 24.000 MHz with zero
+residual; the question is what is on the other end of bank 1 pin 0.
+
+A note on the `CTRL 1000017f` in rows 1 and 2 versus `0000007f` in row 3: rows
+1 and 2 call `set_duty()` as their last act, which sets the update bit, and the
+readback happens within microseconds of it while one period is 2 ms. Row 3
+holds a fixed duty and sets nothing. That is a read-too-soon, not a clock
+failure — `PwmSlow` timed the same configuration retiring in 2002 µs.
+
+###### What is being asked next
+
+`examples/PwmFreq`, in two phases:
+
+- **A — does duty modulate, and which way round?** Hold 0.5 Hz and step the
+  duty 10/50/90%. At half a hertz the ratio is directly visible, so the duty
+  and its polarity are read straight off the panel with no instrument in
+  between.
+- **B — where does it stop following?** A ladder from 0.5 Hz to 1 kHz at 50%
+  duty, reported as BLINK / FLICKER / STEADY-HALF / BLACK.
+
+The ladder crosses **500 Hz and 1000 Hz on both clocks** — the slow one with a
+small period, the fast one with a large one — and that is the cross-check the
+question turns on:
+
+| Result | Meaning |
+|---|---|
+| black on both at 500 Hz | it is the **frequency**; the pin behaves like an enable with a slow response rather than a brightness input |
+| black only on the fast clock | it is the **clock**, in a way the commit timing did not reveal |
+
+If somewhere on the ladder the blink becomes a flicker and then fuses into
+steady half-brightness, that is an ordinary PWM backlight and dimming works —
+just not at the frequency tried first. If it goes from blinking straight to
+black without ever passing through steady-half, this pin is not dimming
+anything, and `sl6806_backlight_begin()`'s bit-8 write is the correct and
+final answer for this board.
+
+##### [M] `PwmFreq` — the panel follows the counter, and the "limit" found was the observer
+
+Phase A, 0.5 Hz at duty 10 / 50 / 90%: **all three blinked.** So the counter
+drives the pad and duty does not stop it.
+
+Phase B, the ladder: indistinguishable **from about 20-50 Hz upward.**
+
+That threshold is not a property of this board. **Human flicker fusion is
+20-60 Hz.** Phase B did not find a limit in the panel or the driver; it found
+the limit of watching a panel blink. Above fusion, "I can't see a difference
+between rows" is exactly what *both* possible answers look like:
+
+- steady half-brightness — dimming works and the blink fused as it should;
+- off — the pin stops driving above some frequency.
+
+Neither can be distinguished by asking "is this row steady-half?", because
+that requires comparing against a state that is no longer on the screen. It
+also cannot be reconciled with `PwmDim` row 1 reading BLACK at 500 Hz: if the
+panel fuses into half-brightness at 50 Hz it should still be half-lit at 500
+Hz. One of those two readings is wrong and the ladder cannot say which.
+
+###### The fix is a within-row comparison
+
+`examples/PwmDuty` alternates duty **10% and 90% every four seconds** at each
+frequency, announcing each change before it happens. The eye is very good at
+"did that just get brighter" and very poor at "is this the same as a minute
+ago", so the probe now asks only the question the observer can answer:
+
+| Reading | Meaning |
+|---|---|
+| DIFFERS | duty controls brightness at that frequency — dimming works |
+| SAME-LIT | duty ignored, output saturating |
+| SAME-DARK | the pin has stopped driving at that frequency |
+
+Row 1 is 0.5 Hz, where `PwmFreq` phase A already established the answer must be
+DIFFERS — so the first row is a **positive control for the method itself**, in
+the same way `PwmDim` row 3 was for the apparatus. And 500 Hz appears on both
+clocks again: if duty works there on the slow source and not the fast one, the
+problem is the clock rather than the frequency.
+
+Also fixed: `PwmFreq` printed integer hertz, so every sub-hertz row read
+"0 Hz" — the rows that mattered most were the ones its log described least.
+It prints milli-hertz now. A probe whose transcript cannot describe its own
+most important rows is a recurring fault in this section, not a cosmetic one.
+
+##### [M] Duty is confirmed working and active-high
+
+`PwmFreq` phase A, reported in detail: at 0.5 Hz with bit 8 clear, duty 10%
+gave a **short** flash, 50% an **even** on/off, and 90% a **long** flash.
+
+So the duty field modulates the output pulse width, and the polarity is
+**active-high** — more duty is more on-time. Together with the 24.000 MHz
+clock measurement that makes the PWM functionally complete and confirms that
+`sl6806_backlight_set()` has been writing the correct values all along.
+
+Phase B's last visible blink was at **50 Hz**, which is the top of the human
+flicker-fusion range and therefore still the observer's limit rather than the
+board's.
+
+###### What is left, stated precisely
+
+One question, and it is now narrow: **above fusion, is the panel at a
+brightness proportional to duty, or is it dark?**
+
+- If proportional, the backlight dims and the only reason it looked like an
+  on/off light for a year is that nothing ever enabled romclk 39. The driver
+  should drop the pair register's bit 8 in favour of duty.
+- If dark, the pad stops driving somewhere above 50 Hz, bit 8 stays as the
+  only way to light this panel, and the useful dimming range is limited to
+  frequencies that visibly flicker — i.e. not useful.
+
+`PwmDim` row 1 read BLACK at 500 Hz with the duty ramped to 100%, which
+argues for the second. But it cannot be squared with a panel that fuses into
+half-brightness at 50 Hz, so one of the two readings is wrong.
+`examples/PwmDuty` decides it with a within-row 10%/90% comparison at each
+frequency, and carries a 0.5 Hz positive control for the method.
+
+##### [M] Above fusion the brightness does not read as proportional — and the eye is out of road
+
+`PwmDuty` reported "brightness doesn't seem to be proportional". Taken with
+`PwmDim` row 1 reading BLACK at 500 Hz with duty at 100%, the weight of
+evidence is that **the pad stops producing a usable average above flicker
+fusion**, and that this panel is an on/off backlight in practice.
+
+That is stated as a weight of evidence and not as a result, because the same
+report is also what an ambiguous observation looks like, and this section has
+already promoted four ambiguous observations to results.
+
+###### The instrument, not the board, is now the limit
+
+Five probes in a row have asked an observer to judge brightness against a
+state that was no longer visible:
+
+| Report | What it turned out to be |
+|---|---|
+| "brightness changed" | a blinking panel |
+| "1 was black" | a ramp that never left 0% duty |
+| "can't see a difference" | flicker fusion — the observer |
+| "50 Hz is the last to blink" | flicker fusion again |
+| "doesn't seem proportional" | unresolved, and unresolvable this way |
+
+`examples/PwmManual` stops running sequences. It holds a state and changes one
+thing per keypress, so an A/B can be repeated until it is certain rather than
+judged once in passing. The test it exists for is **maximum contrast** — flip
+duty 0% against 100%, not 10 against 90 — starting at 1 Hz where the answer is
+already known, so the observer calibrates on a positive control before
+trusting any negative higher up.
+
+And if that is still ambiguous, the answer needs an actual instrument. A
+phone's slow-motion mode samples at 120-240 fps and resolves PWM well past
+fusion; two stills at a fixed manual exposure, one at 0% and one at 100%,
+differ in a way that is measurable rather than remembered. **This
+investigation has been substituting an eye for a photometer for five rounds,
+and that is the mistake to record.**
+
+###### What is settled regardless of how this ends
+
+- The PWM works. Counter at exactly 24.000 MHz; duty modulates pulse width,
+  active-high; the pad follows the counter with pair bit 8 clear.
+- `sl6806_backlight_begin()` is correct as it stands: it enables romclk 39 and
+  sets pair bit 8, and bit 8 is the only thing observed to light this panel
+  steadily. No code change is pending on the outcome, which is why none has
+  been made.
+- What the outcome decides is only whether a *dimming* API is worth offering
+  on this board, and at what frequency ceiling.
+
+##### [M] `PwmManual` — bit 8 is a force, and duty works when it is clear
+
+Three observations, all consistent with each other and with the register
+decode:
+
+- **Blinking stops when bit 8 is set.** So bit 8 pins the pad regardless of
+  what the counter is doing. That is an output force / override, confirmed
+  behaviourally rather than inferred, and it is why every table in this
+  section that had bit 8 set showed a steady panel.
+- **Blinking stops at duty 100%.** With `duty == period` the comparator never
+  resets and the output is constantly high, so the panel is steady bright.
+  That also confirms the duty field reaches full scale.
+- **Duty works when bit 8 is clear.**
+
+Which retires the "weight of evidence" recorded above that the pad stops
+producing a usable average: it does produce one. What the earlier `PwmDim`
+row 1 reading of BLACK-at-500 Hz meant is still not settled, but it is now the
+odd one out rather than the rule.
+
+So the picture is complete and self-consistent:
+
+```
+module 68        the registers answer
+romclk 39        the counter runs, at exactly 24.000 MHz
+pad bank1 pin0 f4  the counter reaches the pad
+CTRL 0x7F, MODE 1  the channel runs
+period/duty      active-high, modulates pulse width, full scale at duty==period
+pair bit 8       an OUTPUT FORCE that overrides all of the above
+```
+
+###### The one number that decides the driver
+
+**What is the highest frequency at which flipping duty 0% against 100% still
+changes the panel?**
+
+- above ~60 Hz and dimming is usable: a backlight API can offer brightness,
+  at a frequency high enough not to flicker, and `sl6806_backlight_begin()`
+  should leave bit 8 clear so duty has an effect.
+- at or below ~50 Hz only, and dimming is not usable on this board: any
+  frequency where duty works is a frequency where the panel visibly flickers.
+  Bit 8 stays, the backlight is on/off, and that is the final answer.
+
+`examples/PwmManual` walks it: `[` and `]` step the ladder, `f` swaps source,
+`0` and `4` are the maximum-contrast flip. Start at 1 Hz, where the flip is
+known to work, and walk up until it stops.
