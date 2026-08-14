@@ -94,6 +94,12 @@ DEFS   := -DF_CPU=$(F_CPU)UL -DSL6806=1 $(MODE_DEF)
 
 # examples/PadSweep takes one GPIO bank per build, so a bank that wedges the
 # device cannot take the others with it.
+# The console ring, in bytes; must be a power of two. The default is in
+# cores/sl6806/sl6806_console.h and is large on purpose - see the note there.
+ifneq ($(CONSOLE_SIZE),)
+DEFS   += -DSL6806_CONSOLE_SIZE=$(CONSOLE_SIZE)
+endif
+
 ifneq ($(SWEEP_BANK),)
 DEFS   += -DSWEEP_BANK=$(SWEEP_BANK)
 endif

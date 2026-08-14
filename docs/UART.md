@@ -123,6 +123,32 @@ this is safe to leave in a sketch you also run on a device with nothing
 attached. `sl6806_uart_puts()` and `sl6806_uart_write()` are there if you want
 to write to the port alone.
 
+## Do you actually need this?
+
+Possibly not, and it is worth saying so on the page that sells it.
+
+The problem the serial port was decoded to solve — losing the top of every
+long report — had a one-line fix that nobody made: **the console ring was
+2 KB, and it is now 64 KB.** It lives in `.bss`, which the payload image does
+not carry, so the upload is the same size; it costs about a tenth of the heap;
+and `tools/sl6806-monitor` reads the size out of the ring's own header, so
+nothing on the host had to change. Sixty-four kilobytes is roughly a thousand
+lines, which is more than any sketch in this tree prints.
+
+So if all you want is to stop losing output, rebuild and you have it. What the
+serial port gives you beyond that is narrower and real:
+
+- it **cannot** overflow, however long the run;
+- it works when the USB handler is wedged, which is the one failure the USB
+  console cannot report at all — by construction, since reporting is what USB
+  is doing;
+- and it needs no host polling, so timing measurements are not perturbed by a
+  monitor.
+
+Those matter for `MODE=firmware` and for anything that takes the USB stack
+down. For everyday probing, the bigger ring is the answer, and it does not
+require opening the case.
+
 ## Why this was worth building
 
 Nine runs in the SD investigation opened with `[lost output - device outran
