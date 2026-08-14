@@ -627,3 +627,256 @@ Everything else is tuning.
 
 ~~Whether the DMA descriptor registers accept writes~~ — settled: they do, and
 a whole buffer transfers.
+
+## The 10 µs needs auditing before anything else is swept
+
+Written 2026-08-14, straight after the PWM investigation closed, because that
+investigation ended by finding that four separate "clean negatives" were one
+instrument reporting its own limit — and this document's central negative has
+the same shape.
+
+The claim is that a 4796-byte descriptor retires in a mean of 10 µs, which
+would be 480 MB/s, which a 64 MHz AHB cannot do, so nothing is transferred.
+**The reasoning is sound if and only if the 10 µs is a measurement.** Here is
+how it is taken, in `examples/AudioWall`:
+
+```c
+sl6806_audio_play(...);
+start = micros();
+while (micros() - start < 100000)
+    if (sl6806_audio_done())
+        return micros() - start;
+```
+
+When the flag is already up, what comes back is the cost of **one iteration**
+of that loop — a `micros()`, an MMIO read, a write-1-to-clear write, another
+`micros()`. At the 312 ns per register access measured for the LCDC, one
+iteration being of the order of 10 µs is entirely plausible. If it is, then
+"10 µs" does not mean 480 MB/s. It means *the flag was already set the first
+time anything looked*, and it carries no timing information at all.
+
+And the tell is already in this document, three sections up: **"a mean of
+10 µs in all twelve. Nothing varies."** An observable that does not vary
+across a twelve-way sweep is usually a broken instrument, not a discovery.
+That exact sentence, in the form `commits 0/4` across 168 configurations, cost
+the PWM work four rounds — and the PWM counter had been running the whole
+time. See `docs/sl6806_re_notes.md` §32.
+
+### What `examples/AudioLen` checks, in order
+
+1. **The instrument's floor.** The same poll loop against a condition that is
+   never true. Every audio timing number this project has quoted has to be
+   read against that figure.
+
+2. **Whether the flag is stale.** Read `TX_CTRL` before starting anything;
+   write the acknowledgement; read back. Nothing has ever verified that
+   `SL6806_AUD_IRQ_DONE` clears — if it is not write-1-to-clear, every
+   completion reading taken so far is void, and "retires instantly" is just a
+   bit that was already up.
+
+3. **Whether completion time scales with length.** This is the control the
+   question turns on, and it has never been run: the sweeps so far varied
+   routes, clock sources and all 32 bits of `0x400E0000` while holding the
+   length at 4796 bytes throughout. `AudioLen` spans 128 bytes to 64000 — a
+   500:1 range.
+
+   | Result | Meaning |
+   |---|---|
+   | time rises with length | data **is** moving; only the rate is wrong, and this document's central negative is void |
+   | time flat across 500:1 | nothing moves, and the negative stands for a better reason than it had |
+
+That is the same control that settled the PWM — halve the period and the time
+must halve. Here: double the length and the time must double. It is a stronger
+test than any register sweep, because no configuration bit can fake a
+proportionality.
+
+### [M] First run — the two tidy explanations are dead, and the control did not run
+
+**1. The 10 µs is a real reading.** The poll loop's floor is **1.73 µs per
+iteration**, so `AudioWall`'s 10 µs is about six iterations — comfortably
+above it. The completion is genuinely fast; it is not the loop reporting its
+own cost. The argument from 480 MB/s stands as far as it goes.
+
+**2. The flag is not stale.** `TX_CTRL` reads `0x00000800` before anything
+starts, and `SL6806_AUD_IRQ_DONE` is bit 10 — **clear**. So the descriptor is
+not retiring against a bit that was already up.
+
+That run also turned up a small new register fact: **bit 11 is set and
+survives two write-backs**, so it is a status bit rather than write-1-to-clear,
+and it is the first thing known about what else lives in that word. Worth a
+census later.
+
+**3. The length control did not run.** All eight rows printed `us 0, iters 0`,
+and `iters == 0` is reachable only on the early-return path — so
+`sl6806_audio_play()` rejected every call. Its guard is
+
+```c
+if (!buf || !len || (len & 3u) || (addr & 3u) || len > 0xFFFFu) return -1;
+```
+
+Every length passes. The rejection was `(addr & 3u)`: `static int16_t wave[]`
+is only **2-byte aligned**, and the buffer landed on an odd word boundary.
+
+[!] And note what that column looked like: eight rows of zeros, in a test
+whose stated criterion was *"flat µs across a 500:1 span of length = nothing
+moves."* A rejected row and a flat row are indistinguishable in the reported
+value. The only reason this was caught is that the raw `iters` counter was
+printed beside the derived number — which is the same thing that caught the
+void `PwmMode` sweep, and the argument for printing raw state rather than
+verdicts.
+
+Fixed: the buffer is `__attribute__((aligned(4)))`, the buffer address and its
+alignment are printed, and a rejected row now prints `REJECTED ... not a
+measurement` instead of a zero. **A test must not be able to report a failure
+to run as a result.**
+
+So the question is exactly where it was, minus two explanations, and the
+length sweep still has to be run.
+
+### [M] RETRACTED — the DMA moves data. The central negative was one length, measured many ways.
+
+`examples/AudioLen`, with the buffer word-aligned so the rows actually ran:
+
+```
+ len      us   iters
+   128     3      1
+  2048     5      2
+  4796    10      5
+  8192    17      8
+ 16384    32     16
+ 64000   125     64
+```
+
+Linear fit: **`us = 0.001926 × len + 1.43`** — about 519 bytes/µs with a fixed
+1.4 µs of overhead, negligible residuals, across a 500:1 span of length.
+
+**A descriptor that is retired without doing anything takes constant time.**
+This does not. So something proportional to the data is happening, and this
+document's central claim — *"the block accepts a descriptor and retires it in
+10 µs having moved nothing"* — is **void**. Every sweep behind it varied
+routes, clock sources and all 32 bits of `0x400E0000` while holding the length
+at 4796 bytes, so the one variable that could have exposed it was never moved.
+
+The 480 MB/s impossibility argument also needs correcting: it was computed
+against a 64 MHz core, and §30 of the RE notes measured the PLL already
+running at **192 MHz**. ~130 M words/s is about two thirds of a word per cycle
+on such a bus — an ordinary DMA rate, not an impossible one.
+
+**What is true instead is more useful than the negative was.** The DMA runs at
+bus speed and *nothing paces it at the sample rate*: real time for 48 kHz
+stereo 16-bit is 192 KB/s, the measured rate is 2667× that, and the ratio is
+constant at every length. That is a DMA draining into a sink which never
+back-pressures.
+
+One anomaly kept rather than dropped: **length 32768 timed out** (60 ms,
+30968 iterations) while 64000 completed in 125 µs. `0x8000` is exactly bit 15
+of the 16-bit length field. Unexplained.
+
+### [V] The audio master clock the vendor starts, and this framework never has
+
+`sl6806_audio_begin()` does module 37, romclk 19 and the bit clock. The
+vendor's own path at `0x00D9A224` does all of the following *first*, and none
+of it appears anywhere in `cores/`:
+
+```
+romclk_enable(0)
+0x00807300(24576000)          <- an audio PLL
+module_enable(87)
+romclk_enable(31)
+romclk_enable(56)
+0x4009B04C = (v & ~0x0F000000) | 0x0E000000
+0x4009B050 = 27
+0x4009B040 |= 0x80000000 | 1
+```
+
+`0x00807300` is a **second PLL**, distinct from the `0x40080008` one that
+`sl6806_pwm.h` documents, and its multiplier is chosen by the audio rate:
+
+| freq | mult | mode |
+|---|---|---|
+| 24576000 | `0x3126` | 3 |
+| otherwise (`0x01588738`) | `0x186C2` | 2 |
+
+```
+poll 0x40080014 bit 11 until clear
+0x40080010 = (v & ~0xFC1F0000) | 0x3000 | (mode << 5)
+0x40080014 = (v & 0x3800) | 0x80000000 | 0x400 | (mult << 14)
+```
+
+A multiplier selected by sample rate is an audio PLL by construction.
+**`0x4009B000` is a block this project has never named**, and module 87,
+romclk 31 and romclk 56 have never been attributed. There is also a fallback
+at `0x00D9A1FE` — `clk_setsrc(57, 42)` — taken when the PLL flag is clear.
+
+This is the same shape as the PWM's romclk 39: an entire clock chain sitting
+in XIP that the driver never performs, on a block that is otherwise fully
+configured.
+
+### What `examples/AudioPll` runs
+
+The vendor's chain, one step per `loop()` call with each step announced before
+it happens, then the length sweep again.
+
+| Result | Meaning |
+|---|---|
+| completion moves toward 25 ms for 4796 bytes | the DAC now paces the DMA — audio is running |
+| completion stays at ~10 µs | this chain is not the pacing, and the question becomes what consumes the FIFO |
+
+The linearity should persist either way; what changes is the slope, by a
+factor of 2667. There is no way to misread that, which is the point after five
+rounds of ambiguous eyeballing on the backlight.
+
+### [M] The vendor's clock chain is fully applied, and it is not the pacing
+
+`examples/AudioPll`. The chain was performed step by step with readback, and
+the length sweep run before and after. **Nothing changed** — 2048 to 64000
+bytes, ~520 B/µs, 2667× real time, identical either side.
+
+What each step actually did:
+
+| Step | Result |
+|---|---|
+| `romclk_enable(0)` | set |
+| audio PLL `0x00807300(24576000)` | **already programmed — see below** |
+| `module_enable(87)` | acked |
+| `romclk_enable(31)` | **a no-op in the ROM** — id 31 dispatches to `0x24BE`, a bare `bx lr`. The generated table is right to omit it; the vendor calls a dead id. |
+| `romclk_enable(56)` | set |
+| `0x4009B04C/50/40` | took: `0x0E900000`, `0x1B`, `0x80000001` |
+
+**The audio PLL is already running at exactly 24.576 MHz.** `0x40080014`
+reads `0x8C498C00`, which is bit-for-bit what `0x00807300` writes for
+24576000 — multiplier `0x3126`, bit 31, bit 10, bits [13:11] preserved — and
+`0x40080010` reads `0x00103060`, carrying mode 3 and `0x3000` exactly as the
+routine sets them. Whatever brings the chip up leaves the audio PLL configured
+for the 48 kHz family.
+
+That also explains the `BUSY TIMEOUT`: bit 11 is not a busy flag. It is inside
+the `0x3800` field the vendor's write *preserves*, and it currently reads 1.
+The vendor's `lsls #20 ; bmi` loop only terminates when the PLL is
+unconfigured, i.e. at cold boot before anything sets it. The probe's bounded
+version correctly declined to write — and would have written the value that is
+already there.
+
+**So this is a clean negative**, and the first in this section that is not an
+instrument artifact: the sweep is linear (the instrument works), every step was
+applied and confirmed by readback, and the one step that mattered was already
+in the target state, verified against the vendor's own formula.
+
+### Where that leaves it
+
+The DMA runs at bus speed. The master clock is up at the right frequency. What
+is missing is whatever makes the output stage **consume** samples at the frame
+rate, and three things are worth trying in order:
+
+1. **The bit clock's parent.** `sl6806_audio.c` writes divider 8 and the enable
+   into `0x40080094` (romclk 44), but nothing has ever established what feeds
+   that divider or whether the audio PLL is its source. A derivation the way
+   romclk 39's was derived, plus an implemented-bit census of `0x40080094`.
+2. **`0x4009B000`.** Three registers were written because the vendor writes
+   three. The block has never been censused, named, or read; it sits directly
+   in the audio clock path and is the least-explored thing in it.
+3. **The output enable inside `0x40009000`.** The DAC path is configured and
+   the levels are at maximum, but nothing is known to *start* the serialiser.
+
+The length sweep is now the standing instrument for all three: real time is
+1×, and anything that introduces pacing moves the slope by a factor of 2667.
