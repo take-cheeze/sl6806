@@ -1467,3 +1467,46 @@ other row, so the control could not contradict the result. A control that
 cannot fail loudly is not a control; it is decoration. The comment above it
 even read *"two equal numbers here means the detector is working"* while the
 code printed a verdict without ever checking that they were equal.
+
+## [M] The clock space is exhausted — the problem is not a clock
+
+With the detector fixed and its baseline passing (`SRAM 9 µs, flash 9 µs,
+equal`), both walks ran clean:
+
+```
+128 module ids, 0 hit(s)
+ 56 romclk ids, 0 hit(s)
+```
+
+**And the walks are cumulative.** By the end of `m` every one of the 128 module
+clocks was on; by the end of `r` every romclk id as well — and the DMA still
+never touched its source. That is a far stronger statement than 184 separate
+negatives: with essentially every clock in the chip enabled, the audio DMA does
+not read memory.
+
+This is also the first walk of the clock space ever run against this block with
+an instrument that works, gated by a control that can fail. §14a's walk was
+void; this one is not.
+
+**So whatever stops the block fetching is not a clock.** That closes the line
+of enquiry this document has followed since it opened — "configured and not
+running" was read as a clocking problem for its whole history, and it is not
+one.
+
+### What is left, cheapest first
+
+1. **An implemented-bit census of the audio block itself.** Its thirty
+   registers have had their *reset values* recorded and nothing more — nobody
+   has ever asked which of their bits are writable. That question found four
+   hidden bits in the PWM's pair register after a year of it being "known", and
+   bit 4 of the audio bit clock. `examples/AudioFetch` phase `c` does it over
+   the ten registers in the path, one bit at a time with a restore after each.
+   The `unwritten` column it prints — implemented but never written by the
+   driver — is the search space.
+2. **The source address may not be what we think.** `+0x10C` is taken as a
+   buffer pointer because the vendor writes one there, but a descriptor-pointer
+   format would look identical from the outside and would explain a length that
+   counts down against nothing.
+3. **A bus-master enable outside both clock families.**
+4. **A generate-rather-than-fetch mode**, in which the length is consumed
+   without a source being read at all. That would fit every measurement taken.

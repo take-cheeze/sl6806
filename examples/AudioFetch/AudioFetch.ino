@@ -171,7 +171,8 @@ void setup()
     sl6806_audio_route(0, 1, 0);
     sl6806_audio_route(1, 1, 0);
     sl6806_audio_clock_start(1);
-    Serial.println("'b' baseline  'm' module ids  'r' romclk ids  'q' stop");
+    Serial.println("'b' baseline  'm' module ids  'r' romclk ids"
+                   "  'c' census the audio block  'q' stop");
 }
 
 void loop()
@@ -181,11 +182,11 @@ void loop()
     if (!up)
         return;
     if (key == 'q') { phase = -1; Serial.println("stopped."); return; }
-    if (key == 'b' || key == 'm' || key == 'r') {
+    if (key == 'b' || key == 'm' || key == 'r' || key == 'c') {
         phase = key; idx = 0; hits = 0; announced = false;
         Serial.printf("\n[%c]\n", key);
     } else if (key >= 0 && key != '\r' && key != '\n') {
-        Serial.printf("unknown key '%c' - try b m r q\n", key);
+        Serial.printf("unknown key '%c' - try b m r c q\n", key);
         return;
     }
     if (phase < 0)
@@ -242,6 +243,63 @@ void loop()
         idx++;
         announced = false;
         break;
+
+    case 'c': {
+        /*
+         * [M] THE CLOCK SPACE IS EXHAUSTED. Both walks came back 0 of 184, and
+         * they are cumulative - by the end every module id and every romclk id
+         * was ON, and the DMA still never touched its source. Whatever stops it
+         * fetching is not a clock.
+         *
+         * So census the block itself. Its thirty registers have had their RESET
+         * VALUES recorded and nothing more: nobody has ever asked which of their
+         * bits are writable. That is the question that found four hidden bits in
+         * the PWM's pair register after a year of it being "known", and bit 4 of
+         * the audio bit clock.
+         *
+         * One bit at a time with a restore after each, which is slower than
+         * all-ones and cannot repeat the 0x3F0F mistake of probing only the bits
+         * it already expected.
+         */
+        static const struct { const char *name; uint32_t reg; } regs[] = {
+            { "+0x000 ctrl ", SL6806_AUD_REG(0x000) },
+            { "+0x008 DAC  ", SL6806_AUD_DAC },
+            { "+0x07C src  ", SL6806_AUD_REG(0x07C) },
+            { "+0x080 src  ", SL6806_AUD_REG(0x080) },
+            { "+0x100 TXen ", SL6806_AUD_TX_ENABLE },
+            { "+0x104 TXtrg", SL6806_AUD_TX_TRIG },
+            { "+0x108 TXctl", SL6806_AUD_TX_CTRL },
+            { "+0x10C TXadr", SL6806_AUD_TX_ADDR },
+            { "+0x200 RXen ", SL6806_AUD_RX_ENABLE },
+            { "+0x208 RXctl", SL6806_AUD_RX_CTRL },
+        };
+        unsigned r;
+
+        Serial.println("\n--- audio block census: which bits are writable?");
+        Serial.println("    reset values were recorded long ago; writability");
+        Serial.println("    never was. A fetch enable would be a bit here that");
+        Serial.println("    holds and that nothing in the driver writes.");
+        for (r = 0; r < sizeof regs / sizeof regs[0]; r++) {
+            uint32_t saved = sl6806_mmio_read(regs[r].reg);
+            uint32_t mask = 0;
+            unsigned b;
+
+            for (b = 0; b < 32; b++) {
+                uint32_t m = 1u << b;
+
+                sl6806_mmio_write(regs[r].reg, saved | m);
+                if (sl6806_mmio_read(regs[r].reg) & m)
+                    mask |= m;
+                sl6806_mmio_write(regs[r].reg, saved);
+            }
+            Serial.printf("    %s holds %08x  implemented %08x  unwritten %08x\n",
+                          regs[r].name, (unsigned)saved, (unsigned)mask,
+                          (unsigned)(mask & ~saved));
+        }
+        Serial.println("    the 'unwritten' column is the search space.");
+        phase = -1;
+        break;
+    }
 
     default:
         phase = -1;
