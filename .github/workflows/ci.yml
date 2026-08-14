@@ -44,10 +44,26 @@ jobs:
         mode: [payload, firmware]
     steps:
       - uses: actions/checkout@v4
+      # apt-get install writes its downloaded .deb files here; ownership is
+      # root by default, so actions/cache (running as the runner user) cannot
+      # write a restored cache into it without this.
+      - name: Allow caching apt archives
+        run: sudo chown "$USER" /var/cache/apt/archives
+      - name: Cache ARM toolchain packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-arm-none-eabi-${{ runner.os }}-v1
       - name: Install the ARM toolchain
         # The newlib packages are *recommends* of gcc-arm-none-eabi, not
         # depends, so --no-install-recommends alone leaves a compiler with no
         # C library headers and every build dies on <string.h>. Name them.
+        #
+        # timeout-minutes: seen stalling past 14 minutes on a flaky mirror
+        # connection while 29 concurrent sibling jobs installed the same
+        # packages in under 2 minutes each - fail fast instead of sitting on
+        # the default 360-minute job budget.
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -74,7 +90,15 @@ jobs:
         run_mode: [hook, poll, takeover]
     steps:
       - uses: actions/checkout@v4
+      - name: Allow caching apt archives
+        run: sudo chown "$USER" /var/cache/apt/archives
+      - name: Cache ARM toolchain packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-arm-none-eabi-${{ runner.os }}-v1
       - name: Install the ARM toolchain
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -98,10 +122,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Allow caching apt archives
+        run: sudo chown "$USER" /var/cache/apt/archives
+      - name: Cache ARM toolchain packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-arm-none-eabi-${{ runner.os }}-v1
       - name: Install the ARM toolchain
         # The newlib packages are *recommends* of gcc-arm-none-eabi, not
         # depends, so --no-install-recommends alone leaves a compiler with no
         # C library headers and every build dies on <string.h>. Name them.
+        timeout-minutes: 5
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
