@@ -28,42 +28,214 @@ permissions:
 jobs:
   host-tests:
     name: host tests (ASan/UBSan)
-    runs-on: ubuntu-latest
+    # No toolchain install: gcc and make are already on the ubuntu-slim
+    # image, and this only compiles ~14 small native test binaries.
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
       - name: Run
         run: make -C tests/host
 
   build:
-    name: build ${{ matrix.sketch }} (${{ matrix.mode }})
+    name: build all sketches
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        sketch: [Hello, Blink, GfxDemo, TouchDemo, CameraDemo, FmDemo, MmioProbe, RegFileProbe, DvpProbe, RomProbe, CallbackProbe, BtProbe, AudioProbe, ToneDemo, AudioWall, AudioWindow]
-        mode: [payload, firmware]
     steps:
       - uses: actions/checkout@v4
+      # apt-get install writes its downloaded .deb files here; ownership is
+      # root by default, so actions/cache (running as the runner user) cannot
+      # write a restored cache into it without this.
+      - name: Allow caching apt archives
+        run: sudo chown "$USER" /var/cache/apt/archives
+      - name: Cache ARM toolchain packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-arm-none-eabi-${{ runner.os }}-v1
       - name: Install the ARM toolchain
         # The newlib packages are *recommends* of gcc-arm-none-eabi, not
         # depends, so --no-install-recommends alone leaves a compiler with no
         # C library headers and every build dies on <string.h>. Name them.
+        #
+        # timeout-minutes: bounds genuine stalls (one job sat past 14 minutes
+        # while 29 siblings installing the same packages finished in under 2)
+        # without false-failing a slow-but-working mirror - these packages
+        # are a real 574 MB (mostly libstdc++-arm-none-eabi-newlib alone),
+        # and a cold cache has measured needing ~5 minutes just to download
+        # that at ordinary, non-stalled mirror throughput.
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-arm-none-eabi libnewlib-arm-none-eabi \
             libstdc++-arm-none-eabi-newlib
-      - name: Build
-        # -Werror here rather than in the Makefile: a warning should stop CI
-        # without making a local experiment painful.
-        run: |
-          make SKETCH=examples/${{ matrix.sketch }} MODE=${{ matrix.mode }} \
-               BUILD_DIR=build/${{ matrix.sketch }}-${{ matrix.mode }} \
-               EXTRA_FLAGS=-Werror
-      - name: Report size
-        run: |
-          arm-none-eabi-size \
-            build/${{ matrix.sketch }}-${{ matrix.mode }}/${{ matrix.sketch }}.elf
+      # One job builds every sketch x mode combination, instead of 32
+      # separate matrix jobs each paying for their own runner and their own
+      # toolchain install - the install above now happens once per CI run
+      # instead of 32 times. `parallel` runs the group as background steps
+      # (up to 10 at a time; the rest queue automatically) and waits for all
+      # of them before the job ends. Each entry keeps its own name and log,
+      # so a failure is still as easy to find as it was per-matrix-job.
+      - parallel:
+          - name: Hello (payload)
+            run: |
+              make SKETCH=examples/Hello MODE=payload \
+                   BUILD_DIR=build/Hello-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/Hello-payload/Hello.elf
+          - name: Hello (firmware)
+            run: |
+              make SKETCH=examples/Hello MODE=firmware \
+                   BUILD_DIR=build/Hello-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/Hello-firmware/Hello.elf
+          - name: Blink (payload)
+            run: |
+              make SKETCH=examples/Blink MODE=payload \
+                   BUILD_DIR=build/Blink-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/Blink-payload/Blink.elf
+          - name: Blink (firmware)
+            run: |
+              make SKETCH=examples/Blink MODE=firmware \
+                   BUILD_DIR=build/Blink-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/Blink-firmware/Blink.elf
+          - name: GfxDemo (payload)
+            run: |
+              make SKETCH=examples/GfxDemo MODE=payload \
+                   BUILD_DIR=build/GfxDemo-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/GfxDemo-payload/GfxDemo.elf
+          - name: GfxDemo (firmware)
+            run: |
+              make SKETCH=examples/GfxDemo MODE=firmware \
+                   BUILD_DIR=build/GfxDemo-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/GfxDemo-firmware/GfxDemo.elf
+          - name: TouchDemo (payload)
+            run: |
+              make SKETCH=examples/TouchDemo MODE=payload \
+                   BUILD_DIR=build/TouchDemo-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/TouchDemo-payload/TouchDemo.elf
+          - name: TouchDemo (firmware)
+            run: |
+              make SKETCH=examples/TouchDemo MODE=firmware \
+                   BUILD_DIR=build/TouchDemo-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/TouchDemo-firmware/TouchDemo.elf
+          - name: CameraDemo (payload)
+            run: |
+              make SKETCH=examples/CameraDemo MODE=payload \
+                   BUILD_DIR=build/CameraDemo-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/CameraDemo-payload/CameraDemo.elf
+          - name: CameraDemo (firmware)
+            run: |
+              make SKETCH=examples/CameraDemo MODE=firmware \
+                   BUILD_DIR=build/CameraDemo-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/CameraDemo-firmware/CameraDemo.elf
+          - name: FmDemo (payload)
+            run: |
+              make SKETCH=examples/FmDemo MODE=payload \
+                   BUILD_DIR=build/FmDemo-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/FmDemo-payload/FmDemo.elf
+          - name: FmDemo (firmware)
+            run: |
+              make SKETCH=examples/FmDemo MODE=firmware \
+                   BUILD_DIR=build/FmDemo-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/FmDemo-firmware/FmDemo.elf
+          - name: MmioProbe (payload)
+            run: |
+              make SKETCH=examples/MmioProbe MODE=payload \
+                   BUILD_DIR=build/MmioProbe-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/MmioProbe-payload/MmioProbe.elf
+          - name: MmioProbe (firmware)
+            run: |
+              make SKETCH=examples/MmioProbe MODE=firmware \
+                   BUILD_DIR=build/MmioProbe-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/MmioProbe-firmware/MmioProbe.elf
+          - name: RegFileProbe (payload)
+            run: |
+              make SKETCH=examples/RegFileProbe MODE=payload \
+                   BUILD_DIR=build/RegFileProbe-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/RegFileProbe-payload/RegFileProbe.elf
+          - name: RegFileProbe (firmware)
+            run: |
+              make SKETCH=examples/RegFileProbe MODE=firmware \
+                   BUILD_DIR=build/RegFileProbe-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/RegFileProbe-firmware/RegFileProbe.elf
+          - name: DvpProbe (payload)
+            run: |
+              make SKETCH=examples/DvpProbe MODE=payload \
+                   BUILD_DIR=build/DvpProbe-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/DvpProbe-payload/DvpProbe.elf
+          - name: DvpProbe (firmware)
+            run: |
+              make SKETCH=examples/DvpProbe MODE=firmware \
+                   BUILD_DIR=build/DvpProbe-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/DvpProbe-firmware/DvpProbe.elf
+          - name: RomProbe (payload)
+            run: |
+              make SKETCH=examples/RomProbe MODE=payload \
+                   BUILD_DIR=build/RomProbe-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/RomProbe-payload/RomProbe.elf
+          - name: RomProbe (firmware)
+            run: |
+              make SKETCH=examples/RomProbe MODE=firmware \
+                   BUILD_DIR=build/RomProbe-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/RomProbe-firmware/RomProbe.elf
+          - name: CallbackProbe (payload)
+            run: |
+              make SKETCH=examples/CallbackProbe MODE=payload \
+                   BUILD_DIR=build/CallbackProbe-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/CallbackProbe-payload/CallbackProbe.elf
+          - name: CallbackProbe (firmware)
+            run: |
+              make SKETCH=examples/CallbackProbe MODE=firmware \
+                   BUILD_DIR=build/CallbackProbe-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/CallbackProbe-firmware/CallbackProbe.elf
+          - name: BtProbe (payload)
+            run: |
+              make SKETCH=examples/BtProbe MODE=payload \
+                   BUILD_DIR=build/BtProbe-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/BtProbe-payload/BtProbe.elf
+          - name: BtProbe (firmware)
+            run: |
+              make SKETCH=examples/BtProbe MODE=firmware \
+                   BUILD_DIR=build/BtProbe-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/BtProbe-firmware/BtProbe.elf
+          - name: AudioProbe (payload)
+            run: |
+              make SKETCH=examples/AudioProbe MODE=payload \
+                   BUILD_DIR=build/AudioProbe-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/AudioProbe-payload/AudioProbe.elf
+          - name: AudioProbe (firmware)
+            run: |
+              make SKETCH=examples/AudioProbe MODE=firmware \
+                   BUILD_DIR=build/AudioProbe-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/AudioProbe-firmware/AudioProbe.elf
+          - name: ToneDemo (payload)
+            run: |
+              make SKETCH=examples/ToneDemo MODE=payload \
+                   BUILD_DIR=build/ToneDemo-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/ToneDemo-payload/ToneDemo.elf
+          - name: ToneDemo (firmware)
+            run: |
+              make SKETCH=examples/ToneDemo MODE=firmware \
+                   BUILD_DIR=build/ToneDemo-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/ToneDemo-firmware/ToneDemo.elf
+          - name: AudioWall (payload)
+            run: |
+              make SKETCH=examples/AudioWall MODE=payload \
+                   BUILD_DIR=build/AudioWall-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/AudioWall-payload/AudioWall.elf
+          - name: AudioWall (firmware)
+            run: |
+              make SKETCH=examples/AudioWall MODE=firmware \
+                   BUILD_DIR=build/AudioWall-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/AudioWall-firmware/AudioWall.elf
+          - name: AudioWindow (payload)
+            run: |
+              make SKETCH=examples/AudioWindow MODE=payload \
+                   BUILD_DIR=build/AudioWindow-payload EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/AudioWindow-payload/AudioWindow.elf
+          - name: AudioWindow (firmware)
+            run: |
+              make SKETCH=examples/AudioWindow MODE=firmware \
+                   BUILD_DIR=build/AudioWindow-firmware EXTRA_FLAGS=-Werror
+              arm-none-eabi-size build/AudioWindow-firmware/AudioWindow.elf
 
   run-modes:
     name: build run mode ${{ matrix.run_mode }}
@@ -74,7 +246,15 @@ jobs:
         run_mode: [hook, poll, takeover]
     steps:
       - uses: actions/checkout@v4
+      - name: Allow caching apt archives
+        run: sudo chown "$USER" /var/cache/apt/archives
+      - name: Cache ARM toolchain packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-arm-none-eabi-${{ runner.os }}-v1
       - name: Install the ARM toolchain
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -98,10 +278,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Allow caching apt archives
+        run: sudo chown "$USER" /var/cache/apt/archives
+      - name: Cache ARM toolchain packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/apt/archives/*.deb
+          key: apt-arm-none-eabi-${{ runner.os }}-v1
       - name: Install the ARM toolchain
         # The newlib packages are *recommends* of gcc-arm-none-eabi, not
         # depends, so --no-install-recommends alone leaves a compiler with no
         # C library headers and every build dies on <string.h>. Name them.
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -117,7 +305,9 @@ jobs:
 
   tools:
     name: python tools
-    runs-on: ubuntu-latest
+    # No toolchain install: python3 is already on the ubuntu-slim image, and
+    # this job never touches the ARM cross-compiler.
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
