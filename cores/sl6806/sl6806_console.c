@@ -62,6 +62,13 @@ int sl6806_console_space(void)
     return (int)(SL6806_CONSOLE_SIZE - used);
 }
 
+static sl6806_console_sink_fn g_sink;
+
+void sl6806_console_set_sink(sl6806_console_sink_fn fn)
+{
+    g_sink = fn;
+}
+
 void sl6806_console_write(const uint8_t *buf, size_t len)
 {
     uint32_t pm, head, tail, used, skipped = 0;
@@ -69,6 +76,12 @@ void sl6806_console_write(const uint8_t *buf, size_t len)
 
     if (_sl6806_console.magic != SL6806_CONSOLE_MAGIC)
         sl6806_console_init();
+
+    /* Before the ring, and before anything can be dropped: a sink exists to
+     * receive output the ring would lose, so giving it the truncated copy
+     * would defeat the purpose. */
+    if (g_sink)
+        g_sink(buf, len);
 
     /* A single write larger than the ring can only ever leave its tail end,
      * so skip the part that is guaranteed to be overwritten. Those bytes are

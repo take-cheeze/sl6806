@@ -46,7 +46,9 @@ CORE_C   := $(CORE_DIR)/wiring_time.c $(CORE_DIR)/wiring_digital.c \
             $(CORE_DIR)/sl6806_adc.c $(CORE_DIR)/sl6806_module.c \
             $(CORE_DIR)/sl6806_pwm.c $(CORE_DIR)/sl6806_regfile.c \
             $(CORE_DIR)/sl6806_audio.c $(CORE_DIR)/sl6806_bt.c \
-            $(CORE_DIR)/sl6806_sd.c \
+            $(CORE_DIR)/sl6806_sd.c $(CORE_DIR)/sl6806_fat.c \
+            $(CORE_DIR)/sl6806_uart.c $(CORE_DIR)/sl6806_firm.c \
+            $(CORE_DIR)/sl6806_hwinit.c \
             $(CORE_DIR)/syscalls.c \
             $(CORE_DIR)/gfx/Framebuffer.c $(CORE_DIR)/gfx/font5x7.c \
             $(CORE_DIR)/gfx/LcdBus.c
@@ -93,6 +95,12 @@ DEFS   := -DF_CPU=$(F_CPU)UL -DSL6806=1 $(MODE_DEF)
 
 # examples/PadSweep takes one GPIO bank per build, so a bank that wedges the
 # device cannot take the others with it.
+# The console ring, in bytes; must be a power of two. The default is in
+# cores/sl6806/sl6806_console.h and is large on purpose - see the note there.
+ifneq ($(CONSOLE_SIZE),)
+DEFS   += -DSL6806_CONSOLE_SIZE=$(CONSOLE_SIZE)
+endif
+
 ifneq ($(SWEEP_BANK),)
 DEFS   += -DSWEEP_BANK=$(SWEEP_BANK)
 endif

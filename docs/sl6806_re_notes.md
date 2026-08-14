@@ -4876,3 +4876,1445 @@ needs is among them.
 
 Run it twice, once with a card and once without; the diff is this board's SD
 pinout and its card-detect pin.
+
+### [M] The pad census: 80 bonded pads, and the boot ROM assigns six
+
+`examples/PadMap`, 2026-08-13, reading every bank's function nibbles with no
+writes at all. The first pad map this project has had:
+
+| bank | base | pads that exist | assigned by the boot ROM |
+|---|---|---|---|
+| 0 | `0x40081000` | pins 0..5 | 0,1,2,3 → function 2 |
+| 1 | `0x40081040` | pins 0..31 | 9 → function 3 |
+| 2 | `0x400F6080` | pins 0..5 | 0,1 → function 2 |
+| 3 | `0x400810C0` | pins 0..12 | none |
+| 4 | `0x40081100` | pins 0..16 | none |
+| 5 | `0x400F6000` | pins 0..5 | none |
+
+Every bank shows the same shape: a contiguous run of **function 15** from pin
+0, and **every pin above that run reads 0 in the function nibble**. Six banks
+independently producing that pattern is not a coincidence, so:
+
+- **`0` in a function nibble means the pin does not exist** — the register
+  file is 32 pins wide per bank and the package bonds fewer;
+- **`15` means a real pad the boot ROM has parked**, which matches §23's
+  finding that the ROM parks the SD pads on function 15 when it tears the SD
+  block down.
+
+**Eighty pads are bonded out and the ROM assigns six of them.** Those six are
+the entire pinout that bootloader mode needs: four on bank 0 and two on bank 2,
+all function 2, plus bank 1 pin 9 on function 3. `[I]` the bank 0 four are the
+SPI flash the bootloader runs from and the bank 2 pair is USB, which would be
+consistent with `0x400F7000` being the flash host — but nothing here
+establishes that, and the pads carrying them are unreadable in an alternate
+function anyway.
+
+This also explains why the sketch's first pull test measured nothing: it
+tested "pads already in function 0", which is to say every pin that is not
+there, and correctly reported that all of them read 0 under both pulls. The
+pads that exist are the parked ones. The test now targets those, and
+configures them properly through `sl6806_pad_configure()` (ROM `0x93C`) rather
+than writing the pull registers of a pad that is still parked — a parked pad
+ignores its pull, which is the second half of why nothing moved.
+
+⚠ **A census is only the boot state on a freshly powered device.** Uploading a
+payload does not reset the chip, so pads an earlier sketch configured stay
+configured: this run showed bank 1 pins 12, 13 and 14 in function 0, which is
+`examples/SdPads` having left them as inputs, not anything the ROM did. Same
+caution as §23's cold-dump correction, and the same fix — power-cycle first.
+
+### [M] The parked-pad pull test, empty slot — and the boot ROM's own two inputs
+
+`examples/PadMap` aimed at parked pads, 2026-08-13. Forty-six of the sixty-nine
+parked pads follow their pull, so the mechanism works; the rest are driven from
+outside the chip:
+
+```
+bank 1 pin 0     LOW          bank 2 pins 2,3,4   LOW
+bank 1 pin 10    HIGH         bank 2 pin 5        HIGH
+bank 1 pins 16,17,19..31  LOW     (18 floats)
+bank 3 pin 0     LOW
+```
+
+This is the empty-slot half of the card-detect test; the diff against a
+card-in run is the result, and has not been taken yet.
+
+**Bank 1 pins 10 and 11 are the boot ROM's own inputs**, which is worth having
+independently of SD. ROM `0x3C1F0` configures pin 10 as **function 14** with
+pull selector 11 — a pull-up — then sets an interrupt mode (`0x9BC`, bank
+`+0x218`), enables it (`0x9D2`), and polls the pending bit (`0xA02`, bank
+`+0x214`) five hundred times before giving up. ROM `0x3C19C` does exactly the
+same for pin 11 with selector 5, a pull-down.
+
+A pin with a pull-up that the ROM waits for an edge on is an active-low button,
+and **pin 10 reading HIGH in this run is that button not being pressed**.
+docs/DUMPING.md still describes the boot key as "trial and error"; bank 1
+pin 10 is the first candidate anything in this project has produced for it.
+
+That pair also explains §"the pad input buffer is off in almost every alternate
+function" from the other end: **functions 0 and 14 are the two that leave the
+buffer alive because both are input modes** — 0 a plain input, 14 an
+interrupt-capable one. The table was measured without a reason; this is the
+reason.
+
+The many bank 1 pins reading LOW against a pull-up (16, 17, 19..31, with 18
+floating) are `[I]` unused pads tied to ground on the board, which is ordinary
+practice — but note it sits against §"0 means the pin does not exist", since
+bank 1 is the one bank whose function nibbles read 15 all the way to pin 31.
+Either bank 1 really has 32 bonded pads and sixteen of them are grounded, or
+the `0`/`15` reading needs refining. The card-in diff will not settle that; a
+board photograph would.
+
+### [M] Two runs, one pin different — and a bug that makes it unreadable
+
+Third run of `examples/PadMap`. Diffed against the second, **exactly one pin
+differs across the whole board**:
+
+```
+bank 1 pin 10:   HIGH (up=1 down=1)   ->   (up=0 down=1)
+```
+
+Every other driven pin, and all forty-six floating ones, read identically.
+That is a clean single-variable result, and it is still not usable, for two
+reasons — one about the board and one about the sketch.
+
+**The board reason.** Bank 1 pin 10 is the pin ROM `0x3C1F0` waits for an edge
+on: pull-up, function 14, interrupt enabled, five hundred polls. That makes it
+the boot-key candidate *and* the only pin that changed. Whether it moved
+because a card went into the slot or because the boot key was held differently
+between two power-ups cannot be told from these logs. Both runs need their
+conditions stated: card in or out, key held or not.
+
+**The sketch reason, which is a defect.** `up=0 down=1` is not a level. It is
+the exact inverse of following the pull, and that is what a pad reads when it
+is sampled *before it has settled*: the first version applied a pull and read
+the input register in the next instruction. An internal pull is a weak
+resistor into whatever capacitance the board puts on the pin — a long trace, a
+switch, a connector — and needs microseconds. Every "driven" verdict in the
+previous two runs is therefore suspect, though a pin held hard at ground will
+not lag and the forty-six that followed their pull clearly did settle.
+
+`pad_settled()` now waits 500 µs, then samples eight times and reports 2 if the
+level never holds still, and the verdicts are `HIGH`, `LOW`, `UNSTABLE` and
+`INVERTED` rather than a bare high/low. `INVERTED` appearing again would mean
+something stranger than settling.
+
+The general lesson is the same one §"the pad input buffer is off" taught, from
+a different direction: **a two-sample test cannot tell a level from a
+transition**, and every probe in this tree that reduces an analogue reality to
+one boolean has eventually had to be rewritten.
+
+### [V] Bank 1 pins 10 and 11 are the boot ROM's two mode inputs
+
+Following the two edge-waiters found above to their callers, at ROM `0x3D8C0`
+and `0x3D922`, gives the shape of boot-mode selection:
+
+```
+0x3D8B8   loop for ~1 second:
+0x3D8C0       if edge on bank 1 pin 10  -> tail-call 0x3D750
+0x3D8E4   then sample bank 1 pin 11's LEVEL for up to 999 ms,
+0x3D90A       and store it as a byte of boot state
+0x3D922   if edge on bank 1 pin 11      -> tail-call 0x3D63C
+```
+
+So **each pin gets about a second at boot and each branches somewhere
+different**, and pin 11's level is additionally recorded as a flag. Neither
+branch is the SD bring-up at `0x3D5CC`, so these are not card-reader mode
+directly.
+
+`docs/DUMPING.md` describes entering bootloader mode as "hold a boot key while
+plugging in USB (key varies, trial and error)". This is that mechanism: two
+inputs, both on bank 1, both function 14 — pin 10 with a pull-up (so an
+active-low button) and pin 11 with a pull-down (active-high). It is the first
+thing this project has found that explains the key at all.
+
+### The card-detect result is one pin, and the measurement was defective
+
+Runs two and three of `examples/PadMap` differ in exactly one pin out of
+sixty-nine, and the conditions are now known: **boot key unchanged, card in the
+slot for the third run.** So bank 1 pin 10 is the only pin on this board that
+responded to card insertion.
+
+That is exactly the card-detect signature — and it is also the pin the ROM
+polls for a boot key, which is an awkward coincidence rather than a
+contradiction (an SD socket's detect contact and a button are the same kind of
+signal, and a boot ROM that wakes on card insertion is not unusual). Under the
+lag model the readings say the pad's resting level goes from 1 with no card to
+0 with a card, with an internal pull-up still able to drag it up slowly — a
+weak pull to ground, not a hard short.
+
+**But the numbers come from the version of the sketch that did not let the pad
+settle**, so `up=0 down=1` is a transition caught mid-flight rather than a
+level, and every "driven" verdict in those two runs is suspect. The fix is in;
+the measurement has to be retaken. Two runs of the current build, card out then
+card in, nothing else changed:
+
+| pin 10 reads | meaning |
+|---|---|
+| follows the pull with no card, LOW with one | card detect, and it goes straight into `sl6806_sd.h` |
+| the same both ways | the earlier difference was the settling bug, and the card-detect pin is still unknown |
+| `UNSTABLE` either way | something is driving it actively — the boot ROM's own interrupt path is the first suspect |
+
+### [M] The first clean census — and why diffing across a power cycle is useless
+
+Fourth run of `examples/PadMap`, and the first from a genuinely fresh
+power-up: bank 1 reads function 15 at pins 12, 13 and 14 with the input
+register at zero, so `examples/SdPads`' leftovers are gone. **This is the boot
+state**, and it confirms two things the earlier runs could only suggest:
+
+- **the ROM parks the SD pads on function 15**, as §23 read out of ROM
+  `0x0003D2F0` — pins 12/13/14 are parked, not unassigned;
+- **bank 1 has 32 real pads.** Zero pins in function 0, where the other five
+  banks have 15 to 26 of them. So `0` really is "not bonded" and bank 1 really
+  is the wide bank.
+
+Against the previous run, **ten pins differ**:
+
+```
+bank 1 pin 10   driven high  ->  UNSTABLE
+bank 1 pin 11   floating     ->  UNSTABLE
+bank 3 pin 1    floating     ->  LOW
+bank 4 pins 0, 5, 6, 7, 8, 9, 10, 11   floating -> LOW
+```
+
+None of that is a card. **A power cycle changes the board's state**, and the
+previous run was taken from a session in which earlier payloads had been
+running. Diffing across a power cycle answers a question nobody asked, and the
+instruction to "power-cycle first" — correct for a census — silently broke the
+comparison it was meant to serve.
+
+The protocol is now in the sketch's banner and header:
+
+1. power off, hold the boot key, plug in — **once, at the start**;
+2. run with the slot **empty**;
+3. insert a microSD, **do not unplug and do not reset**;
+4. run again.
+
+Step 3 is safe for exactly the reason leftover pad state is a nuisance
+elsewhere: the device stays in bootloader mode across an upload.
+
+### UNSTABLE on both boot inputs, and what that is
+
+The two pads that would not settle at 500 µs are **bank 1 pins 10 and 11** —
+precisely the two the boot ROM waits for an edge on (§"the boot ROM's two mode
+inputs"). Nothing else on the board came back unstable.
+
+That is what a **button with a debounce capacitor** looks like to an internal
+pull. A pull on the order of 100 kΩ into a cap on the order of 100 nF is about
+ten milliseconds, and the fast pass allows 500 µs plus 160 µs of sampling — so
+the level is still moving when it is read, every time. It is a positive
+identification rather than a nuisance: the two pins the ROM polls as keys are
+the two pins with debounce hardware on them.
+
+`pad_settled()` now retries a pad that fails the fast pass with a 40 ms
+settle — four RC constants of that estimate — and only pads that failed pay
+for it.
+
+### [M] RESULT: inserting a card changes nothing software can see
+
+The card-detect test, run to its own protocol at last — one power cycle, slot
+empty, then a card inserted without unplugging. **The two logs are identical
+byte for byte**: same census across all six banks, same verdict on all
+sixty-nine parked pads, same counts.
+
+Two things follow.
+
+**There is no card-detect pin among the pads this test can reach.** It could
+still be one of the six the boot ROM has assigned (bank 0 pins 0..3 and bank 2
+pins 0..1 on function 2, bank 1 pin 9 on function 3), which are off limits
+because something USB needs is among them; or a pin in function 0, which is to
+say not bonded; or nowhere at all, since plenty of microSD sockets have no
+detect contact or have one the board does not route. `sl6806_sd.h` keeps
+reporting card presence as a pair of command timeouts, and that is now a
+measured limitation rather than an unexamined gap.
+
+**The earlier "one pin differed" result is retracted.** Bank 1 pin 10 moved
+between two runs that also differed by a power cycle, and it was measured by
+the build that read a pad before it settled. Neither the pin nor the card had
+anything to do with it. The finding that survives from those runs is the one
+that came from the ROM rather than the meter: pins 10 and 11 are the boot
+ROM's two mode inputs (§"the boot ROM's two mode inputs"), and they are the
+only two pads on the board that will not settle under an internal pull even
+after 40 ms — which is what a debounced button looks like, and corroborates
+them from the other side.
+
+**And the SD bus pads showed nothing either**, which is worth stating because
+it was not the question and may be the more useful answer. Bank 1 pins 12, 13
+and 14 follow their pull with a card in the slot exactly as they do with it
+out. A card holds CMD and DAT up through its own pull-ups, so either those are
+weaker than this chip's internal pulls — they are the same order of magnitude,
+so quite possible — or **[?] bank 1 pins 12..14 are the chip vendor's default
+SD pads rather than the ones this board routes to its socket.** The mask ROM
+is generic to the part; the board is not. Nothing in the dump can settle that,
+because the dump is the same for every board built on this chip. A photograph
+of the socket's traces would.
+
+That last possibility deserves weight in proportion to §23's open problem. The
+SD host accepts a command and discards it in under a microsecond with its
+datapath demonstrably clocked; a controller wired to pads that go nowhere is
+one of the few explanations left standing that does not require the block to
+be broken.
+
+### CORRECTION, same day: the previous section is wrong. Bank 5 pin 0 moves
+
+The section above says the card-in and card-out logs were identical and
+concludes there is no reachable card-detect pin. **That was written from a
+duplicated paste — the same log twice — and it is retracted.**
+
+The real pair differs in exactly one pin of sixty-nine:
+
+```
+bank 5 pin 0     slot empty  ->  LOW (up=0 down=0, held to ground)
+                 card in     ->  follows the pull (floating)
+```
+
+Everything else is identical: the census of all six banks, and every other
+driven pin including bank 1 pins 10 and 11 UNSTABLE and bank 2 pin 5 HIGH. So
+the protocol worked exactly as intended, and the single-variable result it was
+built to produce is a pin nobody had been watching.
+
+**Bank 5 pin 0 is the card-detect contact**, wired the less common way round:
+the switch is closed to ground when the slot is **empty** and opens when a card
+is inserted. Both polarities are built; this socket is the normally-closed
+kind. Card present is therefore "reads high under a pull-up", and slot empty is
+"reads low whatever pull is applied".
+
+It is a candidate rather than a fact until it has been run once more —
+insert and remove twice, confirming the pin follows the card both ways —
+because it rests on one pair of logs, and the last thing that rested on one
+pair of logs was bank 1 pin 10, which was wrong. But it is the first thing in
+this investigation that a card has moved.
+
+What has not changed from the retracted section is the loose thread, and the
+card-detect result sharpens it: **the SD bus pads still show nothing.** Bank 1
+pins 12, 13 and 14 follow their pull identically with a card in and with it
+out — while a pad on a completely different bank registers the card
+mechanically. A card holds CMD and DAT up through its own pull-ups. Either
+those are weaker than this chip's internal pulls, or **[?] bank 1 pins 12..14
+are the chip vendor's default SD pads rather than the ones this board routes
+to its socket.** The mask ROM is generic to the part; the board is not, and
+the board demonstrably has the socket wired to bank 5 pin 0 for detection.
+
+That matters to §23 in proportion. The SD host accepts a command and discards
+it in under a microsecond with its datapath demonstrably clocked, and a
+controller driving pads that do not reach the socket is one of the few
+remaining explanations that does not require the block to be broken.
+
+**Method note, and it is the third of its kind in this file.** The retracted
+section was written in the same minute as the log arrived, from two blocks of
+text that looked like two runs. Two identical logs and one duplicated log are
+indistinguishable by inspection — the check that would have caught it is
+asking whether *anything at all* differed, since two runs of a sixty-nine-pad
+sweep agreeing to the byte is itself the surprising outcome and deserved more
+suspicion than it got.
+
+### [M] Bank 5 pin 0 is bistable, and the sketch now labels its own logs
+
+A third run puts bank 5 pin 0 back in the floating state. Across the three
+logs taken since the protocol was fixed it has been seen in both states and it
+remains **the only pin of sixty-nine that varies at all** — everything else,
+census included, is identical run to run.
+
+Bistability on exactly one pin is what the card-detect candidate needed; what
+it still needs is the states tracking the card, which requires knowing which
+state each run was taken in.
+
+**And that is where this investigation has actually been losing, twice now.**
+The result is a diff between two runs, and the two runs are told apart by
+whoever pastes the logs remembering which was which. Once that produced a
+mislabel and once a duplicated paste analysed as a pair, and each cost a
+retracted conclusion — the second one within a minute of being committed. The
+measurements were fine both times. The bookkeeping was not.
+
+So `examples/PadMap` now tests bank 5 pin 0 **first** and prints the verdict at
+the top of every log:
+
+```
+--- card detect: bank 5 pin 0 ---
+  up=1 down=0   ->  CARD PRESENT   (pin floats: switch open)
+```
+
+A log that says which state it was taken in cannot be mislabelled, and the
+diff stops depending on anyone's memory. This is a cheaper fix than any of the
+three method notes above it, and it should have been the first thing written
+once the answer turned out to be a two-run comparison.
+
+## 24. The stock boot, phase by phase — and the SD bring-up nobody had read
+
+Prompted by the run that finally settled §23's power-cycle question, below.
+All of this is `dump.bin` and `maskrom.bin`, reproducible with
+`tools/sl6806-boot`.
+
+### [M] First: on a fresh boot the SD block is OFF
+
+`examples/SdProbe` as the first payload after a power cycle, 2026-08-13:
+
+```
+--- step 1b: do writes stick? ---
+    ARG <- 0xA5A5F00D  reads 0x00000000   DROPPED
+    ARG <- 0x5A5A0FF0  reads 0x00000000   DROPPED
+    verdict: WRITES ARE DROPPED - the block is gated
+
+--- step 2: bring-up and identification ---
+    CTRL 0x40000000 <-- changed    CLKCR 0x20070008 <-- changed
+    ARG <- 0xA5A5F00D  reads 0xA5A5F00D   ok
+    verdict: the block takes writes - it is not gated off
+```
+
+Three things settled at once:
+
+- **The mask ROM does not touch the SD host in bootloader mode.** The cold
+  registers read zero, not the ROM's bring-up values. The claim retracted
+  earlier — that the ROM brings the block up and fails at CMD0 — is now
+  positively disproven rather than merely unsupported, and the values seen in
+  earlier sessions were leftovers from earlier payloads, exactly as the
+  correction said.
+- **Module 36 and ROM clock 17 are the right gates.** Writes go from dropped
+  to sticking across them; this is the `DvpProbe` pattern (§7n) and it is a
+  clean positive.
+- **And CMD0 still never completes**, on a block this payload woke itself.
+
+### The boot phases
+
+```
+mask ROM reset
+  |
+  +-- boot-mode select: bank 1 pin 10, then pin 11, ~1 s each   (0x3D8B8)
+  |     each pin's edge tail-calls a different handler
+  |
+  +-- otherwise: load the HLKJ image from flash to 0x0081FC00 and enter it
+        |
+0x00820000  zero r0..lr, set SP, zero BSS, call main
+        |
+0x00820588  main
+        |     +-- 0x00820378   hardware init
+        |     +-- 0x008244DC   "update from PC" requested?  -> update path
+        |     +-- 0x008244CC   forced restore?              -> restore path
+        |     +-- 0x008244D4   sdupdate wanted?             -> SD path
+        |     +-- otherwise 0x00820514 -> 0x00820E8C, load FIRM and run it
+        |
+        +-- the update paths run, in order:
+              0x008204BC  bring up the display
+              0x008203DC / 0x008202B2 / 0x0082029C
+              0x00820318  "Finding file..."
+              ...          and for the SD one, the sequence below
+```
+
+### The SD bring-up the bootloader uses, and what it adds
+
+The bootloader's own SD entry (around `0x008275F0`, logging
+`sd init ok with mode:%d.`) calls **`0x0082167C` first**, then
+`HAL_sd_disk_init` at `0x00822768`, then `sdmmc_wrap_init` — a FatFs mount.
+`0x0082167C` is the step §23 never had:
+
+```
+0x008206AE(17, 10)        clock source select for id 17 - a no-op, as in the ROM
+0x008207A8(17)            -> ROM 0x20EC, romclk_enable(17)
+pad_configure x6          bank 1 pins 12..17, listed below
+0x00001C28(44, handler)   install the IRQ 44 handler
+0x0082017C(44, 8)         its priority
+0x008200A0(44)            enable it
+0x0082A0E8(callback)      store a completion callback
+```
+
+The clocks are the two §23 already had. **The pads are not.**
+
+| pin | function | drive | pull | ROM's version |
+|---|---|---|---|---|
+| 12 | 2 | **3** | none | drive 1 |
+| 13 | 2 | **2** | 11 | drive 1 |
+| 14 | 2 | **3** | **8** | drive 1, pull 11 |
+| 15 | 2 | 3 | 11 | **not configured** |
+| 16 | 2 | 3 | 11 | **not configured** |
+| 17 | 2 | 3 | 11 | **not configured** |
+
+**Six pads is a four-bit bus**, and this is the code that actually reads cards
+on this board — `sdupdate` runs on it. The mask ROM's three-pad configuration
+is the chip's generic minimum, and §23 transcribed the generic one because it
+transcribed the ROM. `cores/sl6806/sl6806_sd.c` now configures the
+bootloader's six, at the bootloader's drive strengths, and still talks
+one-bit — which is the bootloader's own order of business, since it configures
+pads at bring-up and only decides a bus width later with ACMD6.
+
+This does not obviously explain a command state machine that discards
+commands: pads do not gate it. But it retires "the driver is configuring the
+wrong bus" as an explanation, and it answers the §"loose thread" question
+from the pad census in the affirmative — **bank 1 pins 12..17 really are this
+board's SD bus**, since the product's own bootloader drives them.
+
+Which sharpens the remaining puzzle rather than solving it. Of those six pads,
+the card-inserted `PadMap` run reads pins 16 and 17 hard low and 12, 13, 14
+floating — no sign of a card's pull-ups anywhere on a bus the bootloader
+drives. Worth one more look with the socket in hand.
+
+## 25. The PLL, found in the bootloader's first phase — and §19 corrected
+
+Digging the bootloader's `hardware_init` (`0x00820378`, the first thing main
+calls) turns up the clock tree, which this project has been without since the
+beginning.
+
+### The call
+
+```
+0x00820378  hardware_init(1)
+    0x00820164()                 NVIC and SCB (0xE000E100, 0xE000ED14)
+    ROM 0x3BFC()
+    0x00820DF8(24)
+    0x008206D0(2, 384000000, 32000000)      <- the clock tree
+    0x00820284()
+    pad_configure(0x00011300)                bank 1 pin 2, function 6
+    0x0082A220(&{48000000, 1500000, ...})    a block at 0x40091000, unlisted in 7c
+    0x0082356C(1)
+```
+
+Two of those arguments are frequencies written as plain integers:
+`0x16E36000` is **384,000,000** and `0x01E84800` is **32,000,000**.
+
+### What 0x008206D0 does
+
+```
+[0x400F7000 + 0x60] = 0
+ROM 0x2E5C(3, 10)  and  0x2E5C(6, 10)      clock source select, both no-ops
+ROM 0x3A6C(2, 384000000)                    <- set clock id 2 to 384 MHz
+ROM 0x24C4(8)  and  0x24C4(9)               romclk_disable of two ids
+[0x400F7000 + 0xD8] &= ~2
+ROM 0x289C(3, 2)   0x289C(4, 1)   0x289C(5, 1)
+ROM 0x289C(6, 384000000 / 32000000 = 12)    <- dividers
+```
+
+### The PLL itself
+
+ROM `0x3A6C` is a dispatcher over clock ids 0..83; id 2 tail-calls **ROM
+0x1F6C**, which is three register accesses and no loops:
+
+```
+    ref = 24576000
+    mul = (freq == ref) ? 0x3126 : 0x000186C2
+
+    [0x40080010] = ([0x40080010] & 0xFC1F0000) | 0x3000 | (freq == ref ? 0x60 : 0x40)
+    [0x40080014] = ([0x40080014] & 0x00003800) | 0x80000000 | 0x400 | (mul << 14)
+```
+
+and its readback, ROM `0x1FB8`, says what those mean:
+
+```
+    frequency = ((([0x40080000] >> 8) & 0xFF) * 48 / ([0x40080000] & 0xF)) MHz
+```
+
+So **`0x40080000` bits [15:8] are a multiplier and bits [3:0] a divider, in
+units of 48 MHz**, and m = 8, d = 1 gives exactly the 384,000,000 the
+bootloader asks for. `0x40080010` and `0x40080014` are the PLL's own control
+and multiplier registers, the latter holding its value at bit 14 and up.
+
+**This corrects the README and §19.** The capability table says *"The clock and
+reset unit at 0x40080000 holds dividers and gates, not a PLL multiplier, and
+nothing in the dump establishes the crystal"*, and §19 read the vendor's clock
+init without finding one. Both are wrong: the PLL is at `+0x10`/`+0x14`, its
+rate is legible at `+0x00`, and the bootloader programs it to 384 MHz on every
+boot.
+
+**384 MHz is six times the measured 64 MHz CPU clock.** `[I]` and no more than
+that — the dividers this routine sets are for clock ids 3 to 6, and which of
+them feeds the core is not established here. But a measured 64,000,071 Hz
+against a PLL that this code sets to exactly 384,000,000 is not a coincidence,
+and it is the first explanation the F_CPU measurement has had.
+
+**And 24,576,000 is the audio clock.** §16 found the audio controller
+switching between 24.576 MHz and 22.579 MHz on a `rate % 8000` test. Here the
+generic PLL setter carries 24,576,000 as its one special case, with its own
+multiplier constant. The two findings are the same clock seen from opposite
+ends, which is worth knowing for whoever picks up the audio block: the
+frequency it wants is one the PLL knows how to make.
+
+### Still open from this phase
+
+`0x0082A220` initialises a block at **`0x40091000`** — not in §7c's map — from
+a struct whose first two words are 48,000,000 and 1,500,000. A 48 MHz clock
+and a 1.5 MHz something is the shape of a serial bus, and it runs in the
+bootloader's very first init phase, before the display or storage. Worth a
+look.
+
+## 26. `0x40091000` — the bootloader's printf goes here, and it looks like a UART
+
+Continuing through `hardware_init`'s call list. This is the step after the
+PLL, and it is the most immediately useful thing in the bootloader.
+
+### The chain
+
+```
+0x00820378  hardware_init
+    ...
+    pad_configure(0x00011300)     bank 1 pin 2, function 6, no pull
+    0x0082A220(&{ [0]=1500000, [8]=48000000, [16]=1, rest 0 })
+    0x0082356C(1)
+```
+
+`0x0082A220` is:
+
+```
+module_clock_enable(73)                      ROM 0x1EC0
+clock_source_select(22, [cfg+8]==24000000 ? 10 : 9)
+romclk_enable(22)                            ROM 0x20EC
+descriptor[+0x44] = 0x40091000               the base
+descriptor[+0x4C] = cfg[0]   = 1500000
+descriptor[+0x48] = cfg[8]   = 48000000
+descriptor[+0x60] = 3   [+0x64] = 0x301   [+0x68] = 0x60   [+0x84] = 17
+[0x40091000 + 0x10] |= 0xB0
+[0x40091000 + 0x14] |= 3
+```
+
+and `0x0082356C(1)` tail-calls **ROM 0x260**, which stores four words into a
+table at `0x0080082C` — one of them the ROM function pointer `0x0000023D`, and
+the ROM code immediately after it is an integer-to-string converter. **ROM
+0x260 installs the sink that the ROM's printf writes to**, and the descriptor
+it is given is the one `0x0082A220` just filled in.
+
+So the bootloader's own logging — every `boot--->` and `sdio(i):` message in
+this file — comes out of the block at `0x40091000`.
+
+### It is very probably a UART, and the application agrees
+
+`[V]` The application does the same thing with the same numbers. `0x00D9A4C0`
+in FIRM is the same routine instruction for instruction: `module_enable(73)`,
+clock id 22, base `0x40091000`, the same descriptor layout. Both images bring
+this block up the same way, which is what a debug console looks like.
+
+`[I]` A configuration of **1,500,000 against a 48,000,000 clock**, a single
+output pad, and a printf sink is a UART at 1.5 Mbaud. Nothing here proves the
+framing, and no string in either image names the block.
+
+| what | value | provenance |
+|---|---|---|
+| base | `0x40091000` | [V] both images |
+| module clock id | **73** | [V] `0x0082A220`, and FIRM `0x00D9A4C0` |
+| ROM clock id | **22** | [V] same |
+| pad | bank 1 pin 2, **function 6** | [V] configured immediately before |
+| clock | 48 MHz, or 24 MHz selecting a different source | [V] |
+| rate | 1,500,000 | [V] the number; [I] that it is a baud |
+| registers | `+0x10 \|= 0xB0`, `+0x14 \|= 3` | [V] |
+
+### Why this is worth building
+
+Every hardware session in this project has lost output. Nine runs in this
+investigation alone opened with `[lost output - device outran the poll rate]`,
+and the fix so far has been to pace sketches around a 2 KB ring that the host
+drains only between `loop()` calls (§"the console loses the head of a long
+report"). That is a workaround for not having a serial port.
+
+**This is the serial port.** It needs one pad, two clock ids that are already
+understood mechanisms, and two register writes that are written down above. A
+`Serial1` on `0x40091000` would give this framework a console that does not
+depend on USB polling, does not lose the head of a register dump, and keeps
+working when a payload wedges the USB handler — which is the failure mode
+every bounded poll in `cores/` exists to avoid.
+
+The unknown is the register map beyond `+0x10` and `+0x14`: where the data
+register is, and what the status bits are. Both images configure the block and
+then hand it to ROM code, so the ROM at `0x0000023D` and whatever it calls is
+where the rest of the map is, and that is a contained read.
+
+## 27. The bootloader inventoried — 340 functions, and two more blocks named
+
+`tools/sl6806-boot --map` now reduces the whole image to something readable:
+**340 call targets, 140 mask-ROM entry points, 1552 call sites**, of which
+**81 functions carry an MMIO base or a string**. The annotated result is
+[docs/BOOTLOADER.md](BOOTLOADER.md); this section records what the sweep
+turned up that was not already known.
+
+### `0x400A0000` is a hardware mutex `[I]`
+
+`0x00820D90` spins while `[0x400A0010 + id*4]` is non-zero; `0x00820DA8`
+writes zero to the same word. Eleven and ten call sites, and the callers are
+the code that guards the TWI mailbox below. A lock array in MMIO — a hardware
+mutex or semaphore block, which is a thing a chip with a boot ROM, a
+bootloader and an RTOS all sharing one I²C master would want.
+
+Nothing names it, so `[I]`. New to §7c's map either way.
+
+### The register-file mailbox is called TWI by the vendor
+
+`0x00820BF0` and `0x00820C58`, §7m's mailbox accessors, take a mutex through
+`0x00822260` / `0x0082228C` — and those two log **`rtwi op in isr`**.
+
+§7m deduced the block was an I²C master from `0x60`/`0x61` differing by one,
+being an address and its R/W bit. **The bootloader says so in a string.** That
+also bears on the README's standing question, "the TWI controller's base
+address": at least one TWI master on this chip is `0x400F7000+0x100`, it is
+decoded, and `cores/sl6806/sl6806_regfile.c` already drives it. What remains
+open is whether the *bit-banged* buses in `examples/CameraDemo` and
+`examples/FmDemo` have a controller of their own somewhere else.
+
+### What the sweep says about the rest
+
+The bootloader carries FreeRTOS, an OAL allocator, FatFs and a small device
+layer — which is why its `sdupdate` path can mount a card. 259 of the 340
+targets carry neither an MMIO base nor a string, and those are that
+infrastructure. **A peripheral needs a base address and a base address is a
+literal**, so the 81 that do carry one are a complete list of the hardware
+this image touches, not a sample of it.
+
+That list is in BOOTLOADER.md §7 and holds no other surprises: the pad mux,
+both DMA halves, the SD host, the CRU, GPIO bank 0, the LCD controller, the
+flash host, plus the two above and the console at `0x40091000` from §26.
+
+### Still unread, and named so nobody re-derives the list
+
+`0x00820DF8(24)` and `0x00820284`, both in `hardware_init`; ROM `0x3BFC`,
+which it calls before either; and the console block's register map beyond
+`+0x10`/`+0x14`, which is behind ROM `0x0000023D`.
+
+### [M] The filesystem stack, end to end: it stops where predicted
+
+`examples/SdFiles`, 2026-08-14:
+
+```
+begin: 3 (no response)
+read:  3 (no response)
+```
+
+The second line is the only new datum, and it is small: the block read fails
+at the **command**, not the drain, so the FIFO wait is never reached. CMD17
+behaves exactly as CMD0 does. Nothing above the controller was ever going to
+run, and nothing did.
+
+What that leaves is worth stating plainly, because the shape of the problem
+has not changed in six runs: **everything above the command state machine is
+either working or tested.** The gates are right (writes go from dropped to
+sticking across them, measured on a fresh boot), the pads are the product's
+own six, the datapath is clocked (the FIFO fills and its flags move), and the
+filesystem layer reads real FAT16 and FAT32 volumes on the host. The
+controller accepts a command word, drops its busy bit inside 300 ns, and sets
+nothing.
+
+### One more hypothesis checked and closed: `0x400F7000 +0x60` / `+0xD8`
+
+The clock-tree routine (§25) writes `[0x400F7000 + 0x60] = 0` and
+`[+0xD8] &= ~2`, and a function at `0x00822310` writes `+0x60 = 1` next to
+pad code — which suggested a storage mux shared between the SPI flash host and
+the SD host, and therefore a route to the card that a payload never enables.
+
+It is not that.
+
+- `0x0082A06C` is the other `+0xD8` toucher, and it is flash: it reads the id
+  through the `+0x84`/`+0x88` accessors at `0x00822474`/`0x00822480` and its
+  three callers are all in the update path.
+- `0x00822310`, the one that writes `+0x60 = 1`, **has no callers** anywhere
+  in the image. Dead code.
+
+So both registers belong to the flash side of `0x400F7000`, and there is no
+mux. Recorded because it is a plausible idea that costs an hour to have twice.
+
+### The cheap software experiments are exhausted
+
+| Ruled out | By |
+|---|---|
+| a functional-clock bit in `0x400E0000` | `SdWall` — the register is seven bits wide, all seven tried |
+| the clock into the block | `SdClock` — 64 settings, found already enabled and undivided |
+| a CTRL enable the reset destroys | `SdCtrl` — every writable bit, before and after the reset |
+| the block being gated | `SdProbe` on a fresh boot — writes dropped cold, sticking after bring-up |
+| the core being stopped | `SdLife` — the FIFO fills and its flags move |
+| the wrong pad set | §24 — the bootloader's six are now what the driver configures |
+| a storage mux at `0x400F7000` | this section |
+
+What is left is not another sketch. It is `MODE=firmware`, which removes the
+one structural difference between this driver and the bootloader that reads
+cards on this hardware — the bootloader runs as firmware, and the mask ROM
+never touches the SD host in bootloader mode — or an instrument on the socket.
+
+### The console's register map, decoded — ROM 0x23C and below
+
+§26 left the block at `0x40091000` identified and unusable: the data register
+and status bits were "behind ROM 0x0000023D". Following that pointer gives all
+of it, and it is four instructions of actual work.
+
+```
+ROM 0x23C  putchar(c):  if (c == '\n') put('\r'); put(c)
+ROM 0x224  -> ROM 0x1D0
+ROM 0x1D0  put(dev, c):  while (!(base[0x08] & 0x10)) ;  base[0x00] = c & 0x1FF
+ROM 0x1E2  get(dev, *p):  while (!(base[0x08] & 0x1F00)) ;  *p = base[0x00] & 0x1FF
+ROM 0x228  base[0x08] & 0x1F00      receive fill level
+ROM 0x232  base[0x08] & 0x001F      transmit fill level
+ROM 0x1F8  base[0x0C] |= bits       interrupt enables
+ROM 0x204  base[0x0C] &= ~bits
+```
+
+| Offset | What | Provenance |
+|---|---|---|
+| `+0x00` | data, **nine bits** each way | [V] the `0x1FF` mask is the ROM's |
+| `+0x04` | control: enable in the low bits, rate above | [V] `\|= 7` enables |
+| `+0x08` | status: bit 4 transmit-ready, [12:8] receive level, [4:0] transmit level | [V] both spin loops |
+| `+0x0C` | interrupt enables | [V] |
+| `+0x10`, `+0x14` | `\|= 0xB0` and `\|= 3` at bring-up | [V], meanings [?] |
+| `+0x20` | parity and stop bits | [I] from the init's cfg bytes |
+
+Nine bits rather than eight is the ROM's own mask, not a convenience — the
+data register is wider than a byte.
+
+`cores/sl6806/sl6806_uart.[ch]` is that, with the ROM's unbounded transmit
+wait bounded, and `examples/UartProbe` brings it up and sends a banner once a
+second. 28 host checks against a model of the block.
+
+**The rate is deliberately not programmed**, and the reason is a mistake worth
+recording. The first version of the driver put a divisor in CTRL's low twelve
+bits, reading `ubfx r3, r3, #0, #12` at ROM 0x13A as "extract the divisor
+field". It does the opposite: it **keeps** the low twelve bits and discards
+everything above, and the rate fields then go in at bits 12 and 16. The low
+bits are the enable — the very bits `CTRL |= 7` sets. A divisor written there
+would have produced a port that looked configured and was disabled, and on
+hardware that is indistinguishable from "the pin is not connected".
+
+The host test caught it because the two writes collided in the model. It is
+the fourth time in this investigation that a test written against a
+transcription has caught the transcription being wrong, and the first where
+the failure would otherwise have been silent on the bench.
+
+What is still unknown is the rate itself and the framing, and **where bank 1
+pin 2 comes out on this board** — which no software can answer, because a pad
+in function 6 is unreadable (§"the pad input buffer is off").
+
+### [M] The console block answers — and the driver was waiting on the wrong bits
+
+`examples/UartProbe`, 2026-08-14, first run:
+
+```
+as found:   module 73 disabled, ROM clock 22 disabled
+            CTRL 0x000D0000   STATUS 0x00000001   everything else zero
+after:      CTRL 0x000D0007   STATUS 0x00000101   +0x10 0xB0   +0x14 0x03
+            transmit-ready bit: clear - every putc will time out
+            *** received 0x000 ***
+```
+
+Four things, and only one of them is bad news.
+
+**The block is alive.** Every register the bring-up writes took its value —
+`CTRL`, `+0x10`, `+0x14` all changed and read back. The boot ROM does *not*
+bring this port up in bootloader mode (both clocks read disabled cold), so
+this is the payload's own bring-up working.
+
+**And it responded on its own.** After bring-up `STATUS` read `0x00000101` —
+bit 8 set, which is the bottom of the receive-level field — the probe's
+`getc()` returned a byte, and `STATUS` then went back to `0x00000001` with
+the level cleared. A block that produces a receive event and clears it when
+read is running, not merely accepting writes.
+
+**`CTRL` was `0x000D0000` before anything touched it.** Bits 16, 18 and 19,
+which is the region §"the console's register map" places the rate fields in —
+so a rate is configured even though the enable bits are not. That is
+consistent with the fields being at 12 and 16, and it is why this driver
+leaves them alone.
+
+**And the driver's transmit wait was wrong.** ROM `0x1D0` is
+`lsls r2, r2, #27` followed by `beq` back, which shifts bits `[4:0]` into the
+top of the word and loops while the result is zero — so the condition is
+`(status & 0x1F) != 0`, the whole five-bit transmit level that ROM `0x232`
+reads as a field. This file recorded it as "bit 4". The device reported
+`STATUS = 0x01`: the ROM's condition passes, and the driver's does not, so
+every `putc` timed out waiting for a bit that never sets.
+
+Fixed, and the host model now returns `0x01` for a ready port so the bug
+cannot come back silently. **`lsls #n` tests a field of n bits, not the one
+bit that lands in the sign position** — the third time in this investigation
+that a shift-and-branch has been read as a single-bit test, after §23's
+status decode and §25's PLL fields.
+
+One method note: the probe's nonce test wrote `0x2A` to `IRQEN`, read back
+zero, and printed "still gated" — while the dump three lines above showed
+three other registers holding their writes. **A nonce test on one register
+says whether that register is writable, not whether the block is gated.**
+The sketch now says so.
+
+### [M] It transmits — and the console can be mirrored to it
+
+`examples/UartProbe`, second run, with the transmit mask fixed:
+
+```
+transmit-ready bit: SET - the write path will proceed
+sent 20 bytes, status 0x00000000
+sent 20 bytes, status 0x00000000
+```
+
+**The port accepts bytes.** Twenty per banner, once a second, with no
+timeouts.
+
+The status field is now pinned more precisely than the ROM's mask pins it.
+`STATUS & 0x1F` reads **1 at rest and 0 immediately after a burst**, so bit 0
+is a transmit-idle flag and the ROM's five-bit test is a superset of it. That
+is the right way round for a driver — the ROM's mask is what this transcribes,
+and it happens to be more tolerant than the single bit — but it is worth
+recording that the bit which actually moves is bit 0.
+
+⚠ And the same leftover trap as everywhere else: this run's "as found" section
+reports module 73 **ENABLED** with `CTRL` already `0x000D0007`, which is the
+*previous run's* bring-up, not the ROM's. Uploading a payload does not reset
+the chip. The first run, from a colder device, showed both clocks disabled —
+that is the ROM's state, and it means **the boot ROM does not bring this port
+up in bootloader mode.**
+
+### The console mirror, which is the point of all this
+
+`sl6806_console_set_sink()` gives the console a second destination, called
+with the bytes before they reach the ring — before anything can be dropped,
+since a sink exists precisely to receive what the ring would lose.
+`sl6806_uart_console_mirror(1)` installs one that writes to this port.
+
+That turns every existing sketch's output lossless without touching any of
+them, and retires the pattern this investigation kept re-inventing: emitting
+one section per USB poll and waiting for `sl6806_console_space()`, which is
+what `examples/BtProbe`, `SdLife`, `PadMap` and `SdFiles` all do. It also
+survives the one failure the USB console cannot report at all, which is a
+payload wedging the USB handler.
+
+The mirror **refuses to install itself on a port that is not transmitting**
+(`sl6806_uart_alive()`), because a sink whose every character times out in a
+bounded loop would make printing slower than the problem it was added to
+solve.
+
+What is still unproven is the last hop: whether those bytes leave the chip on
+a pin, at a rate and framing something can read. The block accepting them is
+not the same claim.
+
+## 28. Semi-firmware: starting the vendor's application from a payload
+
+`cores/sl6806/sl6806_firm.[ch]` and `examples/FirmBoot`. 15 host tests.
+
+The SD investigation has run out of software experiments (§"the cheap
+software experiments are exhausted"), and the one structural difference left
+between this framework and the code that demonstrably reads cards is that a
+payload runs in **bootloader mode**. Two things measured this session make
+that concrete rather than hand-waving:
+
+- **the mask ROM does not touch the SD host in bootloader mode** — cold
+  registers read zero and writes are dropped until a payload gates it;
+- **it does not touch the serial port either** — both its clocks read
+  disabled on a cold device.
+
+Two blocks the ROM leaves off, both of which a payload can wake, and one of
+which still will not run a command. So the question is what else bootloader
+mode withholds, and the cheapest way to ask it is to leave.
+
+### What it does
+
+```
+read the FIRM header from XIP 0x00C10000
+copy its segment to SRAM
+set VTOR, set MSP from vector 0
+branch to the entry
+```
+
+**Nothing persistent is written.** The application is copied out of the flash
+image already on the device, into RAM, and entered; a power cycle restores
+bootloader mode with nothing changed. That is the whole safety argument, and
+it is why this exists before `MODE=firmware` does — `MODE=firmware` is the one
+thing in this tree that can leave a device that does not boot, and this is the
+half of it that cannot.
+
+### The load address is derived, and then checked
+
+The header names an entry (`+0x14` = `0x00804C01`) and a length (`+0x1C` =
+`0x5862`). It does **not** name a load address: §6 read `+0x10` as
+"loadToRam" and §7m corrected that — the segment opens with a full 256-entry
+vector table, so the load address is the entry less `0x400`, which is
+`0x00804800`, confirmed there by counting which candidate base put SRAM call
+targets on function prologues.
+
+Getting that wrong copies the image `0x400` bytes off and branches into the
+middle of a function: a hard fault with the USB link already gone, no console,
+no message. So the parse derives the load address and then **checks it against
+the image** — the segment's word 1 must be the entry the header named
+(`0x00804C01`), and word 0 must be a plausible SRAM stack pointer
+(`0x0082D63C`). Both hold. A build that disagreed would be refused.
+
+The host tests are all refusals plus one acceptance, because the refusals are
+where the damage would be.
+
+### What a run answers
+
+| Outcome | What it means |
+|---|---|
+| the panel shows the P20 interface | the application boots from a payload — never established before |
+| the host enumerates `301a:2801` and the card mounts | **the socket, the card and the SD host all work under the vendor's firmware**, and §23 becomes "what does bootloader mode withhold" rather than "is the block broken" |
+| nothing | the application needs more of `hardware_init` than this does, and §25's PLL at 384 MHz is the first candidate |
+
+The third outcome is the likeliest first result and is not a failure: this
+deliberately does *not* replicate `hardware_init`, so that a working boot
+tells you the ROM's own state was sufficient, and a dead one tells you which
+part of §24's phase list to add next.
+
+The observable is the device and the USB bus, not the console — the
+application re-initialises USB as a card reader, so the link is gone the
+moment it starts.
+
+## 29. The other half of semi-firmware: build the environment, do not leave for it
+
+`examples/FirmBoot` (§28) answers "does the product work" and costs
+everything — USB, the console, and the ability to upload another sketch. The
+inverse is more useful for the question actually open: **perform the parts of
+the bootloader's `hardware_init` a payload can perform, and return.**
+
+`cores/sl6806/sl6806_hwinit.[ch]` is the first piece, the PLL:
+
+```
+sl6806_pll_hz()       ROM 0x1FB8's decode: ((v >> 8) & 0xFF) * 48 / (v & 0xF) MHz
+sl6806_pll_set_384()  ROM 0x1F6C's two masked writes, verified by that decode
+```
+
+11 host tests, covering the decode and — more importantly — that the two
+writes preserve the fields the vendor's masks preserve. `0xFC1F0000` and
+`0x00003800` are not "clear everything"; they keep fields nothing in this
+project understands, and widening either would clear one silently.
+
+### Why the PLL is the last software hypothesis for §23
+
+Seven are closed by measurement. What survives is that a payload runs in
+bootloader mode, and this session established that state is genuinely
+different rather than merely suspicious: the mask ROM leaves **both** the SD
+host and the serial port switched off there, and both come up when a payload
+gates them — but only one of them then works.
+
+**Nothing has ever started the PLL from a payload.** The bootloader sets it
+to 384 MHz before touching any peripheral (§25). If the SD command state
+machine is fed from a domain that PLL drives, a payload is asking it to shift
+48 bits out with nothing to shift them on, and the measured behaviour is
+exactly that: the command register takes the word, the busy bit drops inside
+300 ns, the status register says nothing.
+
+`examples/SdWithPll` sends CMD0, sets the PLL, and sends CMD0 again.
+
+It may take the console with it — nothing establishes where the boot ROM
+clocks USB from — so it says everything first and then reports whether it
+still has a console, which is itself a measurement nobody has taken. Either
+way it is recoverable by unplugging, and nothing writes flash.
+
+### And this is the answer to "can sketches stay uploadable"
+
+Not while the vendor's application runs: there is one USB device and the
+application takes it, re-enumerating as a card reader. `MODE=firmware` has
+the same property by construction.
+
+But that was the wrong thing to want. What a payload needs is not to *be* the
+firmware, it is the environment the firmware runs in — and §24's phase list
+says what that environment consists of, one step at a time, each of which can
+be performed in place. The PLL is the first and the most likely to matter.
+The console at `0x40091000` is the second, and is already driven. What is
+left of `hardware_init` after those two is `0x00820DF8(24)`, `0x00820284`,
+and ROM `0x3BFC` — all still unread.
+
+## 30. [M] The PLL is already running at 192 MHz — and §25 mis-paired two ROM routines
+
+`examples/SdWithPll`, 2026-08-14:
+
+```
+before:  PLL status 0xD0010802   decoded 192 MHz   CMD0: no
+after:   PLL status 0xD0010802   decoded 192 MHz   NOT the 384 MHz asked for
+         CMD0 with the PLL up: no
+```
+
+Three results, and two of them correct earlier sections of this file.
+
+### The clock question is answered, and better than §25 answered it
+
+`0x40080000` reads `0xD0010802` in bootloader mode. Decoded by ROM `0x1FB8`'s
+own arithmetic: multiplier `[15:8]` = 8, divider `[3:0]` = 2, so
+**8 × 48 / 2 = 192 MHz**. Bit 28 is set, which §17 identified as a lock bit on
+the sibling register `0x40080008`.
+
+**192 / 3 = 64 MHz**, and the measured CPU clock is 64,000,071 Hz.
+
+§25 offered "384 is six times 64" as the first explanation F_CPU ever had.
+This is a better one: the PLL is *measured* at 192 MHz on a live device with
+its lock bit set, and the core divider is 3. The bootloader raising it to
+384 MHz would make that divider 6, which is consistent with both, but the
+number a payload actually runs on is 192.
+
+### §25's setter and readback are not the same clock — retracted
+
+§25 presents ROM `0x1F6C` (writes `0x40080010` and `0x40080014`) and ROM
+`0x1FB8` (reads `0x40080000`) as the setter and the readback of one PLL. They
+were paired **because they are adjacent in the ROM**, which is not evidence.
+
+The measurement says otherwise: `sl6806_pll_set_384()` performed `0x1F6C`'s
+two writes exactly and `0x40080000` did not move — same value before and
+after, to the bit. Either those writes drive a different PLL, or they did not
+take. Both are possible and neither is established.
+
+What survives from §25 is what was read rather than inferred: the decode at
+`0x1FB8` is real and now confirmed against hardware, the bootloader does ask
+for 384 MHz, and 24,576,000 is the audio clock's special case. What does not
+survive is "the PLL is at `+0x10`/`+0x14`" as a statement about *this*
+register. **This is the second time in this investigation that two ROM
+routines were paired by proximity and the pairing was wrong** — the first was
+§26's console descriptor, where it happened to be right.
+
+### And the PLL hypothesis for §23 is closed anyway
+
+The reason `SdWithPll` existed was that a payload had never started the PLL,
+and the SD command state machine might have nothing to shift bits on.
+
+**The PLL was already running.** It reads 192 MHz with its lock bit set,
+before any payload touches anything, and CMD0 fails in exactly the same way
+it always has. So "no PLL" was never the situation, and the hypothesis is
+closed regardless of the failed write — the experiment answered a question it
+was not designed to ask, which is the good kind of accident.
+
+That is **eight** SD hypotheses closed by measurement. What remains for the
+SD host is not a software experiment: it is an instrument on the socket, or
+`examples/FirmBoot` telling us whether the vendor's own application can read
+the card on this board.
+
+### What is still worth doing to the clock
+
+`0x40080000` is writable in principle, and changing its divider field from 2
+to 1 would ask for 384 MHz directly rather than through a routine that
+evidently drives something else. That doubles the core clock, which breaks
+every `delay()` in flight and may take USB with it — recoverable, but it
+should be its own sketch with its own countdown, not a line in an SD probe.
+
+### [M] FirmBoot works: the stock application starts from a payload
+
+2026-08-14. `examples/FirmBoot` booted the vendor's firmware, which took USB
+with it and stopped sketch upload until a power cycle — which is precisely
+what success looks like, since the application re-enumerates as a card reader
+and the ROM's download endpoint goes away.
+
+Three things this establishes, none of which had been:
+
+- **The flash image is intact and startable from RAM.** The whole application
+  runs from a copy a payload made, with nothing written anywhere persistent
+  and a power cycle to undo it.
+- **§7m's load address is confirmed on hardware.** The header names an entry
+  and not a load address; the derivation is the entry less the 256-entry
+  vector table, `0x00804800`. §7m established that by counting which
+  candidate base put SRAM call targets on function prologues, and §28's parse
+  checked it against the image's own vector table before jumping. A wrong
+  derivation would have been a hard fault with USB already gone; instead the
+  product started.
+- **`MODE=firmware` has a rehearsal now.** The one thing in this tree that can
+  leave a device that does not boot can be approached by way of something that
+  cannot.
+
+**The SD question has not been asked yet.** The run that matters is the same
+one with a card in the slot, watching the host: if it enumerates `301a:2801`
+and the card mounts, then the socket, the card and the SD host all work under
+the vendor's firmware, and §23 stops being "is the block broken" and becomes
+"what does bootloader mode withhold" — a question with a finite answer.
+
+### And this raises the value of the serial port
+
+While the application runs there is no console, because USB belongs to it.
+But the application prints — every `boot--->`, `sdio(i):` and `hal_sd(i):`
+string in §"the bootloader inventoried" goes to the port at `0x40091000`, and
+FIRM brings that port up with the same routine (§26).
+
+So a wire on bank 1 pin 2 would let this project **watch the vendor's own SD
+driver run**: which commands it sends, what errorstate it reports, whether it
+mounts. That is a direct read on the question eight closed hypotheses have
+not settled, and it needs a meter, `examples/UartPin`, and one soldered wire.
+
+### [M] FirmBoot's USB came up unstable — and the clock sequence is the difference
+
+The first `FirmBoot` run started the application: the panel came up and the
+upload endpoint went away, which is what success looks like. **But its USB was
+unstable enough that `lsusb` could not be run against it**, so the card
+question — the reason the sketch exists — is still unanswered.
+
+The obvious difference from the vendor's path is the clock tree. USB needs an
+exact 48 MHz; the application derives it assuming the bootloader has already
+run `hardware_init`, and `FirmBoot` jumped without doing any of it. A USB
+divider computed from the wrong PLL rate is exactly what unstable enumeration
+looks like.
+
+So `sl6806_hwinit_clocks()` now performs `0x008206D0`'s sequence — the source
+selects, the rate, the two ROM-clock disables, the flash-host writes and the
+four dividers — and `FirmBoot` calls it immediately before the jump.
+
+**It calls the mask ROM's routines rather than transcribing them**, which is a
+deliberate exception to how everything else in `cores/` is written. The rule
+against calling the ROM exists because its polls are unbounded and a payload
+that hangs in one is off the bus with no log; none of these four routines
+polls — they are dispatchers ending in a register write. And the reason to
+prefer the ROM here is §30: the transcription of one of these was already
+wrong once, so where the vendor's own code can be called, calling it removes a
+class of mistake instead of adding one.
+
+`-DFIRMBOOT_CLOCKS=0` restores the previous behaviour, which is worth keeping
+because it is the known-working half of a comparison: it boots, and its USB is
+bad.
+
+Worth printing and reporting either way: `sl6806_hwinit_clocks()` returns the
+PLL rate afterwards. §30 measured that ROM `0x3A6C` does **not** move
+`0x40080000`, so if it still reads 192 MHz after the vendor's own sequence,
+the 384 MHz the bootloader asks for is going somewhere this project has not
+found — which would be worth more than the boot.
+
+### [M] The clock sequence did not fix it — and the likeliest cause is the handover
+
+Second `FirmBoot` run, with `sl6806_hwinit_clocks()` performing the vendor's
+whole sequence before the jump: **the application's USB is still unstable.**
+
+So the clock tree is not the difference, which also means the run is worth
+reporting for a different reason — the sketch prints the PLL rate before
+jumping, and §30 predicted that ROM `0x3A6C` would not move it. If it read
+192 MHz there after the vendor's own sequence, then the 384 MHz the bootloader
+asks for goes somewhere this project has not found, and that is a bigger
+finding than the boot.
+
+Two things changed in response, and the second is not code.
+
+**The handover now quiesces the machine.** `sl6806_firm_boot()` disables all
+NVIC interrupts, clears all pending ones, and stops SysTick before setting
+VTOR. The application expects to start the way it does after a reset, and it
+is not starting after a reset: the boot ROM has been running with USB
+enumerated, its interrupts enabled and SysTick ticking. A USB interrupt left
+pending by the ROM is delivered into the application's handler before the
+application has configured its own controller. Any bootloader is expected to
+do this; this one was not.
+
+**And the likeliest cause is simpler than any of that.** The application is
+re-initialising USB *on a link that is already enumerated*. In a normal boot
+the host has never seen the device — power up, bootloader, application, and
+only then does anything appear on the bus. Here the ROM has been `301a:2800`
+for the whole session, with an open connection and a host-side device object,
+and the application reconfigures the controller underneath it with no
+disconnect. A host shown a device that stops answering and starts answering
+differently, with no detach in between, behaves exactly as observed.
+
+The fix costs nothing: **unplug the cable after the jump and plug it back
+in.** This is a player with a battery, so the application keeps running and
+the host gets a clean enumeration of whatever the device now is. If
+`301a:2801` appears then the instability was the handover, not the firmware,
+and the card question can finally be asked.
+
+Detaching properly before jumping would need the USB controller's registers,
+which this project does not have — §7l looked at `0x40040000`, called it
+"most likely a USB controller", and left it there.
+
+### [V] ROM 0x3BFC switches off every module clock — and that is what FirmBoot was missing
+
+Reading the three unread steps of `hardware_init` (§24) after a second and
+third unstable-USB result. Two are unremarkable and the first is the answer.
+
+| Step | What it is |
+|---|---|
+| `0x00820284` | `cpsie i`. One instruction. |
+| `0x00820DF8(24)` | ROM `0xBAC8`: module 69, clock id 52 at divider 24, then rate-derived tick constants. A system timer. |
+| **ROM `0x3BFC`** | **zeroes CRU `+0x60`, `+0x64`, `+0x68`, `+0x70`, `+0x74`, `+0x78`, then delays** |
+
+Those six registers are §15b's module-clock gates and shadows — three banks of
+32 ids, gate and shadow each. **ROM `0x3BFC` switches off every module clock
+on the chip**, and it is the *first* thing `hardware_init` does after the
+NVIC setup. Everything the bootloader wants afterwards it enables again by
+name, which is why §24's phase list reads as a sequence of enables.
+
+`examples/FirmBoot` did none of that. The application starts expecting a chip
+whose peripherals are all switched off; entered from a payload it finds
+instead whatever the boot ROM left running — **USB enumerated and
+mid-conversation with a host** — plus whatever the payload itself woke, which
+by then included the SD host and the serial port. An application initialising
+a USB controller that is already running and enumerated is a good description
+of the instability measured three times, and it explains why replugging the
+cable did not help: the controller's state was wrong before the host ever
+looked.
+
+`sl6806_hwinit_modules_off()` calls ROM `0x3BFC` — the ROM rather than six
+stores of zero, because it also waits afterwards and the length of that wait
+is part of what makes turning ninety-six clocks off at once safe. Guessing the
+delay would be inventing the important half.
+
+`FirmBoot` now performs `hardware_init`'s order: **modules off, then the clock
+tree, then the jump**, all after the final flush, because the first step takes
+the console with it — USB's module clock is one of the ninety-six.
+
+If this is right, the next run enumerates cleanly and the card question can
+finally be asked. If it is not, what is left of `hardware_init` is fully read
+and the difference is somewhere else entirely — and the instrument for finding
+it is the serial port, because the application *prints* its own startup, in
+detail, to `0x40091000`.
+
+### CORRECTION: the copy reads flash, so it cannot come after the clocks go off
+
+Adding `sl6806_hwinit_modules_off()` to `FirmBoot` stopped it booting at all —
+no panel, nothing. The cause is entirely mine and is the plainest possible
+ordering mistake.
+
+`sl6806_firm_boot()` did two things: copy the application out of **XIP flash**
+into SRAM, then jump. `FirmBoot` called `sl6806_hwinit_modules_off()`
+immediately before it. That switches off every module clock on the chip — and
+**one of the ninety-six is the flash controller's**. So the copy read an
+unclocked controller, wrote whatever it got into `0x00804800`, and branched
+into it.
+
+The two halves are now separate, and the order is stated where it cannot be
+missed:
+
+```
+sl6806_firm_copy(&f)          while flash still answers
+sl6806_hwinit_modules_off()   every module clock off, as ROM 0x3BFC does
+sl6806_hwinit_clocks()        the tree
+sl6806_firm_enter(&f)         quiesce, VTOR, MSP, branch - needs no flash
+```
+
+Nothing about §"ROM 0x3BFC switches off every module clock" is retracted: it
+is still the first thing `hardware_init` does and still the likeliest reason
+the application's USB was unstable. What was wrong was doing it one step too
+early.
+
+This is the same class of error as §"the order is the operation" in
+`sl6806_module.h`, and the third time in this investigation that a correct
+step in the wrong place looked like the step being wrong.
+
+### [M] Both extra steps together stop it booting — so bisect them
+
+With the copy restored to its right place, `modules off` + `clock tree`
+still produced a device that did nothing. Three results now:
+
+| Steps | Result |
+|---|---|
+| neither | boots; the application's USB is unstable |
+| both | does not boot at all |
+
+That is two variables and one failure, which is not a finding. `FirmBoot` now
+takes them separately — `FIRMBOOT_MODULES_OFF` and `FIRMBOOT_CLOCK_TREE` —
+and **both default off**, because "boots badly" is a better default than
+"does not boot".
+
+```sh
+make SKETCH=examples/FirmBoot RUN_MODE=poll run EXTRA_FLAGS=-DFIRMBOOT_MODULES_OFF=1
+make SKETCH=examples/FirmBoot RUN_MODE=poll run EXTRA_FLAGS=-DFIRMBOOT_CLOCK_TREE=1
+```
+
+Whichever fails is the one that breaks it, and **that is worth more than
+either of them working**: it names a step the bootloader performs that a
+payload cannot survive, which is the shape of the entire remaining question
+about what bootloader mode withholds.
+
+Candidates for each, so the result can be read when it arrives:
+
+- **modules off** (ROM `0x3BFC`) switches off all ninety-six module clocks
+  and delays. The payload runs from SRAM and calls into the mask ROM, so both
+  of those must stay clocked through it — the bootloader survives the same
+  call, but the bootloader is not also holding a live USB connection.
+- **the clock tree** (`0x008206D0`'s routines) includes
+  `ROM 0x289C(3, 2)`, and §25 could not establish which clock id feeds the
+  core. A divider written to the id the CPU is executing on would stop the
+  chip at exactly this point, and it is the single most likely candidate in
+  the list.
+
+If it is the second, the fix is to skip the divider for whichever id that
+turns out to be — and identifying it would settle §25's remaining unknown as
+a side effect.
+
+### [M] The bisect: the clock tree is innocent, the module-clock step is not
+
+```
+neither step                boots, USB unstable
+FIRMBOOT_CLOCK_TREE=1       boots, USB unstable
+both                        does not boot
+```
+
+So `0x008206D0`'s whole clock sequence — source selects, rate, ROM-clock
+disables, flash-host writes, four dividers — is survivable by a payload and
+changes nothing about the application's USB. **The module-clock step is what
+breaks the boot**, and §25's worry that a divider might stop the core is
+retired: `ROM 0x289C(3, 2)` and its three companions run fine.
+
+There is a good reason ROM `0x3BFC` would break the application specifically.
+**Only the first `0x5862` bytes of FIRM are copied to SRAM.** The bulk of the
+application runs XIP from flash at `0x00C10000` — §5, and the reason
+`tools/sl6806-xref` scans that region at all. An application entered with the
+flash controller's module clock off faults the moment it branches into XIP.
+The bootloader survives the identical call because everything it needs
+afterwards it enables again by name, and it needs flash immediately: that is
+how it loads FIRM.
+
+But there is a second possibility with the opposite fix — that the payload
+never survives the call at all, since it runs from SRAM and calls into the
+mask ROM, and either could depend on a clock that goes off.
+
+`examples/ModulesOff` tells them apart in one run: snapshot the six
+registers, print them, call ROM `0x3BFC`, restore the snapshot immediately,
+print again. If the second block appears the payload survives and the
+application is starving; if the console never returns, the payload cannot
+make the call.
+
+It also records something nobody has: **which module clocks the boot ROM
+leaves running in bootloader mode.** That set is the answer to "what does
+bootloader mode withhold" in its most literal form, and the ids in it are the
+candidates for whichever one is the flash controller.
+
+## 31. [M] In RUN_MODE=poll, loop() runs inside the USB handler — so it cannot switch USB off
+
+`examples/ModulesOff` in `RUN_MODE=poll` printed **nothing at all**. Not the
+result, not the register dump, not even `setup()`'s banner.
+
+That silence is the answer, and it explains three earlier runs.
+
+`cores/sl6806/startup_payload.c`, poll mode: `payload_scsi_cb()` handles the
+console-poll command by calling `run_loop_counted()` **and then** draining the
+ring. So `loop()` executes *inside the boot ROM's USB command handler*, in the
+middle of a transaction the host is waiting on.
+
+ROM `0x3BFC` switches off all ninety-six module clocks, and **USB's is one of
+them**. Calling it from `loop()` in poll mode stops the USB controller in the
+middle of the transaction that is running the code doing the stopping. The
+poll never completes; the host sees nothing; and `setup()`'s banner never
+appears either, because the response to that poll was what would have carried
+it. The device is not dead — it is exactly as alive as it was left, with no
+way to say so.
+
+So:
+
+- **`examples/FirmBoot` with `FIRMBOOT_MODULES_OFF=1` failed for this reason**,
+  not because the application starved of XIP flash. That remains a real
+  hazard and is why the copy now comes first, but it was not what was being
+  measured.
+- The right mode is **`RUN_MODE=takeover`**, where `_start()` calls `setup()`
+  and then spins on `loop()` directly with no USB in the control path. There
+  is no console there either, which is acceptable for exactly one use — handing
+  the device to the application, which takes the console regardless.
+
+`FirmBoot` now refuses to compile with `FIRMBOOT_MODULES_OFF=1` in poll mode,
+with the reason in the `#error`. A trap that costs three hardware runs to
+notice deserves to be unbuildable.
+
+```sh
+make SKETCH=examples/FirmBoot RUN_MODE=takeover run \
+     EXTRA_FLAGS="-DFIRMBOOT_MODULES_OFF=1 -DFIRMBOOT_CLOCK_TREE=1"
+```
+
+### The general rule this implies
+
+**Anything that disturbs USB must not run in poll mode.** That covers the
+module clocks, the USB controller itself, and any clock tree change that
+reaches them. Poll mode is the default for probes in this tree precisely
+because it is the mode that reliably drives `loop()` — and it is the one mode
+in which a probe cannot touch the machinery driving it.
+
+Worth measuring for its own sake, and not yet done: which module clocks the
+boot ROM leaves running. `examples/ModulesOff` prints them before it does
+anything, so a takeover-mode run still cannot report them — but a poll-mode
+run that *only* dumps the registers, without the call, would.
+
+### Reading a takeover-mode run: the tooling's complaints are not results
+
+`RUN_MODE=takeover` uploads end with `unexpected status` from `smtlink_dump`,
+and `tools/sl6806-monitor` then reports that the device is not answering.
+**Both are correct and neither is a result.**
+
+In takeover mode `_start()` never returns to the boot ROM: it calls `setup()`
+and spins on `loop()`. So the ROM's run command never produces a completion
+status, and nothing afterwards services USB, which is what the monitor is
+asking. The same two messages appear whether the payload went on to do exactly
+what was intended or faulted on its first instruction.
+
+For `examples/FirmBoot` the observables are the device and the host's bus, and
+they separate the outcomes cleanly:
+
+| Observation | Meaning |
+|---|---|
+| panel shows the P20 interface | the application is running |
+| `lsusb -d 301a:2801` | and its USB enumerated - the card question can be asked |
+| `lsusb -d 301a:2800` | it fell back to the boot ROM, so something reset the chip |
+| neither, panel dark | it did not survive the jump |
+
+Worth stating because this session has twice read a tooling message as a
+hardware result, and once the other way round.

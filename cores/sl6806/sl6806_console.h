@@ -32,8 +32,33 @@
 extern "C" {
 #endif
 
+/*
+ * The transmit ring. Must be a power of two.
+ *
+ * THIS WAS 2048 FOR MOST OF THIS PROJECT'S LIFE, AND IT SHOULD NOT HAVE
+ * BEEN. The ring overwrites rather than blocking - deliberately, because a
+ * sketch must not stall when nobody is running the monitor - and in
+ * RUN_MODE=poll the host drains it only between loop() calls. So any sketch
+ * that printed more than two kilobytes without returning lost the beginning
+ * of it, which is reliably the register dump you wanted.
+ *
+ * That cost nine runs in the SD investigation, each opening with
+ * `[lost output - device outran the poll rate]`, and it produced four
+ * sketches written as state machines that emit one section per USB poll
+ * purely to work around it (examples/BtProbe, SdLife, PadMap, SdFiles). A
+ * serial port was decoded and driven partly to escape it (docs/UART.md).
+ *
+ * The ring is in .bss, which the payload image does not carry - `objcopy -R
+ * .bss` - and a payload has roughly 650 KB of SRAM to play with. Sixty-four
+ * kilobytes is about a thousand lines: more than any sketch here prints, and
+ * about 10% of the heap. The upload does not get bigger. Nothing else had to
+ * change, because the header publishes its own size and tools/sl6806-monitor
+ * reads it from there.
+ *
+ * Override with `make CONSOLE_SIZE=...` if a sketch needs more, or less.
+ */
 #ifndef SL6806_CONSOLE_SIZE
-#define SL6806_CONSOLE_SIZE 2048    /* transmit ring; must be a power of two */
+#define SL6806_CONSOLE_SIZE 65536
 #endif
 
 #define SL6806_CONSOLE_RX_SIZE 256  /* receive ring; must be a power of two */
@@ -78,6 +103,29 @@ extern sl6806_console_t _sl6806_console;
 
 void   sl6806_console_init(void);
 void   sl6806_console_write(const uint8_t *buf, size_t len);
+
+/*
+ * A second destination for everything the console prints.
+ *
+ * WHY THIS EXISTS. The ring above overwrites rather than blocking, and in
+ * RUN_MODE=poll the host drains it only between loop() calls - so a sketch
+ * that prints more than about two kilobytes without returning loses the
+ * beginning of it. Nine runs in the SD investigation opened with
+ * `[lost output - device outran the poll rate]`, and the standing workaround
+ * is to restructure a probe as a state machine so it emits one section per
+ * poll (examples/BtProbe, SdLife, PadMap).
+ *
+ * A sink that writes to the serial port at 0x40091000 removes the problem
+ * rather than working around it: the port has no ring to overflow, and it
+ * keeps working when the USB handler is wedged - the one failure the USB
+ * console cannot report. sl6806_uart_console_mirror() installs exactly that.
+ *
+ * The sink is called with the bytes as they are written, before they go into
+ * the ring, and must not print: it is called from inside Serial.print(). NULL
+ * removes it.
+ */
+typedef void (*sl6806_console_sink_fn)(const uint8_t *buf, size_t len);
+void   sl6806_console_set_sink(sl6806_console_sink_fn fn);
 void   sl6806_debug_print(const char *s);
 
 /* Free space in the transmit ring, in bytes. */

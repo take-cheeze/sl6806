@@ -206,6 +206,41 @@ extern "C" {
 #define SL6806_SD_PAD_B         0x0001691Bu
 
 /*
+ * [V] AND THE BOOTLOADER CONFIGURES SIX, which is what this driver uses.
+ *
+ * The mask ROM's three pads above are the chip's minimum - a one-bit bus. The
+ * HLKJ bootloader, at 0x0082167C and immediately before it calls
+ * `HAL_sd_disk_init`, configures **bank 1 pins 12 through 17**:
+ *
+ *     pin 12   function 2, drive 3, no pull      [I] the clock
+ *     pin 13   function 2, drive 2, pull 11      [I] the command line
+ *     pin 14   function 2, drive 3, pull 8
+ *     pin 15   function 2, drive 3, pull 11
+ *     pin 16   function 2, drive 3, pull 11
+ *     pin 17   function 2, drive 3, pull 11      [I] four data lines
+ *
+ * Six pads is a four-bit bus, and the bootloader is the code that actually
+ * reads cards on this board - it is what `sdupdate` runs on. The ROM's
+ * version is the generic one; this is the product's.
+ *
+ * Note the drive strength as well as the count: 3 where the ROM uses 1, and
+ * pin 13 at 2. A bus driven at a third of the strength the vendor uses is
+ * worth knowing about even if it is not the current problem.
+ *
+ * The driver configures all six and still talks one-bit, which is the
+ * bootloader's own order of business: it configures the pads once at
+ * bring-up and only later decides a bus width with ACMD6. Configuring a pad
+ * the driver does not use costs nothing; switching the card to a bus width
+ * the pads are not ready for would lose the card.
+ */
+#define SL6806_SD_PAD_D0        0x00017138u   /* pin 14 */
+#define SL6806_SD_PAD_D1        0x0001793Bu   /* pin 15 */
+#define SL6806_SD_PAD_D2        0x0001813Bu   /* pin 16 */
+#define SL6806_SD_PAD_D3        0x0001893Bu   /* pin 17 */
+#define SL6806_SD_PAD_CLK_BL    0x00016130u   /* pin 12, drive 3 */
+#define SL6806_SD_PAD_CMD_BL    0x0001692Bu   /* pin 13, drive 2 */
+
+/*
  * [V] The clocks. Module id 36 gates the registers (15b's mechanism, and the
  * bootloader pulses it off-and-on around a 5 ms delay at 0x008227D4 to reset
  * the block); ROM clock id 17 - `0x40080080` bit 0 - is the functional one.
@@ -319,6 +354,22 @@ int sl6806_sd_controller_begin(uint32_t edge, uint32_t clkcr);
  * drain stores words, exactly as ROM 0x4806 does.
  */
 int sl6806_sd_read_block(uint32_t lba, void *buf);
+
+/*
+ * The same read, without requiring a successful sl6806_sd_begin().
+ *
+ * FOR PROBES ONLY, and it exists because of a specific dead end: on this
+ * board no command has ever completed, so `begin()` never succeeds, so
+ * sl6806_sd_read_block() refuses before it touches the bus and nothing
+ * downstream can be tested at all. This issues the read anyway - data-enable,
+ * block size, length, CMD17, drain - and reports what the data path does.
+ *
+ * `high_capacity` picks the addressing, since identification never got far
+ * enough to determine it: non-zero passes `lba` through, zero multiplies by
+ * 512. Guess wrong on a working card and you read the wrong sector; guess
+ * wrong on this one and nothing happens either way.
+ */
+int sl6806_sd_read_block_unchecked(uint32_t lba, void *buf, int high_capacity);
 
 /*
  * Read `count` consecutive blocks, one CMD17 each. Not CMD18: multi-block

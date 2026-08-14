@@ -416,11 +416,12 @@ a poll loop that prints as it goes), and a sweep of the five CLKCR bits **no
 bring-up in the dump ever writes**: the vendor's read-modify-write clears
 `0x7FFF0FFF`, so bits 12..15 and 31 have never been set by anything.
 
-**Run it twice — once with a card in the slot, once without.** CMD0 needs no
-card in principle, but a host with a card-detect input may decline to run its
-clock into a slot it knows is empty, and every run so far has been
-uncontrolled for this. The card-detect pin is unknown, so it cannot be
-checked in software; two runs and a microSD check it in a minute.
+**[M] Run with and without a card: no register changes.** `SdScope` was taken
+both ways. `PadMap` shows the board *does* detect the card — bank 5 pin 0 moves
+— but nothing in the controller responds to it, and the SD bus pads themselves
+do not move at all, which is the loose thread in the notes: bank 1 pins 12–14
+may be the chip vendor's default SD pads rather than the ones this board routes
+to its socket.
 
 ## [M] It discards commands in under a microsecond, 2026-08-13
 
@@ -547,10 +548,17 @@ the pad census and card detect, which `examples/PadMap` covers:
 make SKETCH=examples/PadMap RUN_MODE=poll run     # empty slot, then with a card
 ```
 
-It never drives a pad and never touches one outside function 0. For each pad
-already in function 0 it applies a pull-up, reads, applies a pull-down, reads,
-and restores — so a pin that follows its pull is floating and one that ignores
-it is driven from outside. A microSD socket's card-detect contact is a switch
+It never drives a pad and never touches one the boot ROM has assigned. For
+each **parked** pad — function 15 — it configures a plain input with a pull-up,
+reads, with a pull-down, reads, then parks it again and restores its pull. A
+pin that follows its pull is floating; one that ignores it is driven from
+outside.
+
+The first run of it aimed at the wrong pads and taught the board's pad map
+instead: every bank has a contiguous run of function 15 from pin 0 and reads
+`0` above it, across all six banks, so **`0` means the pin does not exist and
+`15` means a real pad the ROM has parked**. Eighty pads are bonded out; the
+ROM assigns six. The notes have the table. A microSD socket's card-detect contact is a switch
 to ground, so **a pin that follows the pull with an empty slot and reads low
 with a card in it is card detect**, which the driver currently has to
 substitute with a pair of command timeouts.
@@ -649,6 +657,37 @@ Three readings of its output:
    attributed, and a rail that is off would explain why even the ROM's own
    CMD0 timed out with no card present.
 
+## Reading the filesystem
+
+`cores/sl6806_fat.[ch]` is a read-only FAT16/FAT32 reader — mount through an
+MBR or a bare boot sector, directory listing, file read by cluster chain. It
+takes a **block-reader callback and knows nothing about SD**, which is the
+only reason it can be checked at all: `tests/host/test_fat.c` builds real
+FAT16 and FAT32 volumes in memory and reads them back, 43 checks. The FAT
+width comes from the cluster count rather than the string in the boot sector,
+long-name entries are skipped rather than parsed as files, and chains are
+followed for both files and directories.
+
+```sh
+make SKETCH=examples/SdFiles RUN_MODE=poll run
+```
+
+walks the whole stack and reports where it stops — bring-up, identification,
+the block read, the partition table, the boot sector, the directory. **It will
+stop at the block read on this board**, because no command has ever completed;
+it goes through `sl6806_sd_read_block_unchecked()` so that a failed
+identification does not prevent the data phase from being tried, since
+identification needs six commands to work and a data phase needs one.
+
+So the stack is one unknown — does a sector arrive — with a tested reader
+waiting behind it. Nothing here writes.
+
+**If you only want the files off the card**, plug the device in without
+holding a boot key: the stock firmware enumerates as USB mass storage
+(`301a:2801`) and the card mounts on the host. That also happens to be a
+measurement worth taking, since it would show the socket, the card and the SD
+host all working under the vendor's own firmware.
+
 ## What is not done
 
 - **Writing.** CMD24 and CMD25 are in the ROM's table and nothing else is
@@ -659,11 +698,16 @@ Three readings of its output:
 - **Multi-block reads.** CMD18 needs CMD12 to stop it and its own status
   handling. `sl6806_sd_read_blocks()` issues one CMD17 per block instead,
   which is slower and cannot leave the card mid-transfer.
-- **Card detect.** Nothing in the dump reads a card-detect bit in this block.
-  The bootloader configures a bank-2 pad as an input with a pull
-  (`0x0002280B`, at `0x00822310`) next to code that touches the *other*
-  storage host, and that is a guess. "No card" is currently a pair of
-  timeouts, not a pin.
+- **Card detect — [M] candidate found, 2026-08-13: bank 5 pin 0.** Nothing in
+  the dump reads a card-detect bit in this block, but the board has one.
+  `examples/PadMap`, run with a single power cycle and a card inserted between
+  the two passes, differs in exactly one pin of sixty-nine: bank 5 pin 0 is
+  held to ground with the slot **empty** and floats with a card in — a
+  normally-closed detect switch, so "card present" is the pin reading high
+  under a pull-up. It wants one confirming run (insert and remove twice) before
+  it goes into the driver, because the last single-pair result pointed at a
+  different pin and was wrong. Until then "no card" stays a pair of command
+  timeouts.
 - **MMC.** The ROM branches to CMD1 when CMD55 times out. This driver reports
   "no card (or an MMC)" and stops, because with nothing ever having answered
   in this slot there would be no way to tell a working transcription of the
