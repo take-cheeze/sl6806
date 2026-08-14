@@ -69,6 +69,17 @@ static int  phase = -1;
 static int  idx, hits;
 static bool announced;
 
+/* The gap the block needs between descriptors. Without it the SECOND submit
+ * times out - measured on all ten rows of ToneDemo's first pace(), and it is
+ * why the first version of this sketch reported all 184 ids as hits. */
+static void settle(void)
+{
+    unsigned long t = micros();
+
+    while (micros() - t < 2000ul)
+        ;
+}
+
 static unsigned long timeOne(const void *buf)
 {
     unsigned long t0, us;
@@ -88,13 +99,46 @@ static unsigned long timeOne(const void *buf)
 static int fetches(unsigned long *sram, unsigned long *flash)
 {
     *sram  = timeOne(wave);
+    settle();
     *flash = timeOne((const void *)(uintptr_t)FLASH_SRC);
+    settle();
     if (!*sram || !*flash)
+        return 0;                      /* rejected: never a measurement */
+    /* A TIMEOUT IS NOT A SLOW READ. The bound means the descriptor never
+     * retired at all, which is a different fault and must not score as a hit -
+     * scoring it is exactly what made every row of the first run a "discovery". */
+    if (*sram >= 60000ul || *flash >= 60000ul)
         return 0;
     /* Reading 4796 bytes over 32 MHz SPI is >= 300 us even in quad mode,
      * against ~10 us not reading. Half again is far outside the noise, which
      * the logs show as +-1 us. */
     return (*flash > *sram + (*sram / 2u) + 5u);
+}
+
+/*
+ * The control, and it can fail. With nothing enabled the two sources must give
+ * the SAME time - that is the known state, established over a 1440:1 length
+ * range. If they differ before a single clock has been touched, the instrument
+ * is measuring itself and no row below it means anything.
+ */
+static int baseline_ok(void)
+{
+    unsigned long a, b;
+    int hit = fetches(&a, &b);
+
+    Serial.printf("  baseline   SRAM %5lu us   flash %5lu us\n", a, b);
+    if (!a || !b) {
+        Serial.println("  [!] a row did not complete - the detector cannot run");
+        return 0;
+    }
+    if (hit) {
+        Serial.println("  [!] THE BASELINE ALREADY 'READS MEMORY'. It cannot -");
+        Serial.println("      nothing has been enabled. The instrument is broken");
+        Serial.println("      and the walk is refused. Do not read past here.");
+        return 0;
+    }
+    Serial.println("  equal - the detector works and the answer is 'not yet'");
+    return 1;
 }
 
 static void row(const char *what, int id)
@@ -148,19 +192,17 @@ void loop()
         return;
 
     switch (phase) {
-    case 'b': {
-        unsigned long a, b;
-        int hit = fetches(&a, &b);
-
-        Serial.printf("  baseline      SRAM %5lu us   flash %5lu us   %s\n",
-                      a, b, hit ? "READS MEMORY" : "identical - not reading");
-        Serial.println("  two equal numbers here means the detector is working");
-        Serial.println("  and the answer is no, not that the test failed.");
+    case 'b':
         phase = -1;
+        (void)baseline_ok();
         break;
-    }
 
     case 'm':
+        /* The walk refuses to run on a broken detector. The first version
+         * printed the same "READS MEMORY" verdict on its baseline as on its
+         * 184 rows, so the control could not contradict the result - which is
+         * not a control at all. */
+        if (idx == 0 && !announced && !baseline_ok()) { phase = -1; break; }
         if (idx > 127) {
             Serial.printf("  128 module ids, %d hit(s)\n", hits);
             phase = -1;
@@ -181,6 +223,7 @@ void loop()
         break;
 
     case 'r':
+        if (idx == 0 && !announced && !baseline_ok()) { phase = -1; break; }
         if (idx >= SL6806_ROMCLK_COUNT) {
             Serial.printf("  %d romclk ids, %d hit(s)\n",
                           SL6806_ROMCLK_COUNT, hits);

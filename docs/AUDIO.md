@@ -1429,3 +1429,41 @@ The walk is cumulative on purpose — a combination that only works together is
 still reachable — which means a hit names the *last* id enabled, not
 necessarily the only one that mattered. Re-run from cold with just that one to
 confirm.
+
+### [!] The walk was void — and its own baseline said so in the first line
+
+```
+[b]
+  baseline      SRAM     9 us   flash 60001 us   READS MEMORY
+```
+
+**Nothing had been enabled, and the baseline already claimed the DMA reads
+memory.** That is impossible, so the instrument was broken before the walk
+began — and the walk then reported 128 of 128 module ids and 56 of 56 romclk
+ids as hits, which is 184 discoveries or one bug.
+
+`60001` is the poll bound. The flash row did not read slowly; it **never
+retired**. And the cause is already recorded two sections above: `fetches()`
+submitted two descriptors back to back with no gap, and *the second submission
+after no gap times out* — measured on all ten rows of `ToneDemo`'s first
+`pace()`, which is why that function has a `settle()` in it. `AudioFetch` did
+not.
+
+Three fixes, and the third is the one that matters:
+
+1. `settle()` between the two timings, as `pace()` has.
+2. **A timeout is not a slow read.** Hitting the bound means the descriptor
+   never retired, which is a different fault; it now scores as "not a
+   measurement" rather than as an enormous time. Scoring it as a time is
+   precisely what turned every row into a hit.
+3. **The baseline is now a gate that can fail.** It refuses to run either walk
+   and prints `THE BASELINE ALREADY 'READS MEMORY'. It cannot - nothing has
+   been enabled. The instrument is broken and the walk is refused.`
+
+That third point is the lesson, and it is the fourth time this investigation
+has hit the same wall. The sketch **had** a baseline, designed for exactly this
+failure — and it printed the same cheerful `READS MEMORY` verdict as every
+other row, so the control could not contradict the result. A control that
+cannot fail loudly is not a control; it is decoration. The comment above it
+even read *"two equal numbers here means the detector is working"* while the
+code printed a verdict without ever checking that they were equal.
