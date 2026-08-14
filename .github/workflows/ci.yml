@@ -56,11 +56,13 @@ jobs:
         # depends, so --no-install-recommends alone leaves a compiler with no
         # C library headers and every build dies on <string.h>. Name them.
         #
-        # timeout-minutes: seen stalling past 14 minutes on a flaky mirror
-        # connection while 29 concurrent sibling jobs installed the same
-        # packages in under 2 minutes each - fail fast instead of sitting on
-        # the default 360-minute job budget.
-        timeout-minutes: 5
+        # timeout-minutes: bounds genuine stalls (one job sat past 14 minutes
+        # while 29 siblings installing the same packages finished in under 2)
+        # without false-failing a slow-but-working mirror - these packages
+        # are a real 574 MB (mostly libstdc++-arm-none-eabi-newlib alone),
+        # and a cold cache has measured needing ~5 minutes just to download
+        # that at ordinary, non-stalled mirror throughput.
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -252,7 +254,7 @@ jobs:
           path: /var/cache/apt/archives/*.deb
           key: apt-arm-none-eabi-${{ runner.os }}-v1
       - name: Install the ARM toolchain
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -287,7 +289,7 @@ jobs:
         # The newlib packages are *recommends* of gcc-arm-none-eabi, not
         # depends, so --no-install-recommends alone leaves a compiler with no
         # C library headers and every build dies on <string.h>. Name them.
-        timeout-minutes: 5
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
