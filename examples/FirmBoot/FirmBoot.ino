@@ -99,6 +99,9 @@
 extern "C" {
 #include "sl6806_firm.h"
 #include "sl6806_hwinit.h"
+#include "sl6806_uart.h"
+#include "sl6806_audio.h"
+#include "sl6806_mmio.h"
 }
 
 /*
@@ -176,6 +179,47 @@ extern "C" {
 #define FIRMBOOT_CLOCK_TREE 0
 #endif
 
+/*
+ * ===================================================================
+ *  DUMPING, AND WHY IT HAS TO GO OUT OF THE UART
+ * ===================================================================
+ * docs/AUDIO.md ends by asking for the audio block to be dumped **while the
+ * stock firmware is really playing**, and then diffed against what this
+ * framework produces. That cannot be done over USB: the application
+ * re-initialises the controller, so the console and the upload endpoint are
+ * gone the instant the jump happens, and any code of ours went with them.
+ *
+ * But there is a channel that survives, and this project already found it.
+ * 26 and 27 identified 0x40091000 as a real UART on bank 1 pin 2, function 6,
+ * at 1.5 Mbaud - it is where every `boot--->` line from the HLKJ bootloader
+ * comes out. The application is built from the same tree and carries the same
+ * printf: FIRM contains `-pwm1_event_callback`, `-brightness percent %d`,
+ * `sdio(i):...` and the rest. **So a serial adapter on that pad sees the
+ * product's own debug output, live, after the handover.**
+ *
+ * That makes the dump a two-part observation on one wire:
+ *
+ *   before the jump - this sketch prints the audio block and its clocks, so
+ *                     the "ours" half of the diff is in the same transcript;
+ *   after the jump  - whatever the application says for itself.
+ *
+ * WHAT YOU NEED: a 3.3 V USB-serial adapter, RX to bank 1 pin 2, ground to
+ * ground, **1500000 baud**. Nothing else changes; if you have no adapter the
+ * dump still goes to the USB console and only the second half is lost.
+ *
+ *     make SKETCH=examples/FirmBoot RUN_MODE=poll run
+ *     # in another terminal, before the countdown ends:
+ *     #   picocom -b 1500000 /dev/ttyUSB0
+ *
+ * Set FIRMBOOT_DUMP=0 to skip it. It only reads registers and configures one
+ * pad, so it cannot affect whether the application boots - but the pad write
+ * is a write, and this file's convention is that anything touching hardware
+ * before the jump can be turned off.
+ */
+#ifndef FIRMBOOT_DUMP
+#define FIRMBOOT_DUMP 1
+#endif
+
 /* Seconds of grace before the jump, so the console can be read and the run
  * abandoned by unplugging. */
 #define COUNTDOWN 8
@@ -193,6 +237,65 @@ static void printHex(uint32_t v)
     for (int i = 7; i >= 0; i--)
         Serial.print(hex[(v >> (i * 4)) & 0xF]);
 }
+
+#if FIRMBOOT_DUMP
+/* Both destinations, because the UART half is the only one that survives the
+ * jump and the USB half is the only one that exists without an adapter. */
+static void say(const char *s)
+{
+    Serial.print(s);
+    sl6806_uart_puts(s);
+}
+
+static void sayReg(const char *name, uint32_t addr)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    char line[48];
+    uint32_t v = sl6806_mmio_read(addr);
+    unsigned i, n = 0;
+
+    while (*name && n < 20u)
+        line[n++] = *name++;
+    while (n < 20u)
+        line[n++] = ' ';
+    for (i = 0; i < 8u; i++)
+        line[n++] = hex[(v >> ((7u - i) * 4u)) & 0xFu];
+    line[n++] = '\r';
+    line[n++] = '\n';
+    line[n] = 0;
+    say(line);
+}
+
+/*
+ * The "ours" half of the diff docs/AUDIO.md asks for. Read-only apart from
+ * the UART pad, so it changes nothing the application then has to survive.
+ */
+static void dumpAudio(const char *when)
+{
+    say("\r\n--- audio block, ");
+    say(when);
+    say(" ---\r\n");
+    sayReg("+0x000 ctrl",   SL6806_AUD_REG(0x000));
+    sayReg("+0x008 DAC",    SL6806_AUD_DAC);
+    sayReg("+0x07C src",    SL6806_AUD_REG(0x07C));
+    sayReg("+0x080 src",    SL6806_AUD_REG(0x080));
+    sayReg("+0x100 TXen",   SL6806_AUD_TX_ENABLE);
+    sayReg("+0x104 TXtrig", SL6806_AUD_TX_TRIG);
+    sayReg("+0x108 TXctrl", SL6806_AUD_TX_CTRL);
+    sayReg("+0x10C TXaddr", SL6806_AUD_TX_ADDR);
+    sayReg("+0x200 RXen",   SL6806_AUD_RX_ENABLE);
+    sayReg("+0x208 RXctrl", SL6806_AUD_RX_CTRL);
+    sayReg("+0x400 EQctrl", SL6806_AUD_EQ_CTRL);
+    sayReg("+0x40C EQ?",    SL6806_AUD_REG(0x40C));
+    say("--- clocks ---\r\n");
+    sayReg("40080010 PLLsel",  SL6806_AUD_PLL_SEL);
+    sayReg("40080014 PLLrat",  SL6806_AUD_PLL_RATIO);
+    sayReg("40080094 bitclk",  SL6806_AUD_BITCLK_REG);
+    sayReg("4009B040",         0x4009B040u);
+    sayReg("4009B04C",         0x4009B04Cu);
+    sayReg("4009B050",         0x4009B050u);
+}
+#endif
 
 static const char *why(int err)
 {
@@ -213,6 +316,12 @@ void setup()
     Serial.begin(115200);
     Serial.println();
     Serial.println("=== SL6806: start the stock application ===");
+#if FIRMBOOT_DUMP
+    Serial.print("UART on bank 1 pin 2 @1500000: ");
+    Serial.println(sl6806_uart_begin(SL6806_UART_BAUD)
+                   ? "up - put an adapter there to see past the jump"
+                   : "REFUSED - the dump will be USB-only and stop at the jump");
+#endif
     Serial.println();
     Serial.println("This does not come back. USB goes away with it, and the");
     Serial.println("device becomes the product. Nothing is written to flash;");
@@ -328,6 +437,16 @@ void loop()
      * console with them - USB's module clock is among the ninety-six - which
      * is why they come after the flush and immediately before the handover.
      */
+#if FIRMBOOT_DUMP
+    /*
+     * Last thing before the handover, so what is printed is the state the
+     * application is actually given - not the state eight seconds earlier.
+     */
+    dumpAudio("as this payload leaves it");
+    say("\r\n--- jumping. anything below this line is the application's"
+        " own output ---\r\n");
+#endif
+
 #if FIRMBOOT_MODULES_OFF
     sl6806_hwinit_modules_off();
 #endif

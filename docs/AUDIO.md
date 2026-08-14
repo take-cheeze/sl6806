@@ -1272,3 +1272,647 @@ values of thirty others were recorded without ever asking which of their bits
 are writable.
 
 That is where a fetch enable would be, if it is anywhere reachable.
+
+## `examples/AudioBeep` — the demo, and why it is honest about being silent
+
+`examples/ToneDemo` is now seven phases of instrumentation and is unreadable as
+an example. `AudioBeep` is the twenty-line version: begin, route, volume,
+unmute, `sl6806_audio_play()`, four notes of an arpeggio.
+
+**It makes no sound today**, because the block does not fetch — and it says so
+rather than leaving the reader to suspect their headphones. It measures instead
+of claiming:
+
+> A buffer of N bytes of 48 kHz 16-bit stereo is N/192 ms of audio. If the
+> hardware is really playing it, the completion **cannot arrive sooner than
+> that** — a DAC consuming at 48 kHz is what paces the DMA, and that is exactly
+> what "it works" means here.
+
+So each note prints its retire time against the 120 ms it lasts, and the sketch
+ends with one of two verdicts:
+
+- **NOT PLAYING** — with the fastest retire quoted, and a pointer to this
+  document. Expected today.
+- **PACED AT REAL TIME** — the block is playing. If nothing is audible at that
+  point the fault has moved *past* the DMA to routing, the amplifier enable or
+  the jack, which is a different and much shorter search.
+
+That second branch is the point of writing it now. It is the regression that
+will announce success without being modified, the day someone finds what makes
+the block fetch. A demo that prints "playing!" and makes no sound would be
+worse than no demo at all.
+
+### [M] `AudioBeep` confirms the model, and a new lead in the submit path
+
+Four notes, 23040 bytes each, retiring in 43–44 µs against 120 ms of audio.
+**536 B/µs** — another point on the same line, at a length nothing had tested,
+and the sketch correctly printed `NOT PLAYING` with the number rather than
+claiming anything.
+
+Reading the submit path afterwards, two things check out and one does not.
+
+**The descriptor is right.** The vendor's TX submit at `0x0080D9BC` is, exactly:
+`TX_ADDR = addr`; `TX_CTRL[31:16] = len`; then it assembles
+`(3 × len / 4) << 16 | 1` in a stack temporary and stores it to `TX_TRIG`.
+That is `sl6806_audio_trigger_word()` to the bit, three-quarter watermark and
+all.
+
+**The start is right.** `0x00D97A5E` is `TX_CTRL |= 0x10`, and its sibling
+branch does the same to `RX_CTRL` at `+0x208`.
+
+**But there is a priming path the driver has never performed.** At
+`0x00D97A20`, before any of that:
+
+```
+[driver_state + 0x128] = r7          ; a flag, not MMIO
+TX_CTRL |= 0x10                      ; START set FIRST
+submit(0x0080D9BC, buf = state+0x118, len = 16)   ; a SIXTEEN-BYTE descriptor
+while ([driver_state + 0x128]) ;     ; spin until an ISR clears the flag
+0x00D94B0C()
+```
+
+So the vendor **sets START before the descriptor**, submits a 16-byte primer
+from a buffer inside its own driver state, and then *waits for the completion
+interrupt to fire* before doing anything else. `sl6806_audio_play()` writes the
+descriptor and then sets START, never primes, and has no interrupt at all.
+
+Whether a 16-byte primer with START pre-set is what arms the fetch is not
+established — it is one reading of one call site, and this document has
+promoted several of those to conclusions it had to withdraw. But it is the
+first thing found in the fetch path that the driver demonstrably does not do,
+and it is cheap to try: submit 16 bytes with START already set, wait, then
+submit the real buffer and see whether the retire time moves off 43 µs.
+
+### The priming path, read carefully — and what of it can actually be tried
+
+`0x00D97A20` looked like a hardware handshake. It is not, and the difference
+matters enough to state before anyone builds on it.
+
+```
+[state + 0x128] = 1
+TX_CTRL |= 0x10                       START set FIRST
+submit(state + 0x118, len = 16)       a SIXTEEN-BYTE descriptor
+while ([state + 0x128]) ;             spin
+0x00D94B0C()
+```
+
+The base is `[0x0082B310]`, the audio driver's **state pointer** — and two
+instructions earlier the callback `0x0080D955` is stored into the same struct.
+So `+0x128` is a flag the vendor's *interrupt handler* clears, not a register,
+and `+0x10C` in that routine is a state byte rather than `TX_ADDR`. A probe
+that spun on those addresses as MMIO would be reading SRAM and would either
+hang or quietly measure nothing.
+
+That is worth recording as a near miss: the byte-width accesses (`strb` into a
+register block that is otherwise all 32-bit) were the tell, and they were
+visible in the first disassembly.
+
+**What remains testable is real, though, and it is two things:**
+
+1. **START before the descriptor.** The vendor has the channel running when the
+   descriptor lands. `sl6806_audio_play()` writes the descriptor and starts
+   afterwards. If the block latches on a running channel rather than on the
+   START edge, that is the difference.
+2. **A 16-byte primer** submitted before the real buffer.
+
+Both are in `examples/AudioPrime`, with a fourth mode that primes before *every*
+buffer in case the primer arms a single fetch rather than the channel.
+
+The detector needs no judgement: 23040 bytes is 120 ms of audio, unpaced
+retires in ~43 µs, and a factor of **2791** is not something anyone has to
+squint at.
+
+### [M] The submit path is exhausted too — and the question moves earlier
+
+`examples/AudioPrime`: START before the descriptor, a 16-byte primer, and a
+primer before every buffer. **All 43–45 µs, all unpaced.** The descriptor was
+already bit-exact against the vendor's, so nothing in the submit path was ever
+the problem.
+
+The primer row is a useful consistency check rather than a null: 16 bytes
+retired in **1 µs**, against a model of `16 × 0.00185 + 1.4 = 1.43`. The
+counter model now holds at both ends of a **1440:1** length range, 16 bytes to
+23040.
+
+So the question is no longer what paces the DMA. **It is what lets the DMA
+reach the bus at all**, which is earlier than anything this document has been
+asking.
+
+### `examples/AudioFetch` — the walk that has never been run
+
+**The detector is the source-memory test, not the pacing one, and the choice is
+the point.** Pacing needs two things to be true: the engine must fetch *and*
+the DAC must consume at 48 kHz. Fetching needs only the first. So a source-speed
+difference appears the moment the bus master wakes, even with nothing
+downstream ready — strictly the more sensitive instrument, and the one that
+fails first.
+
+| | |
+|---|---|
+| SRAM and flash the same | still not reading |
+| flash slower than SRAM | **it is reading memory** |
+
+Signal to noise is about thirty: reading 4796 bytes over 32 MHz SPI is ≥300 µs
+even in quad mode, against ~10 µs not reading, and the logs show ±1 µs of
+scatter.
+
+§14a walked all 128 module ids once and got nothing — but it scored on CTRL
+bit 28 of the *PWM*, which is not a run flag, and §32 records that walk as void.
+**No walk has ever been run against the audio block with a working detector.**
+This is that walk, over both clock families.
+
+Ids are only ever switched **on**; `sl6806_module.h` records the disable
+direction as the dangerous one and the sketch never uses it. Each id is
+announced and the call returns before the write, so a hang names the id.
+
+The walk is cumulative on purpose — a combination that only works together is
+still reachable — which means a hit names the *last* id enabled, not
+necessarily the only one that mattered. Re-run from cold with just that one to
+confirm.
+
+### [!] The walk was void — and its own baseline said so in the first line
+
+```
+[b]
+  baseline      SRAM     9 us   flash 60001 us   READS MEMORY
+```
+
+**Nothing had been enabled, and the baseline already claimed the DMA reads
+memory.** That is impossible, so the instrument was broken before the walk
+began — and the walk then reported 128 of 128 module ids and 56 of 56 romclk
+ids as hits, which is 184 discoveries or one bug.
+
+`60001` is the poll bound. The flash row did not read slowly; it **never
+retired**. And the cause is already recorded two sections above: `fetches()`
+submitted two descriptors back to back with no gap, and *the second submission
+after no gap times out* — measured on all ten rows of `ToneDemo`'s first
+`pace()`, which is why that function has a `settle()` in it. `AudioFetch` did
+not.
+
+Three fixes, and the third is the one that matters:
+
+1. `settle()` between the two timings, as `pace()` has.
+2. **A timeout is not a slow read.** Hitting the bound means the descriptor
+   never retired, which is a different fault; it now scores as "not a
+   measurement" rather than as an enormous time. Scoring it as a time is
+   precisely what turned every row into a hit.
+3. **The baseline is now a gate that can fail.** It refuses to run either walk
+   and prints `THE BASELINE ALREADY 'READS MEMORY'. It cannot - nothing has
+   been enabled. The instrument is broken and the walk is refused.`
+
+That third point is the lesson, and it is the fourth time this investigation
+has hit the same wall. The sketch **had** a baseline, designed for exactly this
+failure — and it printed the same cheerful `READS MEMORY` verdict as every
+other row, so the control could not contradict the result. A control that
+cannot fail loudly is not a control; it is decoration. The comment above it
+even read *"two equal numbers here means the detector is working"* while the
+code printed a verdict without ever checking that they were equal.
+
+## [M] The clock space is exhausted — the problem is not a clock
+
+With the detector fixed and its baseline passing (`SRAM 9 µs, flash 9 µs,
+equal`), both walks ran clean:
+
+```
+128 module ids, 0 hit(s)
+ 56 romclk ids, 0 hit(s)
+```
+
+**And the walks are cumulative.** By the end of `m` every one of the 128 module
+clocks was on; by the end of `r` every romclk id as well — and the DMA still
+never touched its source. That is a far stronger statement than 184 separate
+negatives: with essentially every clock in the chip enabled, the audio DMA does
+not read memory.
+
+This is also the first walk of the clock space ever run against this block with
+an instrument that works, gated by a control that can fail. §14a's walk was
+void; this one is not.
+
+**So whatever stops the block fetching is not a clock.** That closes the line
+of enquiry this document has followed since it opened — "configured and not
+running" was read as a clocking problem for its whole history, and it is not
+one.
+
+### What is left, cheapest first
+
+1. **An implemented-bit census of the audio block itself.** Its thirty
+   registers have had their *reset values* recorded and nothing more — nobody
+   has ever asked which of their bits are writable. That question found four
+   hidden bits in the PWM's pair register after a year of it being "known", and
+   bit 4 of the audio bit clock. `examples/AudioFetch` phase `c` does it over
+   the ten registers in the path, one bit at a time with a restore after each.
+   The `unwritten` column it prints — implemented but never written by the
+   driver — is the search space.
+2. **The source address may not be what we think.** `+0x10C` is taken as a
+   buffer pointer because the vendor writes one there, but a descriptor-pointer
+   format would look identical from the outside and would explain a length that
+   counts down against nothing.
+3. **A bus-master enable outside both clock families.**
+4. **A generate-rather-than-fetch mode**, in which the length is consumed
+   without a source being read at all. That would fit every measurement taken.
+
+### [V] The descriptor-pointer hypothesis is ruled out, statically
+
+`+0x10C` might have been a descriptor-list pointer rather than a buffer
+pointer — a format that would look identical from outside and would explain a
+length counting down against nothing. It is not. There are four call sites of
+the TX submit `0x0080D9BC`:
+
+| site | buffer | length |
+|---|---|---|
+| `0x00D97A3C` | `state + 0x118` | 16 |
+| `0x00D99F62` | `[0x0082B42C] + 0x40` | 16 |
+| `0x0080FE4A` | `state + 0x40` | 16 |
+| **`0x00D99FBA`** | **ROM `0xC81C`(state→0x1C)** | **`[state + 0x38]`, a halfword** |
+
+Three pass a fixed 16, which is what made "16 = the descriptor size" tempting.
+The fourth does not: it takes a pointer from a queue accessor and a **variable
+byte length** out of driver state. A descriptor pointer does not come with a
+caller-supplied variable length, and a 16-byte descriptor would not be
+submitted with a length of 4796 from anywhere.
+
+So `+0x10C` is a buffer pointer and `TX_CTRL[31:16]` is a byte count, exactly
+as `sl6806_audio_play()` assumes. The three 16s are small fixed buffers — four
+stereo frames each, most plausibly silence — not descriptors.
+
+That leaves, of the four hypotheses:
+
+1. **the audio block's own unwritten bits** — `examples/AudioFetch` phase `c`,
+   never run;
+2. ~~the source address is a descriptor pointer~~ — ruled out here;
+3. a bus-master enable outside both clock families;
+4. a generate-rather-than-fetch mode, which still fits every measurement.
+
+## [M] The census invalidates the source test — `+0x10C` cannot hold a flash address
+
+```
++0x10C TXadr  holds 00810000  implemented 008FFFFC
+```
+
+**Bits [19:2] and bit 23. Bits 20, 21 and 22 are absent.** So the TX address
+register reaches SRAM (`0x008xxxxx`) and the low megabyte, and **cannot hold a
+flash address at all**:
+
+| written | retained |
+|---|---|
+| `0x00838B38` SRAM buffer | `0x00838B38` |
+| `0x00C10000` XIP flash | **`0x00810000`** |
+| `0x00000100` mask ROM | `0x00000100` |
+
+And `0x00810000` is exactly what the register was found holding — the truncated
+remains of the last flash-source test.
+
+**So the source-memory test never pointed at flash. Both of its rows read
+SRAM**, and their identical times were guaranteed by the hardware truncating
+the address rather than by anything the DMA did or did not do. `docs/AUDIO.md`'s
+"SETTLED — the DMA does not read its source" is **retracted**. It is unproven
+in both directions.
+
+That is the fifth instrument failure in this investigation and the first one
+caught by a control built for the purpose. The census was added to look for a
+fetch enable; what it found was that a measurement three sections above it was
+void. Worth the run on its own.
+
+### The trigger register, explained rather than blamed
+
+```
++0x104 TXtrg  holds 0E0C0000  implemented FFFC0002
+```
+
+The watermark field is **[31:18]**, not [31:16], and the driver's write of
+`(3 × len / 4) << 16 | 1` comes back as `0x0E0C0000` — bits 16, 17 and 0
+dropped, exactly as the mask predicts.
+
+That looked like a bug and is not. The vendor writes a **byte** count at bit 16;
+the field sits at bit 18, so it sees `value >> 2`; and `3·len/16` **words** is
+`3·len/4` **bytes**. The two cancel. The field counts words, the vendor's value
+lands correctly, and the odd position is explained.
+
+What is *not* explained: **bit 0 is not implemented and bit 1 is**, and nothing
+writes bit 1. `SL6806_AUD_TRIG_ARM` is `(1u << 0)` and has therefore never set
+anything.
+
+### The test that replaces the source comparison
+
+Both reachable regions are on-chip, so there is no source-speed comparison left
+to make. But there is a better test that needs no second memory:
+
+> If the engine walks the buffer, **the address register moves.**
+
+Write it, run one transfer, read it back. An engine that fetches leaves it
+advanced by the length; a counter leaves it where it was. `examples/AudioFetch`
+phase `a`.
+
+Other unwritten fields the census turned up, for later: `+0x000` bits [11:0]
+and [31:26]; `+0x108` bits 2, 5, 6 and [31:16] beyond the length; `+0x200` and
+`+0x208` broadly. The `unwritten` column of each row is the search space.
+
+### [M] TX_ADDR does not advance — but that is weak evidence, not proof
+
+```
+before 00837980   after 00837980   delta 0   (len 4796, 9 us)
+```
+
+Consistent with the engine not walking the buffer. **It is not proof of it.**
+Many DMA engines keep the *programmed* base in the register and walk an
+internal shadow pointer; "unchanged" is what a non-fetching counter and an
+ordinary base-preserving DMA both look like. An **advance** would have been
+proof; the absence of one is not, and saying otherwise would be the same
+over-claim this document has had to withdraw four times.
+
+So the tally on "does the DMA read memory":
+
+| test | outcome |
+|---|---|
+| source-speed comparison | **void** — the address field truncated flash to SRAM |
+| capture into a patterned buffer | **inconclusive** — RX never retires |
+| does TX_ADDR advance | **weak** — negative, but a base-preserving engine looks identical |
+
+It is genuinely unresolved.
+
+### The one detector left that assumes nothing about a register
+
+Every test so far has been undone by an assumption about a register: the source
+comparison by an address field that silently truncates, the capture test by a
+direction that never retires, the address test by engines that keep their base.
+
+**Bus contention** asks the bus instead. 4796 bytes in 9 µs is ~533 MB/s of
+SRAM traffic; a CPU loop reading SRAM at the same moment cannot help but slow if
+that traffic is real, and cannot be affected at all if the block is only
+counting a register down.
+
+| result | meaning |
+|---|---|
+| the loop slows during a transfer | the DMA really moves data, and the question is pacing after all |
+| the loop is identical | it never reaches memory, and the counter model stands on evidence that does not depend on any register's meaning |
+
+`examples/AudioFetch` phase `x`, using the longest descriptor the length field
+accepts (65532 bytes, ~123 µs) so the window comfortably covers the loop.
+
+### [!] The contention test was under-powered, and its own numbers said so
+
+```
+idle 1351 us   during transfer 1351 us   +0%
+```
+
+`identical` — but look at the two figures it prints. **The loop takes 1351 µs
+and the transfer lasts ~123 µs**, so the DMA was active for **9% of the
+measurement**. The sketch's threshold was +5%.
+
+| if contention stalled the CPU for | effect on the total |
+|---|---|
+| half the window | +4.6% — **below threshold** |
+| the whole window | +9.1% |
+| twice the window | +18% |
+
+So only a near-total CPU stall could have registered, and a realistic partial
+contention would have read as "identical". The result is not evidence of no
+traffic; it is a test with no power to see it.
+
+That is the same failure as the length sweep that never varied the length and
+the two-length pair that used one length twice: **the diagnostic was printed
+right beside the verdict and contradicted it.** 1351 against 123 is visible in
+the output. This is the third time the numbers needed to catch the error were
+already on screen.
+
+Rebuilt: the loop is now **sized to run inside the transfer window** — 400
+volatile word reads at the measured 141 ns each is ~56 µs against a 123 µs
+window — and the pair is repeated eight times so the comparison is between
+totals rather than single samples. Each rep also waits for the transfer to
+retire, so the log shows it really was in flight. The threshold drops to +2%,
+and a DMA saturating the bus across the loop would be a 50–100% effect: two
+orders of magnitude of headroom rather than none.
+
+### [!] The contention test was confounded by ordering — and the census gives a three-bit target
+
+```
+8 reps: idle 510 us   during transfer 459 us   -10%
+per rep: 63 us idle vs 57 us busy, in a ~123 us window
+```
+
+The loop is correctly sized now — 57–63 µs inside a 123 µs window. But the
+result is **not "identical"**: the busy half is **10% faster**, and a DMA cannot
+speed the CPU up. All eight idle reps ran first and all eight busy reps after,
+so that is warm-up, and any real contention smaller than the drift is buried
+under it.
+
+Fixed by interleaving: idle and busy alternate *within* each rep, and which
+goes first flips on alternate reps so residual drift cancels instead of
+accumulating into one column.
+
+### [M] Three bits, and that is the whole remaining space in TX_CTRL
+
+```
++0x108 TXctl  implemented FFFF0874
+```
+
+The low half is bits **2, 4, 5, 6 and 11**. The driver writes bit 4 (START) and
+`[31:16]` (the length). Bit 11 is the status seen holding `0x800` before any
+transfer. That leaves:
+
+> **bits 2, 5 and 6 — implemented, and written by nobody.** Not by this
+> framework, and not by the vendor.
+
+Eight combinations. After a year of "configured and not running", the entire
+unexplored space in the control register of the direction that does something
+is eight rows. `examples/AudioFetch` phase `t` walks them, scored on the retire
+time — the one observable never in doubt, where ~9 µs is the counter running
+down and a paced transfer would be 25 ms, three orders away.
+
+Each row clears the three bits again afterwards, so a row is the bits it names
+rather than the union of every row before it — the mistake the route sweep in
+this document made and had to redo.
+
+Also unwritten, for after that: `+0x000` bits [11:0] and [31:26], `+0x07C` and
+`+0x080`'s spare source fields, and most of `+0x200`/`+0x208`.
+
+## [M] The DMA does not touch the bus — a clean result at last
+
+```
+8 reps, interleaved: idle 509 us   during transfer 508 us   -1%
+per rep: 63 us idle vs 63 us busy, in a ~123 us window
+```
+
+Properly sized (the loop runs entirely inside the transfer), properly
+interleaved (drift cancels rather than accumulating), repeated eight times.
+**The CPU sees no bus traffic while a transfer is in flight.**
+
+4796 bytes in 9 µs would be ~533 MB/s of SRAM reads. A CPU loop reading the
+same SRAM alongside it cannot be unaffected by that. It is unaffected.
+
+This is the first properly controlled answer to the question the document has
+been circling: **the block counts the length register down and never reaches
+memory.** It agrees with TX_ADDR not advancing — which was weak evidence on its
+own — and it depends on no register's meaning, which every earlier attempt did
+and was undone by.
+
+The original conclusion, from long before this session, was right. What it
+lacked was a reason that held.
+
+### [!] And the `t` sweep measured nothing — its control row said so
+
+All eight rows returned 60000 µs, the timeout — **including the `---` row,
+which is no extra bits at all.** That row is the control, and a control that
+fails means the sweep measured nothing.
+
+The cause is visible in its own readback, `CTRL 12bc0810`: **bit 4 was already
+set** before START was written. `sl6806_mmio_set()` ORs, so with bit 4 already
+high there is no rising edge, the transfer never starts, it times out — and
+that leaves bit 4 set for the next row. Self-perpetuating. Phase `x` runs a
+65532-byte transfer immediately before, and `AudioLen` had already recorded
+length 32768 timing out while 64000 worked, so a stuck length near the top of
+the field is a known hazard here.
+
+Two fixes:
+
+1. **Clear START (and the three bits) before each row**, so every row gets a
+   real rising edge rather than an OR into an already-set bit.
+2. **The control row is now a gate.** If combo 0 times out the sweep abandons
+   itself and says the channel was wedged before it began.
+
+That is the fifth time a control existed and was not allowed to fail. It
+printed `<<< CHANGED` alongside the other seven rows, exactly like the
+`AudioFetch` baseline that printed `READS MEMORY` before anything was enabled.
+Writing the control is not the hard part; **letting it stop the run is.**
+
+### [!] The census undercounts — it cannot see a write-only bit
+
+The `t` control row, run first on a fresh boot, came back
+`CTRL 12bc0800` — **bit 4 clear**, so the rising-edge fix worked — and still
+timed out. The only remaining difference from `sl6806_audio_play()`, which
+retires in 9 µs every time:
+
+```
+play():  TX_TRIG = (3*len/4) << 16 | SL6806_AUD_TRIG_ARM     <- bit 0
+t row :  TX_TRIG = (3*len/4) << 16                            omitted
+```
+
+It was omitted because the census reported bit 0 unimplemented. **A census that
+writes a bit and reads it back cannot see a write-only or self-clearing bit:**
+it writes 1, reads 0, and calls it absent. A go/arm strobe behaves exactly like
+that.
+
+So bit 0 of `+0x104` is real and functional, the census mislabelled it, and the
+earlier note calling `SL6806_AUD_TRIG_ARM` "never did anything" is **wrong** —
+it is doing the arming, and removing it stops the transfer dead.
+
+Two consequences worth carrying:
+
+1. **"Bits 2, 5 and 6 are the whole search space" undercounts.** Any write-only
+   or self-clearing bit in any of those ten registers reads as absent. The
+   `implemented` masks are a lower bound, not an inventory.
+2. **Stop re-deriving a sequence that already works.** Both failed versions of
+   this row open-coded the submit and each broke it in a different place. The
+   row now clears the three bits, ORs the combination under test, and calls
+   `sl6806_audio_play()` for everything else — one variable, and the rest of
+   the path is the one that demonstrably retires.
+
+The bus-contention result reproduced twice more in the same session — `+0%`,
+63 µs against 64 µs — so that finding is unaffected and stands.
+
+## [M] CONCLUSION — the block counts a length down and never touches memory
+
+The `t` sweep ran clean at last: control row 9 µs, all eight combinations 9 µs,
+with the readbacks confirming the bits took (`…0804`, `…0820`, `…0840`,
+`…0864`). **TX_CTRL's three unwritten readable bits change nothing.**
+
+That closes the reachable search space. What has been tried, all with
+instruments whose controls were allowed to fail:
+
+| | |
+|---|---|
+| all 128 module ids, cumulative | nothing |
+| all 56 romclk ids, cumulative | nothing |
+| four output routes, three source modes | nothing |
+| all 32 bits of `0x400E0000` | nothing |
+| bit clock divider (8 settings) and its source bit 4 | nothing |
+| module 2 cycled, with the vendor's delays | nothing |
+| the audio PLL, and the vendor's wider clock chain | already correct / nothing |
+| START before the descriptor; a 16-byte primer; a primer per buffer | nothing |
+| TX_CTRL bits 2, 5, 6 — all eight combinations | nothing |
+| **bus contention, interleaved, four separate runs** | **no traffic** |
+
+The last row is the one that matters. 4796 bytes in 9 µs would be ~533 MB/s of
+SRAM reads, and a CPU loop reading the same SRAM inside the transfer window is
+completely unaffected — `+0%` and `-1%`, reproduced four times. It depends on no
+register's meaning, which is what undid every earlier attempt.
+
+**So: in every state reachable from a payload, `0x40009000` accepts a
+descriptor, counts its length register down at bus rate, raises its completion
+flag, and never reaches memory.** The original conclusion in this document was
+right; it now has a reason that holds.
+
+### What this does not say
+
+The census undercounts. A bit that is write-only or self-clearing reads back as
+zero and is reported absent — which is exactly how `TX_TRIG` bit 0, the arm
+strobe the whole path depends on, came to be listed as unimplemented. So
+"reachable search space" means *what can be found by writing and reading back*,
+not *all bits*. There may be a fetch enable that no read-back census can see.
+
+### The next move is not another sweep
+
+Blind search has now cost this document more retractions than results. The
+board runs vendor firmware that plays audio, and `examples/FirmBoot` already
+boots it. **Dump the audio block's registers while the stock firmware is
+actually playing**, and diff against the state this driver produces. That
+converts the question from "which of these bits might it be" to "here is
+exactly what differs", and this project already has the tooling for it —
+`tools/sl6806-dumpram` and the host read command in bootloader mode.
+
+Everything above is a reason to stop guessing, not a reason to guess harder.
+
+## Dumping from `examples/FirmBoot` — and why it has to leave by the UART
+
+The conclusion above asks for the audio block to be dumped **while the stock
+firmware is really playing**, then diffed against what this framework produces.
+That cannot be done over USB. `FirmBoot` hands the device to the application and
+does not come back: the application re-initialises the USB controller, so the
+console and the upload endpoint are gone the instant it jumps, and any code of
+ours went with them. There is no post-jump moment in which a payload can print.
+
+**But a channel does survive, and this project already found it.** §26 and §27
+identified `0x40091000` as a real UART on bank 1 pin 2, function 6, at
+1.5 Mbaud — it is where every `boot--->` line from the HLKJ bootloader comes
+out. The application is built from the same tree and carries the same `printf`:
+FIRM contains `-pwm1_event_callback`, `-brightness percent %d`, `sdio(i):…` and
+the rest. So a serial adapter on that pad sees the **product's own debug
+output, live, after the handover**.
+
+That makes the dump a two-part observation on one wire:
+
+| | |
+|---|---|
+| before the jump | this sketch prints the audio block and its clocks, so the "ours" half of the diff is in the same transcript |
+| after the jump | whatever the application says for itself, including anything it logs while playing |
+
+`FIRMBOOT_DUMP` (default on) brings the UART up in `setup()` and dumps twelve
+audio registers plus the PLL, the bit clock and the three `0x4009B000` ones
+**as the last thing before the handover** — so what is printed is the state the
+application is actually given, not the state eight seconds earlier. It is
+read-only apart from configuring the one pad, so it cannot change whether the
+application boots; it is switchable off anyway, because this file's convention
+is that anything touching hardware before the jump can be turned off.
+
+### What you need
+
+A 3.3 V USB-serial adapter: **RX to bank 1 pin 2, ground to ground, 1500000
+baud**. Nothing else changes. Without an adapter the dump still goes to the USB
+console and only the second half is lost.
+
+```sh
+make SKETCH=examples/FirmBoot RUN_MODE=poll run
+# in another terminal, during the 8-second countdown:
+picocom -b 1500000 /dev/ttyUSB0
+```
+
+The line `--- jumping. anything below this line is the application's own
+output ---` marks the handover in the serial transcript.
+
+### What this is worth
+
+It converts the remaining question from "which of these bits might it be" —
+which has cost this document more retractions than results — into "here is
+exactly what differs". If the application logs nothing useful, the register
+dump before the jump is still the reference half of the diff, and the UART is
+then known to be silent under the application, which is itself worth recording.
