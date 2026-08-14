@@ -1000,3 +1000,35 @@ timings rather than depending on `printf` for it.
 
 No sound, which is expected: nothing is paced, and the only thing that has ever
 been established about the output stage is that it is configured.
+
+### [M] `ToneDemo` second run — the instrument is sound, and two more clean negatives
+
+The two-length pair now differs, and the numbers validate against an
+independent measurement: a two-point slope of **540 B/µs** against
+`examples/AudioLen`'s eight-point fit of **519 B/µs**. Two sketches, two
+instruments, the same rate.
+
+The printed ratio is 3.6:1 for a 10:1 length ratio, and that is the fixed
+overhead rather than a fault — `AudioLen` measured a constant 1.4 µs term, and
+`480 × 0.00185 + 1.4 = 2.3` against a measured 3, `4796 × 0.00185 + 1.4 = 10.3`
+against a measured 11. The *slope* is what carries the result; the ratio is
+there so a pair that has collapsed to one length shows up as `1.0:1`.
+
+Two negatives, both taken with a working instrument and real variation applied:
+
+- **The bit clock divider is not the pacing.** All eight settings of
+  `0x40080094[10:8]` — divide by 1 through 8 — give 2270× real time. The
+  vendor's 8 is not special, and nor is anything else.
+- **Cycling module 2 off and on changes nothing.** The one difference between
+  the vendor's stream start and ours that had never been reproduced, now
+  reproduced, with no effect.
+
+Also worth recording: `TX ctrl +0x108` read `0xFA000910` on the previous run
+and `0x12BC0910` on this one. `0x12BC` is 4796, this sketch's length;
+`0xFA00` is 64000, which is `AudioLen`'s longest row and a sketch that had run
+earlier in the same power session. The length field simply holds whatever was
+last written, across payloads — a reminder that uploading does not reset this
+block either.
+
+**Phase `e` has still not been run.** It is the one the census pointed at, and
+it is the only untried item on the list.
