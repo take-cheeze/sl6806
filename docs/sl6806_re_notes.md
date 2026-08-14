@@ -5898,3 +5898,73 @@ be performed in place. The PLL is the first and the most likely to matter.
 The console at `0x40091000` is the second, and is already driven. What is
 left of `hardware_init` after those two is `0x00820DF8(24)`, `0x00820284`,
 and ROM `0x3BFC` — all still unread.
+
+## 30. [M] The PLL is already running at 192 MHz — and §25 mis-paired two ROM routines
+
+`examples/SdWithPll`, 2026-08-14:
+
+```
+before:  PLL status 0xD0010802   decoded 192 MHz   CMD0: no
+after:   PLL status 0xD0010802   decoded 192 MHz   NOT the 384 MHz asked for
+         CMD0 with the PLL up: no
+```
+
+Three results, and two of them correct earlier sections of this file.
+
+### The clock question is answered, and better than §25 answered it
+
+`0x40080000` reads `0xD0010802` in bootloader mode. Decoded by ROM `0x1FB8`'s
+own arithmetic: multiplier `[15:8]` = 8, divider `[3:0]` = 2, so
+**8 × 48 / 2 = 192 MHz**. Bit 28 is set, which §17 identified as a lock bit on
+the sibling register `0x40080008`.
+
+**192 / 3 = 64 MHz**, and the measured CPU clock is 64,000,071 Hz.
+
+§25 offered "384 is six times 64" as the first explanation F_CPU ever had.
+This is a better one: the PLL is *measured* at 192 MHz on a live device with
+its lock bit set, and the core divider is 3. The bootloader raising it to
+384 MHz would make that divider 6, which is consistent with both, but the
+number a payload actually runs on is 192.
+
+### §25's setter and readback are not the same clock — retracted
+
+§25 presents ROM `0x1F6C` (writes `0x40080010` and `0x40080014`) and ROM
+`0x1FB8` (reads `0x40080000`) as the setter and the readback of one PLL. They
+were paired **because they are adjacent in the ROM**, which is not evidence.
+
+The measurement says otherwise: `sl6806_pll_set_384()` performed `0x1F6C`'s
+two writes exactly and `0x40080000` did not move — same value before and
+after, to the bit. Either those writes drive a different PLL, or they did not
+take. Both are possible and neither is established.
+
+What survives from §25 is what was read rather than inferred: the decode at
+`0x1FB8` is real and now confirmed against hardware, the bootloader does ask
+for 384 MHz, and 24,576,000 is the audio clock's special case. What does not
+survive is "the PLL is at `+0x10`/`+0x14`" as a statement about *this*
+register. **This is the second time in this investigation that two ROM
+routines were paired by proximity and the pairing was wrong** — the first was
+§26's console descriptor, where it happened to be right.
+
+### And the PLL hypothesis for §23 is closed anyway
+
+The reason `SdWithPll` existed was that a payload had never started the PLL,
+and the SD command state machine might have nothing to shift bits on.
+
+**The PLL was already running.** It reads 192 MHz with its lock bit set,
+before any payload touches anything, and CMD0 fails in exactly the same way
+it always has. So "no PLL" was never the situation, and the hypothesis is
+closed regardless of the failed write — the experiment answered a question it
+was not designed to ask, which is the good kind of accident.
+
+That is **eight** SD hypotheses closed by measurement. What remains for the
+SD host is not a software experiment: it is an instrument on the socket, or
+`examples/FirmBoot` telling us whether the vendor's own application can read
+the card on this board.
+
+### What is still worth doing to the clock
+
+`0x40080000` is writable in principle, and changing its divider field from 2
+to 1 would ask for 384 MHz directly rather than through a routine that
+evidently drives something else. That doubles the core clock, which breaks
+every `delay()` in flight and may take USB with it — recoverable, but it
+should be its own sketch with its own countdown, not a line in an SD probe.

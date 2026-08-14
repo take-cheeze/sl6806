@@ -79,10 +79,11 @@ with a bracket of ±0.06% containing exactly one whole MHz. ~~The clock and
 reset unit at `0x40080000` holds dividers and gates, not a PLL multiplier, and
 nothing in the dump establishes the crystal~~ — **retracted (§25)**: it holds
 both. The PLL is at `+0x10`/`+0x14`, its rate reads back at `+0x00` as
-`(m × 48 / d)` MHz, and the bootloader's first init phase programs it to
-exactly 384,000,000 Hz — six times the measured figure. The 64 MHz still comes
-from timing the device against the host rather than from a register, because
-which divider reaches the core is not decoded yet.
+`(m × 48 / d)` MHz. **[M] 2026-08-14 it reads `0xD0010802` on a live device —
+m = 8, d = 2, so 192 MHz, with its lock bit set — and 192 / 3 is the measured
+64 MHz exactly** (§30). So the core divider is 3 and the clock is no longer
+purely a host-timing measurement; the bootloader separately asks for 384 MHz,
+which would make that divider 6.
 
 If you are bringing up a different unit, re-measure rather than assume — it is
 a single scale factor, and one measurement fixes every `delay()` and

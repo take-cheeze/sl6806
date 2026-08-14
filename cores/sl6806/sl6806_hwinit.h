@@ -59,7 +59,26 @@
 extern "C" {
 #endif
 
-/* [V] §25. The CRU's PLL, and where its rate reads back. */
+/*
+ * ⚠ [M] 2026-08-14: THE SETTER BELOW DOES NOT MOVE THE READBACK.
+ *
+ * §25 paired ROM 0x1F6C (which writes +0x10 and +0x14) with ROM 0x1FB8
+ * (which reads +0x00) as the setter and readback of one PLL, on the strength
+ * of their being adjacent in the ROM. examples/SdWithPll performed those two
+ * writes on hardware and `0x40080000` did not change by a single bit.
+ *
+ * So sl6806_pll_set_384() writes what the vendor writes and this project
+ * cannot yet say what it drives. sl6806_pll_hz() is unaffected and is
+ * confirmed: it read 192 MHz on a live device, with the lock bit set, and
+ * 192/3 is the measured 64 MHz core clock exactly.
+ *
+ * The register that plainly *does* carry this PLL's rate is +0x00 itself.
+ * Changing its divider field from 2 to 1 would ask for 384 MHz directly, and
+ * would double the core clock while doing it - which is a sketch with its own
+ * countdown, not a library call.
+ */
+
+/* [V] §25, §30. The CRU's PLL rate, and the registers the vendor writes. */
 #define SL6806_PLL_STATUS   0x40080000u   /* (m * 48 / d) MHz */
 #define SL6806_PLL_CTRL     0x40080010u
 #define SL6806_PLL_MUL      0x40080014u
