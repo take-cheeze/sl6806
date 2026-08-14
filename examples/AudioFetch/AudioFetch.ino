@@ -374,45 +374,66 @@ void loop()
          * window as wide as possible: 65532 bytes is ~123 us, comfortably
          * longer than the loop below.
          */
+        /*
+         * [!] THE FIRST VERSION OF THIS WAS UNDER-POWERED, and its numbers say
+         * so: the loop took 1351 us while the transfer lasts ~123 us, so the
+         * DMA was active for 9% of the measurement and a realistic partial
+         * contention would have sat below the 5% threshold and read as
+         * "identical". Only a near-total CPU stall could have registered.
+         *
+         * So the loop is now SHORTER than the transfer and runs entirely
+         * inside it - 400 volatile word reads at the measured 141 ns each is
+         * about 56 us, against a 123 us window - and the pair is repeated so
+         * the comparison is between medians rather than single samples.
+         */
         volatile uint32_t sink = 0;
-        unsigned long idle, busy;
-        unsigned i, k;
+        unsigned long idle = 0, busy = 0, t;
+        unsigned rep, i;
 
         Serial.println("\n--- bus contention: does a transfer slow the CPU?");
+        Serial.println("    loop is sized to run INSIDE the transfer window");
 
-        /* Calibrate: the same loop with nothing in flight. */
-        idle = micros();
-        for (k = 0; k < 8; k++)
-            for (i = 0; i < TESTLEN / 4; i++)
+        for (rep = 0; rep < 8; rep++) {
+            t = micros();
+            for (i = 0; i < 400u; i++)
                 sink += ((volatile uint32_t *)wave)[i];
-        idle = micros() - idle;
-
-        settle();
-
-        /* And again with the largest transfer the descriptor allows running
-         * underneath it. Started first so the window covers the loop. */
-        if (sl6806_audio_play(wave, 0xFFFCu) != 0) {
-            Serial.println("    play() refused 0xFFFC - not a measurement");
-            phase = -1;
-            break;
+            idle += micros() - t;
+            settle();
         }
-        busy = micros();
-        for (k = 0; k < 8; k++)
-            for (i = 0; i < TESTLEN / 4; i++)
-                sink += ((volatile uint32_t *)wave)[i];
-        busy = micros() - busy;
-        (void)sl6806_audio_done();
-        settle();
 
-        Serial.printf("    idle %6lu us   during transfer %6lu us   %+ld%%\n",
+        for (rep = 0; rep < 8; rep++) {
+            unsigned long us;
+
+            if (sl6806_audio_play(wave, 0xFFFCu) != 0) {
+                Serial.println("    play() refused 0xFFFC - not a measurement");
+                phase = -1;
+                break;
+            }
+            t = micros();
+            for (i = 0; i < 400u; i++)
+                sink += ((volatile uint32_t *)wave)[i];
+            busy += micros() - t;
+            /* Confirm the transfer really was in flight across the loop. */
+            us = 0;
+            while (us < 60000ul && !sl6806_audio_done())
+                us = micros() - t;
+            settle();
+        }
+        if (phase < 0)
+            break;
+
+        Serial.printf("    8 reps: idle %lu us   during transfer %lu us   %+ld%%\n",
                       idle, busy,
                       idle ? (long)((busy * 100ul) / idle) - 100l : 0l);
-        if (busy > idle + (idle / 20u) + 2u) {
+        Serial.printf("    per rep: %lu us idle vs %lu us busy, in a ~123 us window\n",
+                      idle / 8ul, busy / 8ul);
+        if (busy > idle + (idle / 50u) + 8u) {
             Serial.println("    SLOWED - the DMA is contending for the bus, so it");
             Serial.println("    really moves data and the question is pacing.");
         } else {
-            Serial.println("    identical - no bus traffic. The block counts the");
-            Serial.println("    length down and never reaches memory.");
+            Serial.println("    identical - no bus traffic across 8 reps with the");
+            Serial.println("    loop inside the window. The block counts the length");
+            Serial.println("    down and never reaches memory.");
         }
         phase = -1;
         break;

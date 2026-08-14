@@ -1648,3 +1648,37 @@ counting a register down.
 
 `examples/AudioFetch` phase `x`, using the longest descriptor the length field
 accepts (65532 bytes, ~123 µs) so the window comfortably covers the loop.
+
+### [!] The contention test was under-powered, and its own numbers said so
+
+```
+idle 1351 us   during transfer 1351 us   +0%
+```
+
+`identical` — but look at the two figures it prints. **The loop takes 1351 µs
+and the transfer lasts ~123 µs**, so the DMA was active for **9% of the
+measurement**. The sketch's threshold was +5%.
+
+| if contention stalled the CPU for | effect on the total |
+|---|---|
+| half the window | +4.6% — **below threshold** |
+| the whole window | +9.1% |
+| twice the window | +18% |
+
+So only a near-total CPU stall could have registered, and a realistic partial
+contention would have read as "identical". The result is not evidence of no
+traffic; it is a test with no power to see it.
+
+That is the same failure as the length sweep that never varied the length and
+the two-length pair that used one length twice: **the diagnostic was printed
+right beside the verdict and contradicted it.** 1351 against 123 is visible in
+the output. This is the third time the numbers needed to catch the error were
+already on screen.
+
+Rebuilt: the loop is now **sized to run inside the transfer window** — 400
+volatile word reads at the measured 141 ns each is ~56 µs against a 123 µs
+window — and the pair is repeated eight times so the comparison is between
+totals rather than single samples. Each rep also waits for the transfer to
+retire, so the log shows it really was in flight. The threshold drops to +2%,
+and a DMA saturating the bus across the loop would be a 50–100% effect: two
+orders of magnitude of headroom rather than none.
