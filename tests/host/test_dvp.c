@@ -210,6 +210,67 @@ static void test_writable(void)
           "a gated block that drops writes says no");
 }
 
+/*
+ * The bit-at-a-time trigger and the CTRL reader, both added after the first
+ * hardware run. That run showed the descriptor holds what it is given and
+ * the buffer never changes, which on its own cannot say whether the engine
+ * ever started - so these two exist to ask the register instead of the
+ * buffer. What is testable here is the guard and the plumbing; what the
+ * hardware does with the write is a bench question.
+ */
+static void test_ctrl_bits(void)
+{
+    void *buf = (void *)(uintptr_t)(SL6806_DVP_SRAM_BASE + 0x00040000u);
+    const uint32_t len = 256;
+
+    printf("the per-bit trigger, and CTRL read back\n");
+
+    reset_model();
+    CHECK(sl6806_dvp_capture_start_bits(buf, len, 1u << 1) == 0,
+          "a single writable CTRL bit is a valid trigger");
+    CHECK(ctrl == (1u << 1), "and only that bit reaches the register");
+    CHECK(len20 == len && addr != 0,
+          "the descriptor is still programmed the same way");
+
+    reset_model();
+    CHECK(sl6806_dvp_capture_start_bits(buf, len, 0) == -1,
+          "a zero trigger is refused - it would arm nothing");
+    CHECK(ctrl == 0 && addr == SL6806_DVP_SRAM_BASE && len20 == 0,
+          "and is refused before any register is touched");
+
+    reset_model();
+    CHECK(sl6806_dvp_capture_start_bits(buf, len, 1u << 2) == -1,
+          "a bit the census measured as not sticking is refused");
+    CHECK(sl6806_dvp_capture_start_bits(buf, len, 0x10u) == -1,
+          "so is anything above the writable mask");
+    CHECK(addr == SL6806_DVP_SRAM_BASE && len20 == 0,
+          "both refused before the descriptor is written");
+
+    /* The rejections must hold for the bit form too, or the guard could be
+     * bypassed by choosing a trigger. */
+    CHECK(sl6806_dvp_capture_start_bits(NULL, len, 1u) == -1,
+          "null is refused whichever trigger is asked for");
+    CHECK(sl6806_dvp_capture_start_bits((void *)0x10000000u, len, 1u) == -1,
+          "so is an address outside the SRAM window");
+
+    reset_model();
+    CHECK(sl6806_dvp_capture_start(buf, len) == 0,
+          "capture_start() still works");
+    CHECK(ctrl == SL6806_DVP_DMA_CTRL_MASK,
+          "and is exactly the all-bits case of the bit form");
+
+    /* Unmasked on purpose: a status bit the hardware sets on its own is the
+     * one thing this cluster could use to report progress, and masking the
+     * accessor to the writable bits would hide it. */
+    reset_model();
+    ctrl = 0x80u;
+    CHECK(sl6806_dvp_capture_ctrl() == 0x80u,
+          "capture_ctrl() reports bits outside the writable mask");
+    gated = 1;
+    CHECK(sl6806_dvp_capture_ctrl() == 0,
+          "and a gated block reads zero, like every other block here");
+}
+
 static void test_masks(void)
 {
     printf("the field masks, against DvpProbe's census\n");
@@ -235,6 +296,7 @@ int main(void)
     test_rejections();
     test_descriptor();
     test_writable();
+    test_ctrl_bits();
     test_masks();
 
     printf("%d checks, %d failures\n", checks, failures);

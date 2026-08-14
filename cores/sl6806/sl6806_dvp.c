@@ -29,7 +29,7 @@
 #define DVP_TEST_ADDR_OFS  0x00012340u
 #define DVP_TEST_LEN       0x00034560u
 
-int sl6806_dvp_capture_start(void *dst, uint32_t len)
+int sl6806_dvp_capture_start_bits(void *dst, uint32_t len, uint32_t ctrl)
 {
     uint32_t addr = (uint32_t)(uintptr_t)dst;
 
@@ -42,16 +42,25 @@ int sl6806_dvp_capture_start(void *dst, uint32_t len)
         return -1;
     if (len == 0 || (len & 3u) || len > SL6806_DVP_DMA_LEN_MASK)
         return -1;
+    /* A trigger outside the census's three writable bits would be a write
+     * to bits that were measured not to stick - refuse it rather than let a
+     * caller draw a conclusion from a word the block cannot hold. */
+    if (ctrl == 0 || (ctrl & ~(uint32_t)SL6806_DVP_DMA_CTRL_MASK))
+        return -1;
 
     sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_DMA_ADDR,
                       SL6806_DVP_SRAM_BASE
                           | (addr & SL6806_DVP_DMA_ADDR_MASK));
     sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_DMA_LEN20,
                       len & SL6806_DVP_DMA_LEN_MASK);
-    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_DMA_CTRL,
-                      SL6806_DVP_DMA_CTRL_START);
+    sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_DMA_CTRL, ctrl);
 
     return 0;
+}
+
+int sl6806_dvp_capture_start(void *dst, uint32_t len)
+{
+    return sl6806_dvp_capture_start_bits(dst, len, SL6806_DVP_DMA_CTRL_START);
 }
 
 void sl6806_dvp_capture_stop(void)
@@ -82,6 +91,15 @@ int sl6806_dvp_capture_writable(void)
     sl6806_mmio_write(SL6806_DVP_BASE + SL6806_DVP_DMA_LEN20, old_len);
 
     return ok ? 1 : 0;
+}
+
+uint32_t sl6806_dvp_capture_ctrl(void)
+{
+    /* Deliberately unmasked. SL6806_DVP_DMA_CTRL_MASK is the census's
+     * *writable* bits, and a status bit the hardware sets on its own is
+     * exactly what this accessor exists to catch - masking it here would
+     * hide the only thing in this cluster that could report progress. */
+    return sl6806_mmio_read(SL6806_DVP_BASE + SL6806_DVP_DMA_CTRL);
 }
 
 void *sl6806_dvp_capture_addr(void)

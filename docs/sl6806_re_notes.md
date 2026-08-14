@@ -1761,7 +1761,7 @@ it only runs once the block is streaming — and the sensor cannot stream
 without it, which would be a chicken-and-egg the vendor must break somewhere
 that has not been read yet.
 
-**WRITTEN, NOT YET RUN: a driver for this cluster.**
+**A driver for this cluster, and it has now run.**
 [`cores/sl6806/sl6806_dvp.c`](../cores/sl6806/sl6806_dvp.c) now programs
 `+0x38`/`+0x3C`/`+0x30` — address, length, then every writable `+0x30` bit as
 the start trigger, in that order, as its own three writes. That order is this
@@ -1784,10 +1784,56 @@ Two functions, two different claims:
   changed. `dvpCaptureProbe()` runs immediately after `dvpBringUp()`,
   independently of whether the sensor ever answers on I2C.
 
-31 host tests (`tests/host/test_dvp.c`) hold the driver to its own stated
+45 host tests (`tests/host/test_dvp.c`) hold the driver to its own stated
 contract — rejections before any register is touched, the write order, the
 masks matching the census table above — against a model of just these four
-registers. None of it has run on a P20 yet; that is the next hardware pass.
+registers.
+
+#### [M] The hardware pass, 2026-08-15 — and `+0x30` is not a latch
+
+Two results, and the second is the one worth having.
+
+**The descriptor registers take writes.** `sl6806_dvp_capture_writable()`
+returns 1 on a woken block: `ADDR` and `LEN20` hold a distinguishing test
+pattern and read it back. That was the first write this cluster had ever
+accepted.
+
+**The buffer never changed, and that proves very little.** Fill the
+destination, trigger, wait, count: 0 bytes of 256, every time, and `ADDR`
+never advanced and `LEN20` never counted down. This is *not* the audio DMA's
+clean negative, because the confound is fatal — the sensor on this board has
+never started and its outputs sit in Hi-Z (see below), so a capture engine has
+no pixels to write. An unchanged buffer cannot tell a dead engine from a live
+one that was handed nothing.
+
+**`+0x30` answers a question the buffer cannot**, and needs no pixel source to
+do it. The census that mapped this cluster wrote each bit and read it back in
+the same breath. Read the register again a millisecond later, with nothing
+else touching it, and bits have cleared themselves:
+
+| written | 1 ms later | | written | 1 ms later |
+|---|---|---|---|---|
+| `0x1` | `0x0` | | `0x9` | `0x9` |
+| `0x2` | `0x2` | | `0xA` | `0xA` |
+| `0x8` | `0x8` | | `0xB` | `0x9` |
+| `0x3` | `0x0` | | | |
+
+All seven combinations, 107 rounds, across a power cycle and two different
+destination buffers — 749 readings, zero variance. Two rules cover every row:
+
+- **bit 0 clears itself, unless bit 3 is set** — then it stays.
+- **bit 1 clears itself if bit 0 is set** — otherwise it stays.
+
+A bit that clears itself was cleared by hardware, and which bits clear depends
+on what the others hold. That is sequential logic behind `+0x30`, and it is
+the first thing established about this cluster that is not simply "the
+register accepts a write". It reads naturally as bit 0 being a one-shot *go*
+that the block consumes, bit 3 holding it set, and bit 1 a second command
+taken at the same moment — all [I]. The two rules are what was measured.
+
+`examples/DvpDma` is the sketch, kept separate from `CameraDemo` because that
+one ends by sweeping 56 clock enables and wedges USB, which allows one run per
+power cycle — no way to establish that anything reproduces.
 
 ### The sensor's outputs are high-impedance — the first reading here that discriminates
 
