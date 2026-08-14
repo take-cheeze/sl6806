@@ -6161,3 +6161,44 @@ early.
 This is the same class of error as §"the order is the operation" in
 `sl6806_module.h`, and the third time in this investigation that a correct
 step in the wrong place looked like the step being wrong.
+
+### [M] Both extra steps together stop it booting — so bisect them
+
+With the copy restored to its right place, `modules off` + `clock tree`
+still produced a device that did nothing. Three results now:
+
+| Steps | Result |
+|---|---|
+| neither | boots; the application's USB is unstable |
+| both | does not boot at all |
+
+That is two variables and one failure, which is not a finding. `FirmBoot` now
+takes them separately — `FIRMBOOT_MODULES_OFF` and `FIRMBOOT_CLOCK_TREE` —
+and **both default off**, because "boots badly" is a better default than
+"does not boot".
+
+```sh
+make SKETCH=examples/FirmBoot RUN_MODE=poll run EXTRA_FLAGS=-DFIRMBOOT_MODULES_OFF=1
+make SKETCH=examples/FirmBoot RUN_MODE=poll run EXTRA_FLAGS=-DFIRMBOOT_CLOCK_TREE=1
+```
+
+Whichever fails is the one that breaks it, and **that is worth more than
+either of them working**: it names a step the bootloader performs that a
+payload cannot survive, which is the shape of the entire remaining question
+about what bootloader mode withholds.
+
+Candidates for each, so the result can be read when it arrives:
+
+- **modules off** (ROM `0x3BFC`) switches off all ninety-six module clocks
+  and delays. The payload runs from SRAM and calls into the mask ROM, so both
+  of those must stay clocked through it — the bootloader survives the same
+  call, but the bootloader is not also holding a live USB connection.
+- **the clock tree** (`0x008206D0`'s routines) includes
+  `ROM 0x289C(3, 2)`, and §25 could not establish which clock id feeds the
+  core. A divider written to the id the CPU is executing on would stop the
+  chip at exactly this point, and it is the single most likely candidate in
+  the list.
+
+If it is the second, the fix is to skip the divider for whichever id that
+turns out to be — and identifying it would settle §25's remaining unknown as
+a side effect.

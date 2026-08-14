@@ -102,27 +102,46 @@ extern "C" {
 }
 
 /*
- * Whether to run the bootloader's clock sequence before handing over.
+ * ===================================================================
+ *  THE TWO EXTRA STEPS ARE SEPARATELY SELECTABLE, AND BOTH DEFAULT OFF
+ * ===================================================================
+ * [M] Three results so far:
  *
- * [M] 2026-08-14: without it the application starts - the panel and the loss
- * of the upload endpoint both confirm that - but **its USB comes up
- * unstable**, enough that `lsusb` could not be run against it. USB needs an
- * exact 48 MHz, and the application derives that assuming the bootloader has
- * already set the clock tree, which this did not.
+ *   neither step            boots, and the application's USB is unstable
+ *   both steps              does not boot at all
  *
- * So this now does, by calling the mask ROM's own routines
- * (sl6806_hwinit_clocks()). It also switches every module clock off first, which is what
- * hardware_init does before anything else (ROM 0x3BFC) and which is the
- * likeliest reason the application's USB was unstable: it expects a chip
- * whose peripherals are all off, and a payload hands it one where the boot
- * ROM's USB is enumerated and talking.
+ * "Does not boot" is a worse default than "boots badly", so both are off
+ * unless you ask for them. Turning them on one at a time is the experiment,
+ * and it takes two runs:
  *
- * Build with -DFIRMBOOT_CLOCKS=0 to go back to the behaviour that booted but
- * enumerated badly - worth having, because it is the known-working half of a
- * comparison.
+ *     make SKETCH=examples/FirmBoot RUN_MODE=poll run \
+ *          EXTRA_FLAGS=-DFIRMBOOT_MODULES_OFF=1
+ *
+ *     make SKETCH=examples/FirmBoot RUN_MODE=poll run \
+ *          EXTRA_FLAGS=-DFIRMBOOT_CLOCK_TREE=1
+ *
+ * Whichever of those fails to boot is the one that breaks it, and that is
+ * worth more than either of them working: it names a step the bootloader
+ * performs that a payload cannot survive, which is the shape of the whole
+ * remaining question about bootloader mode.
+ *
+ * **FIRMBOOT_MODULES_OFF** calls ROM 0x3BFC, the first thing hardware_init
+ * does: every module clock on the chip off, then a delay. The application
+ * expects a chip in that state and a payload hands it one where the boot
+ * ROM's USB is enumerated and talking, which is the likeliest reason for the
+ * unstable enumeration. Note that the copy above already happened, so flash
+ * going quiet no longer matters - that ordering cost one run.
+ *
+ * **FIRMBOOT_CLOCK_TREE** calls the ROM routines behind 0x008206D0: the
+ * source selects, the rate, two ROM-clock disables, two flash-host writes and
+ * the four dividers. Any of those could be what a payload cannot survive -
+ * the dividers change the core clock this code is executing on.
  */
-#ifndef FIRMBOOT_CLOCKS
-#define FIRMBOOT_CLOCKS 1
+#ifndef FIRMBOOT_MODULES_OFF
+#define FIRMBOOT_MODULES_OFF 0
+#endif
+#ifndef FIRMBOOT_CLOCK_TREE
+#define FIRMBOOT_CLOCK_TREE 0
 #endif
 
 /* Seconds of grace before the jump, so the console can be read and the run
@@ -207,10 +226,12 @@ void setup()
     Serial.print("  PLL now      ");
     Serial.print(sl6806_pll_hz() / 1000000u);
     Serial.println(" MHz");
-    Serial.print("  clock setup  ");
-    Serial.println(FIRMBOOT_CLOCKS
-                   ? "the bootloader's sequence, just before the jump"
-                   : "SKIPPED (-DFIRMBOOT_CLOCKS=0)");
+    Serial.print("  modules off  ");
+    Serial.println(FIRMBOOT_MODULES_OFF ? "yes (ROM 0x3BFC)"
+                                        : "no  (-DFIRMBOOT_MODULES_OFF=1)");
+    Serial.print("  clock tree   ");
+    Serial.println(FIRMBOOT_CLOCK_TREE ? "yes (0x008206D0's sequence)"
+                                       : "no  (-DFIRMBOOT_CLOCK_TREE=1)");
     Serial.println();
     Serial.println("--- what to watch after the jump ---");
     Serial.println("  the panel: the P20 interface means it booted");
@@ -270,14 +291,15 @@ void loop()
         }
     }
 
-#if FIRMBOOT_CLOCKS
     /*
-     * Now hardware_init's order, with flash no longer needed: every module
-     * clock off, then the clock tree. Both take the console with them - USB's
-     * module clock is among the ninety-six - which is why they come after the
-     * flush and immediately before the handover.
+     * hardware_init's order, with flash no longer needed. Both take the
+     * console with them - USB's module clock is among the ninety-six - which
+     * is why they come after the flush and immediately before the handover.
      */
+#if FIRMBOOT_MODULES_OFF
     sl6806_hwinit_modules_off();
+#endif
+#if FIRMBOOT_CLOCK_TREE
     sl6806_hwinit_clocks();
 #endif
 
