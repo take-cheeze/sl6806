@@ -1381,3 +1381,51 @@ buffer in case the primer arms a single fetch rather than the channel.
 The detector needs no judgement: 23040 bytes is 120 ms of audio, unpaced
 retires in ~43 µs, and a factor of **2791** is not something anyone has to
 squint at.
+
+### [M] The submit path is exhausted too — and the question moves earlier
+
+`examples/AudioPrime`: START before the descriptor, a 16-byte primer, and a
+primer before every buffer. **All 43–45 µs, all unpaced.** The descriptor was
+already bit-exact against the vendor's, so nothing in the submit path was ever
+the problem.
+
+The primer row is a useful consistency check rather than a null: 16 bytes
+retired in **1 µs**, against a model of `16 × 0.00185 + 1.4 = 1.43`. The
+counter model now holds at both ends of a **1440:1** length range, 16 bytes to
+23040.
+
+So the question is no longer what paces the DMA. **It is what lets the DMA
+reach the bus at all**, which is earlier than anything this document has been
+asking.
+
+### `examples/AudioFetch` — the walk that has never been run
+
+**The detector is the source-memory test, not the pacing one, and the choice is
+the point.** Pacing needs two things to be true: the engine must fetch *and*
+the DAC must consume at 48 kHz. Fetching needs only the first. So a source-speed
+difference appears the moment the bus master wakes, even with nothing
+downstream ready — strictly the more sensitive instrument, and the one that
+fails first.
+
+| | |
+|---|---|
+| SRAM and flash the same | still not reading |
+| flash slower than SRAM | **it is reading memory** |
+
+Signal to noise is about thirty: reading 4796 bytes over 32 MHz SPI is ≥300 µs
+even in quad mode, against ~10 µs not reading, and the logs show ±1 µs of
+scatter.
+
+§14a walked all 128 module ids once and got nothing — but it scored on CTRL
+bit 28 of the *PWM*, which is not a run flag, and §32 records that walk as void.
+**No walk has ever been run against the audio block with a working detector.**
+This is that walk, over both clock families.
+
+Ids are only ever switched **on**; `sl6806_module.h` records the disable
+direction as the dangerous one and the sketch never uses it. Each id is
+announced and the call returns before the write, so a hang names the id.
+
+The walk is cumulative on purpose — a combination that only works together is
+still reachable — which means a hit names the *last* id enabled, not
+necessarily the only one that mattered. Re-run from cold with just that one to
+confirm.
