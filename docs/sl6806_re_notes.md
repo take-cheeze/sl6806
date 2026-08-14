@@ -5620,3 +5620,54 @@ What is left is not another sketch. It is `MODE=firmware`, which removes the
 one structural difference between this driver and the bootloader that reads
 cards on this hardware — the bootloader runs as firmware, and the mask ROM
 never touches the SD host in bootloader mode — or an instrument on the socket.
+
+### The console's register map, decoded — ROM 0x23C and below
+
+§26 left the block at `0x40091000` identified and unusable: the data register
+and status bits were "behind ROM 0x0000023D". Following that pointer gives all
+of it, and it is four instructions of actual work.
+
+```
+ROM 0x23C  putchar(c):  if (c == '\n') put('\r'); put(c)
+ROM 0x224  -> ROM 0x1D0
+ROM 0x1D0  put(dev, c):  while (!(base[0x08] & 0x10)) ;  base[0x00] = c & 0x1FF
+ROM 0x1E2  get(dev, *p):  while (!(base[0x08] & 0x1F00)) ;  *p = base[0x00] & 0x1FF
+ROM 0x228  base[0x08] & 0x1F00      receive fill level
+ROM 0x232  base[0x08] & 0x001F      transmit fill level
+ROM 0x1F8  base[0x0C] |= bits       interrupt enables
+ROM 0x204  base[0x0C] &= ~bits
+```
+
+| Offset | What | Provenance |
+|---|---|---|
+| `+0x00` | data, **nine bits** each way | [V] the `0x1FF` mask is the ROM's |
+| `+0x04` | control: enable in the low bits, rate above | [V] `\|= 7` enables |
+| `+0x08` | status: bit 4 transmit-ready, [12:8] receive level, [4:0] transmit level | [V] both spin loops |
+| `+0x0C` | interrupt enables | [V] |
+| `+0x10`, `+0x14` | `\|= 0xB0` and `\|= 3` at bring-up | [V], meanings [?] |
+| `+0x20` | parity and stop bits | [I] from the init's cfg bytes |
+
+Nine bits rather than eight is the ROM's own mask, not a convenience — the
+data register is wider than a byte.
+
+`cores/sl6806/sl6806_uart.[ch]` is that, with the ROM's unbounded transmit
+wait bounded, and `examples/UartProbe` brings it up and sends a banner once a
+second. 28 host checks against a model of the block.
+
+**The rate is deliberately not programmed**, and the reason is a mistake worth
+recording. The first version of the driver put a divisor in CTRL's low twelve
+bits, reading `ubfx r3, r3, #0, #12` at ROM 0x13A as "extract the divisor
+field". It does the opposite: it **keeps** the low twelve bits and discards
+everything above, and the rate fields then go in at bits 12 and 16. The low
+bits are the enable — the very bits `CTRL |= 7` sets. A divisor written there
+would have produced a port that looked configured and was disabled, and on
+hardware that is indistinguishable from "the pin is not connected".
+
+The host test caught it because the two writes collided in the model. It is
+the fourth time in this investigation that a test written against a
+transcription has caught the transcription being wrong, and the first where
+the failure would otherwise have been silent on the bench.
+
+What is still unknown is the rate itself and the framing, and **where bank 1
+pin 2 comes out on this board** — which no software can answer, because a pad
+in function 6 is unreadable (§"the pad input buffer is off").

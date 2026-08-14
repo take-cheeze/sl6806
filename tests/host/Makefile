@@ -11,7 +11,7 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
 TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
-         test_regfile test_audio test_bt test_sd test_fat
+         test_regfile test_audio test_bt test_sd test_fat test_uart
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -47,6 +47,9 @@ run-test_sd: test_sd
 	./$<
 
 run-test_fat: test_fat
+	./$<
+
+run-test_uart: test_uart
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -115,6 +118,14 @@ test_sd: test_sd.c $(CORE)/sl6806_sd.c $(CORE)/sl6806_module.c \
 # it can be tested at all - the SD host has never completed a command.
 test_fat: test_fat.c $(CORE)/sl6806_fat.c
 	$(CC) $(CFLAGS) $^ -o $@
+
+# The serial port at 0x40091000 against a model of the block and its gates.
+# Nobody has seen a character out of it, so these check that the driver
+# performs the mask ROM's sequence: wait then write, bounded, nine bits, CR
+# expansion, and gates before registers.
+test_uart: test_uart.c $(CORE)/sl6806_uart.c $(CORE)/sl6806_module.c \
+           $(CORE)/sl6806_padctl.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:
 	rm -f $(TESTS) *.ppm
