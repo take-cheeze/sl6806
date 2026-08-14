@@ -1032,3 +1032,34 @@ block either.
 
 **Phase `e` has still not been run.** It is the one the census pointed at, and
 it is the only untried item on the list.
+
+### [!] `e` did nothing because it was never wired up
+
+The one experiment the census pointed at has still not run, and the reason is
+a two-character omission: the key dispatch read
+
+```c
+if (key == 'a' || key == 'b' || key == 'c' || key == 'd')
+```
+
+while the switch below it had grown a `case 'e':`. Pressing `e` therefore set
+no phase, printed nothing, and returned — **no output at all**, which is
+indistinguishable from a device that has stopped responding. A hardware round
+was spent discovering that the only untried item had silently not been tried.
+
+Fixed two ways, and the second is the general one:
+
+1. the dispatch is a range, `key >= 'a' && key <= 'e'`, so adding a case cannot
+   leave it behind;
+2. **every keypress now produces output** — the accepted key is echoed as
+   `[e]`, an unrecognised one says so, and the switch's `default:` reports a
+   phase with no implementation instead of falling through silently.
+
+A probe that can accept input and give no sign of it is a probe that can waste
+a bench session, and this one did. The same rule as the rejected rows and the
+constant columns: **the transcript must show what happened, including
+nothing.**
+
+The runs either side of it reproduce cleanly — baseline and all eight divider
+fields at 2270–2497× real time, module 2 unchanged — so the negatives above
+stand and only `e` is outstanding.

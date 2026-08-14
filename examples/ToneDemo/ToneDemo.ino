@@ -298,8 +298,26 @@ void loop()
     if (!up)
         return;
     if (key == 'q') { phase = -1; Serial.println("stopped."); return; }
-    if (key == 'a' || key == 'b' || key == 'c' || key == 'd') {
-        phase = key; step = 0;
+
+    /*
+     * [!] A KEYPRESS MUST ALWAYS PRODUCE OUTPUT.
+     *
+     * This was `key == 'a' || key == 'b' || key == 'c' || key == 'd'` while
+     * the switch below had grown a `case 'e'`. Pressing 'e' therefore did
+     * nothing at all - no phase, no message, no clue - and a whole hardware
+     * round was spent discovering that the one experiment that mattered had
+     * silently not run. A range and an echo, so that cannot recur: an
+     * unhandled key now says so instead of being swallowed.
+     */
+    if (key >= 0) {
+        if (key >= 'a' && key <= 'e') {
+            phase = key;
+            step = 0;
+            Serial.printf("\n[%c]\n", key);
+        } else if (key != '\r' && key != '\n') {
+            Serial.printf("unknown key '%c' - try a b c d e q\n", key);
+            return;
+        }
     }
     if (phase < 0)
         return;
@@ -404,6 +422,8 @@ void loop()
         break;
 
     default:
+        /* Reachable only if a phase key exists with no case. Say so. */
+        Serial.printf("phase '%c' has no implementation\n", phase);
         phase = -1;
         break;
     }
