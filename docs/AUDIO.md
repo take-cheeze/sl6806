@@ -1861,3 +1861,58 @@ exactly what differs", and this project already has the tooling for it —
 `tools/sl6806-dumpram` and the host read command in bootloader mode.
 
 Everything above is a reason to stop guessing, not a reason to guess harder.
+
+## Dumping from `examples/FirmBoot` — and why it has to leave by the UART
+
+The conclusion above asks for the audio block to be dumped **while the stock
+firmware is really playing**, then diffed against what this framework produces.
+That cannot be done over USB. `FirmBoot` hands the device to the application and
+does not come back: the application re-initialises the USB controller, so the
+console and the upload endpoint are gone the instant it jumps, and any code of
+ours went with them. There is no post-jump moment in which a payload can print.
+
+**But a channel does survive, and this project already found it.** §26 and §27
+identified `0x40091000` as a real UART on bank 1 pin 2, function 6, at
+1.5 Mbaud — it is where every `boot--->` line from the HLKJ bootloader comes
+out. The application is built from the same tree and carries the same `printf`:
+FIRM contains `-pwm1_event_callback`, `-brightness percent %d`, `sdio(i):…` and
+the rest. So a serial adapter on that pad sees the **product's own debug
+output, live, after the handover**.
+
+That makes the dump a two-part observation on one wire:
+
+| | |
+|---|---|
+| before the jump | this sketch prints the audio block and its clocks, so the "ours" half of the diff is in the same transcript |
+| after the jump | whatever the application says for itself, including anything it logs while playing |
+
+`FIRMBOOT_DUMP` (default on) brings the UART up in `setup()` and dumps twelve
+audio registers plus the PLL, the bit clock and the three `0x4009B000` ones
+**as the last thing before the handover** — so what is printed is the state the
+application is actually given, not the state eight seconds earlier. It is
+read-only apart from configuring the one pad, so it cannot change whether the
+application boots; it is switchable off anyway, because this file's convention
+is that anything touching hardware before the jump can be turned off.
+
+### What you need
+
+A 3.3 V USB-serial adapter: **RX to bank 1 pin 2, ground to ground, 1500000
+baud**. Nothing else changes. Without an adapter the dump still goes to the USB
+console and only the second half is lost.
+
+```sh
+make SKETCH=examples/FirmBoot RUN_MODE=poll run
+# in another terminal, during the 8-second countdown:
+picocom -b 1500000 /dev/ttyUSB0
+```
+
+The line `--- jumping. anything below this line is the application's own
+output ---` marks the handover in the serial transcript.
+
+### What this is worth
+
+It converts the remaining question from "which of these bits might it be" —
+which has cost this document more retractions than results — into "here is
+exactly what differs". If the application logs nothing useful, the register
+dump before the jump is still the reference half of the diff, and the UART is
+then known to be silent under the application, which is itself worth recording.
