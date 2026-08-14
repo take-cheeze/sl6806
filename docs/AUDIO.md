@@ -1510,3 +1510,35 @@ one.
 3. **A bus-master enable outside both clock families.**
 4. **A generate-rather-than-fetch mode**, in which the length is consumed
    without a source being read at all. That would fit every measurement taken.
+
+### [V] The descriptor-pointer hypothesis is ruled out, statically
+
+`+0x10C` might have been a descriptor-list pointer rather than a buffer
+pointer — a format that would look identical from outside and would explain a
+length counting down against nothing. It is not. There are four call sites of
+the TX submit `0x0080D9BC`:
+
+| site | buffer | length |
+|---|---|---|
+| `0x00D97A3C` | `state + 0x118` | 16 |
+| `0x00D99F62` | `[0x0082B42C] + 0x40` | 16 |
+| `0x0080FE4A` | `state + 0x40` | 16 |
+| **`0x00D99FBA`** | **ROM `0xC81C`(state→0x1C)** | **`[state + 0x38]`, a halfword** |
+
+Three pass a fixed 16, which is what made "16 = the descriptor size" tempting.
+The fourth does not: it takes a pointer from a queue accessor and a **variable
+byte length** out of driver state. A descriptor pointer does not come with a
+caller-supplied variable length, and a 16-byte descriptor would not be
+submitted with a length of 4796 from anywhere.
+
+So `+0x10C` is a buffer pointer and `TX_CTRL[31:16]` is a byte count, exactly
+as `sl6806_audio_play()` assumes. The three 16s are small fixed buffers — four
+stereo frames each, most plausibly silence — not descriptors.
+
+That leaves, of the four hypotheses:
+
+1. **the audio block's own unwritten bits** — `examples/AudioFetch` phase `c`,
+   never run;
+2. ~~the source address is a descriptor pointer~~ — ruled out here;
+3. a bus-master enable outside both clock families;
+4. a generate-rather-than-fetch mode, which still fits every measurement.
