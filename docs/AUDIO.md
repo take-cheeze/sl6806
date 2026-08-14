@@ -1774,3 +1774,38 @@ That is the fifth time a control existed and was not allowed to fail. It
 printed `<<< CHANGED` alongside the other seven rows, exactly like the
 `AudioFetch` baseline that printed `READS MEMORY` before anything was enabled.
 Writing the control is not the hard part; **letting it stop the run is.**
+
+### [!] The census undercounts — it cannot see a write-only bit
+
+The `t` control row, run first on a fresh boot, came back
+`CTRL 12bc0800` — **bit 4 clear**, so the rising-edge fix worked — and still
+timed out. The only remaining difference from `sl6806_audio_play()`, which
+retires in 9 µs every time:
+
+```
+play():  TX_TRIG = (3*len/4) << 16 | SL6806_AUD_TRIG_ARM     <- bit 0
+t row :  TX_TRIG = (3*len/4) << 16                            omitted
+```
+
+It was omitted because the census reported bit 0 unimplemented. **A census that
+writes a bit and reads it back cannot see a write-only or self-clearing bit:**
+it writes 1, reads 0, and calls it absent. A go/arm strobe behaves exactly like
+that.
+
+So bit 0 of `+0x104` is real and functional, the census mislabelled it, and the
+earlier note calling `SL6806_AUD_TRIG_ARM` "never did anything" is **wrong** —
+it is doing the arming, and removing it stops the transfer dead.
+
+Two consequences worth carrying:
+
+1. **"Bits 2, 5 and 6 are the whole search space" undercounts.** Any write-only
+   or self-clearing bit in any of those ten registers reads as absent. The
+   `implemented` masks are a lower bound, not an inventory.
+2. **Stop re-deriving a sequence that already works.** Both failed versions of
+   this row open-coded the submit and each broke it in a different place. The
+   row now clears the three bits, ORs the combination under test, and calls
+   `sl6806_audio_play()` for everything else — one variable, and the rest of
+   the path is the one that demonstrably retires.
+
+The bus-contention result reproduced twice more in the same session — `+0%`,
+63 µs against 64 µs — so that finding is unaffected and stands.

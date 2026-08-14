@@ -482,24 +482,29 @@ void loop()
             uint32_t back;
 
             /*
-             * [!] CLEAR START FIRST. sl6806_mmio_set() ORs, and if bit 4 is
-             * already set - which it is whenever the previous transfer timed
-             * out rather than retiring - the OR produces no rising edge, the
-             * transfer never starts, and it times out too. Self-perpetuating:
-             * the first version of this sweep inherited a stuck bit 4 from
-             * phase 'x' and reported all eight rows as 60000 us, control row
-             * included.
+             * [!] USE sl6806_audio_play() ITSELF for the descriptor and the
+             * start, and only vary the three bits around it.
+             *
+             * The first two versions of this row open-coded the submit and
+             * both failed. The first left START already set, so the OR gave no
+             * rising edge. The second cleared START correctly and STILL timed
+             * out - because it omitted TX_TRIG's bit 0, which the census had
+             * reported unimplemented.
+             *
+             * A census that writes a bit and reads it back CANNOT SEE a
+             * write-only or self-clearing bit: it writes 1, reads 0, and calls
+             * it absent. A go/arm strobe behaves exactly like that. So bit 0
+             * is real, the census mislabelled it, and the safe move is to stop
+             * re-deriving a sequence that already works and vary one thing.
              */
             sl6806_mmio_clr(SL6806_AUD_TX_CTRL,
                             SL6806_AUD_START | (1u << 2) | (1u << 5) | (1u << 6));
-            sl6806_mmio_write(SL6806_AUD_TX_ADDR, (uint32_t)(uintptr_t)wave);
-            sl6806_mmio_field(SL6806_AUD_TX_CTRL, SL6806_AUD_LEN_SHIFT, 16,
-                              TESTLEN);
             sl6806_mmio_set(SL6806_AUD_TX_CTRL, extra);
             back = sl6806_mmio_read(SL6806_AUD_TX_CTRL);
-            sl6806_mmio_write(SL6806_AUD_TX_TRIG,
-                              (((TESTLEN * 3u) / 4u) << SL6806_AUD_LEN_SHIFT));
-            sl6806_mmio_set(SL6806_AUD_TX_CTRL, SL6806_AUD_START);
+            if (sl6806_audio_play(wave, TESTLEN) != 0) {
+                Serial.println("    play() refused - not a measurement");
+                break;
+            }
 
             t = 0;
             us = micros();
