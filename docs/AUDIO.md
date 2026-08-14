@@ -1809,3 +1809,55 @@ Two consequences worth carrying:
 
 The bus-contention result reproduced twice more in the same session — `+0%`,
 63 µs against 64 µs — so that finding is unaffected and stands.
+
+## [M] CONCLUSION — the block counts a length down and never touches memory
+
+The `t` sweep ran clean at last: control row 9 µs, all eight combinations 9 µs,
+with the readbacks confirming the bits took (`…0804`, `…0820`, `…0840`,
+`…0864`). **TX_CTRL's three unwritten readable bits change nothing.**
+
+That closes the reachable search space. What has been tried, all with
+instruments whose controls were allowed to fail:
+
+| | |
+|---|---|
+| all 128 module ids, cumulative | nothing |
+| all 56 romclk ids, cumulative | nothing |
+| four output routes, three source modes | nothing |
+| all 32 bits of `0x400E0000` | nothing |
+| bit clock divider (8 settings) and its source bit 4 | nothing |
+| module 2 cycled, with the vendor's delays | nothing |
+| the audio PLL, and the vendor's wider clock chain | already correct / nothing |
+| START before the descriptor; a 16-byte primer; a primer per buffer | nothing |
+| TX_CTRL bits 2, 5, 6 — all eight combinations | nothing |
+| **bus contention, interleaved, four separate runs** | **no traffic** |
+
+The last row is the one that matters. 4796 bytes in 9 µs would be ~533 MB/s of
+SRAM reads, and a CPU loop reading the same SRAM inside the transfer window is
+completely unaffected — `+0%` and `-1%`, reproduced four times. It depends on no
+register's meaning, which is what undid every earlier attempt.
+
+**So: in every state reachable from a payload, `0x40009000` accepts a
+descriptor, counts its length register down at bus rate, raises its completion
+flag, and never reaches memory.** The original conclusion in this document was
+right; it now has a reason that holds.
+
+### What this does not say
+
+The census undercounts. A bit that is write-only or self-clearing reads back as
+zero and is reported absent — which is exactly how `TX_TRIG` bit 0, the arm
+strobe the whole path depends on, came to be listed as unimplemented. So
+"reachable search space" means *what can be found by writing and reading back*,
+not *all bits*. There may be a fetch enable that no read-back census can see.
+
+### The next move is not another sweep
+
+Blind search has now cost this document more retractions than results. The
+board runs vendor firmware that plays audio, and `examples/FirmBoot` already
+boots it. **Dump the audio block's registers while the stock firmware is
+actually playing**, and diff against the state this driver produces. That
+converts the question from "which of these bits might it be" to "here is
+exactly what differs", and this project already has the tooling for it —
+`tools/sl6806-dumpram` and the host read command in bootloader mode.
+
+Everything above is a reason to stop guessing, not a reason to guess harder.
