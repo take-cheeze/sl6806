@@ -6293,3 +6293,28 @@ Worth measuring for its own sake, and not yet done: which module clocks the
 boot ROM leaves running. `examples/ModulesOff` prints them before it does
 anything, so a takeover-mode run still cannot report them — but a poll-mode
 run that *only* dumps the registers, without the call, would.
+
+### Reading a takeover-mode run: the tooling's complaints are not results
+
+`RUN_MODE=takeover` uploads end with `unexpected status` from `smtlink_dump`,
+and `tools/sl6806-monitor` then reports that the device is not answering.
+**Both are correct and neither is a result.**
+
+In takeover mode `_start()` never returns to the boot ROM: it calls `setup()`
+and spins on `loop()`. So the ROM's run command never produces a completion
+status, and nothing afterwards services USB, which is what the monitor is
+asking. The same two messages appear whether the payload went on to do exactly
+what was intended or faulted on its first instruction.
+
+For `examples/FirmBoot` the observables are the device and the host's bus, and
+they separate the outcomes cleanly:
+
+| Observation | Meaning |
+|---|---|
+| panel shows the P20 interface | the application is running |
+| `lsusb -d 301a:2801` | and its USB enumerated - the card question can be asked |
+| `lsusb -d 301a:2800` | it fell back to the boot ROM, so something reset the chip |
+| neither, panel dark | it did not survive the jump |
+
+Worth stating because this session has twice read a tooling message as a
+hardware result, and once the other way round.

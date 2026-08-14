@@ -154,6 +154,20 @@ extern "C" {
  * There is no console in takeover mode, so nothing below prints. That is
  * acceptable here and only here: the observable was always the panel and the
  * host's USB bus, because the application takes the console regardless.
+ *
+ * [M] **Expect the upload to end with `unexpected status`, and the monitor to
+ * report that the device is not answering.** Both are correct. In takeover
+ * mode the payload seizes the CPU inside the ROM's run command, so that
+ * command never returns a completion status - `smtlink_dump` says so - and
+ * nothing afterwards services USB, so the monitor has nothing to talk to.
+ * Neither message says anything about whether the jump worked.
+ *
+ * The only observables are the device and the bus:
+ *
+ *     the panel showing the P20 interface   -> the application is running
+ *     lsusb -d 301a:2801                    -> and its USB came up
+ *     lsusb -d 301a:2800                    -> it fell back to the boot ROM
+ *     neither, panel dark                   -> it did not survive the jump
  */
 #if FIRMBOOT_MODULES_OFF && defined(SL6806_RUN_MODE) && SL6806_RUN_MODE == 2
 #error "FIRMBOOT_MODULES_OFF needs RUN_MODE=takeover; in poll mode loop() runs inside the USB handler this would switch off. See sl6806_hwinit.h."
