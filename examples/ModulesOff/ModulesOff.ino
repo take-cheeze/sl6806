@@ -24,7 +24,22 @@
  * Those need opposite fixes and this tells them apart, which four rounds of
  * reasoning about FirmBoot did not.
  *
- *     make SKETCH=examples/ModulesOff RUN_MODE=poll run
+ * [M] 2026-08-14, AND THE ANSWER TURNED OUT TO BE NEITHER OF THOSE. Run in
+ * RUN_MODE=poll this printed **nothing at all** - not even setup()'s banner -
+ * because in poll mode loop() executes inside the boot ROM's USB command
+ * handler (startup_payload.c). Switching off USB's module clock there stops
+ * the controller in the middle of the transaction that is running this code:
+ * the poll never completes, and the banner never appears because that poll's
+ * response was going to carry it.
+ *
+ * So the sketch below cannot answer its own question in the mode it needs a
+ * console for, and that is not a flaw in the question - it is the answer to
+ * why examples/FirmBoot failed with the same step. Use RUN_MODE=takeover,
+ * where loop() is spun from _start() with no USB in the control path; there
+ * is no console there either, so what this then measures is only whether the
+ * device is still alive afterwards, which the next upload attempt tells you.
+ *
+ *     make SKETCH=examples/ModulesOff RUN_MODE=takeover run
  *
  * ===================================================================
  *  HOW IT ASKS

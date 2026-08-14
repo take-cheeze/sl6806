@@ -185,10 +185,24 @@ uint32_t sl6806_hwinit_clocks(void);
  * controller that is already running is a good description of the unstable
  * enumeration measured twice.
  *
- * ⚠ **This takes the console with it, immediately and by design.** USB's
- * module clock is among the ninety-six. Call it only as the last thing before
- * sl6806_firm_boot(), after everything has been printed and flushed. There is
- * no way back except the jump or a power cycle.
+ * ⚠ **NEVER CALL THIS IN RUN_MODE=poll.** [M] 2026-08-14, and it cost three
+ * runs to see. In poll mode `loop()` executes *inside the boot ROM's USB
+ * command handler* - startup_payload.c's `payload_scsi_cb` calls it while
+ * servicing a console poll, before draining the ring. USB's module clock is
+ * one of the ninety-six this switches off, so calling it there stops the
+ * controller **in the middle of the transaction that is running your code**.
+ * The poll never completes, nothing is ever printed - not even output from
+ * setup(), because that poll's response was going to carry it - and the
+ * device looks dead when in fact it is exactly as alive as you left it.
+ *
+ * `RUN_MODE=takeover` is the mode for this: `_start()` calls setup() and then
+ * spins on loop() itself, with no USB in the control path. There is no
+ * console in that mode either, which is fine for the one use this has -
+ * handing the device to the application, which takes the console anyway.
+ *
+ * ⚠ It also takes the console with it by design, immediately. Call it as the
+ * last thing before sl6806_firm_enter(), after the copy - which needs flash,
+ * whose clock is also among the ninety-six.
  */
 void sl6806_hwinit_modules_off(void);
 

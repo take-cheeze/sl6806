@@ -140,6 +140,24 @@ extern "C" {
 #ifndef FIRMBOOT_MODULES_OFF
 #define FIRMBOOT_MODULES_OFF 0
 #endif
+
+/*
+ * [M] And it only works in RUN_MODE=takeover. In poll mode loop() runs inside
+ * the boot ROM's USB command handler, and switching off USB's module clock
+ * there stops the controller in the middle of the transaction executing this
+ * code - the device does nothing and prints nothing, which is what three runs
+ * looked like. sl6806_hwinit.h has the detail.
+ *
+ *     make SKETCH=examples/FirmBoot RUN_MODE=takeover run \
+ *          EXTRA_FLAGS="-DFIRMBOOT_MODULES_OFF=1 -DFIRMBOOT_CLOCK_TREE=1"
+ *
+ * There is no console in takeover mode, so nothing below prints. That is
+ * acceptable here and only here: the observable was always the panel and the
+ * host's USB bus, because the application takes the console regardless.
+ */
+#if FIRMBOOT_MODULES_OFF && defined(SL6806_RUN_MODE) && SL6806_RUN_MODE == 2
+#error "FIRMBOOT_MODULES_OFF needs RUN_MODE=takeover; in poll mode loop() runs inside the USB handler this would switch off. See sl6806_hwinit.h."
+#endif
 #ifndef FIRMBOOT_CLOCK_TREE
 #define FIRMBOOT_CLOCK_TREE 0
 #endif

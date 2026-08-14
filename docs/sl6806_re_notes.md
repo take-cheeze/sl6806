@@ -6240,3 +6240,56 @@ It also records something nobody has: **which module clocks the boot ROM
 leaves running in bootloader mode.** That set is the answer to "what does
 bootloader mode withhold" in its most literal form, and the ids in it are the
 candidates for whichever one is the flash controller.
+
+## 31. [M] In RUN_MODE=poll, loop() runs inside the USB handler — so it cannot switch USB off
+
+`examples/ModulesOff` in `RUN_MODE=poll` printed **nothing at all**. Not the
+result, not the register dump, not even `setup()`'s banner.
+
+That silence is the answer, and it explains three earlier runs.
+
+`cores/sl6806/startup_payload.c`, poll mode: `payload_scsi_cb()` handles the
+console-poll command by calling `run_loop_counted()` **and then** draining the
+ring. So `loop()` executes *inside the boot ROM's USB command handler*, in the
+middle of a transaction the host is waiting on.
+
+ROM `0x3BFC` switches off all ninety-six module clocks, and **USB's is one of
+them**. Calling it from `loop()` in poll mode stops the USB controller in the
+middle of the transaction that is running the code doing the stopping. The
+poll never completes; the host sees nothing; and `setup()`'s banner never
+appears either, because the response to that poll was what would have carried
+it. The device is not dead — it is exactly as alive as it was left, with no
+way to say so.
+
+So:
+
+- **`examples/FirmBoot` with `FIRMBOOT_MODULES_OFF=1` failed for this reason**,
+  not because the application starved of XIP flash. That remains a real
+  hazard and is why the copy now comes first, but it was not what was being
+  measured.
+- The right mode is **`RUN_MODE=takeover`**, where `_start()` calls `setup()`
+  and then spins on `loop()` directly with no USB in the control path. There
+  is no console there either, which is acceptable for exactly one use — handing
+  the device to the application, which takes the console regardless.
+
+`FirmBoot` now refuses to compile with `FIRMBOOT_MODULES_OFF=1` in poll mode,
+with the reason in the `#error`. A trap that costs three hardware runs to
+notice deserves to be unbuildable.
+
+```sh
+make SKETCH=examples/FirmBoot RUN_MODE=takeover run \
+     EXTRA_FLAGS="-DFIRMBOOT_MODULES_OFF=1 -DFIRMBOOT_CLOCK_TREE=1"
+```
+
+### The general rule this implies
+
+**Anything that disturbs USB must not run in poll mode.** That covers the
+module clocks, the USB controller itself, and any clock tree change that
+reaches them. Poll mode is the default for probes in this tree precisely
+because it is the mode that reliably drives `loop()` — and it is the one mode
+in which a probe cannot touch the machinery driving it.
+
+Worth measuring for its own sake, and not yet done: which module clocks the
+boot ROM leaves running. `examples/ModulesOff` prints them before it does
+anything, so a takeover-mode run still cannot report them — but a poll-mode
+run that *only* dumps the registers, without the call, would.
