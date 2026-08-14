@@ -1725,3 +1725,52 @@ this document made and had to redo.
 
 Also unwritten, for after that: `+0x000` bits [11:0] and [31:26], `+0x07C` and
 `+0x080`'s spare source fields, and most of `+0x200`/`+0x208`.
+
+## [M] The DMA does not touch the bus — a clean result at last
+
+```
+8 reps, interleaved: idle 509 us   during transfer 508 us   -1%
+per rep: 63 us idle vs 63 us busy, in a ~123 us window
+```
+
+Properly sized (the loop runs entirely inside the transfer), properly
+interleaved (drift cancels rather than accumulating), repeated eight times.
+**The CPU sees no bus traffic while a transfer is in flight.**
+
+4796 bytes in 9 µs would be ~533 MB/s of SRAM reads. A CPU loop reading the
+same SRAM alongside it cannot be unaffected by that. It is unaffected.
+
+This is the first properly controlled answer to the question the document has
+been circling: **the block counts the length register down and never reaches
+memory.** It agrees with TX_ADDR not advancing — which was weak evidence on its
+own — and it depends on no register's meaning, which every earlier attempt did
+and was undone by.
+
+The original conclusion, from long before this session, was right. What it
+lacked was a reason that held.
+
+### [!] And the `t` sweep measured nothing — its control row said so
+
+All eight rows returned 60000 µs, the timeout — **including the `---` row,
+which is no extra bits at all.** That row is the control, and a control that
+fails means the sweep measured nothing.
+
+The cause is visible in its own readback, `CTRL 12bc0810`: **bit 4 was already
+set** before START was written. `sl6806_mmio_set()` ORs, so with bit 4 already
+high there is no rising edge, the transfer never starts, it times out — and
+that leaves bit 4 set for the next row. Self-perpetuating. Phase `x` runs a
+65532-byte transfer immediately before, and `AudioLen` had already recorded
+length 32768 timing out while 64000 worked, so a stuck length near the top of
+the field is a known hazard here.
+
+Two fixes:
+
+1. **Clear START (and the three bits) before each row**, so every row gets a
+   real rising edge rather than an OR into an already-set bit.
+2. **The control row is now a gate.** If combo 0 times out the sweep abandons
+   itself and says the channel was wedged before it began.
+
+That is the fifth time a control existed and was not allowed to fail. It
+printed `<<< CHANGED` alongside the other seven rows, exactly like the
+`AudioFetch` baseline that printed `READS MEMORY` before anything was enabled.
+Writing the control is not the hard part; **letting it stop the run is.**

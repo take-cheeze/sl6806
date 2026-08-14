@@ -481,6 +481,17 @@ void loop()
             unsigned long us;
             uint32_t back;
 
+            /*
+             * [!] CLEAR START FIRST. sl6806_mmio_set() ORs, and if bit 4 is
+             * already set - which it is whenever the previous transfer timed
+             * out rather than retiring - the OR produces no rising edge, the
+             * transfer never starts, and it times out too. Self-perpetuating:
+             * the first version of this sweep inherited a stuck bit 4 from
+             * phase 'x' and reported all eight rows as 60000 us, control row
+             * included.
+             */
+            sl6806_mmio_clr(SL6806_AUD_TX_CTRL,
+                            SL6806_AUD_START | (1u << 2) | (1u << 5) | (1u << 6));
             sl6806_mmio_write(SL6806_AUD_TX_ADDR, (uint32_t)(uintptr_t)wave);
             sl6806_mmio_field(SL6806_AUD_TX_CTRL, SL6806_AUD_LEN_SHIFT, 16,
                               TESTLEN);
@@ -500,7 +511,22 @@ void loop()
                           (extra & (1u << 5)) ? "5" : "-",
                           (extra & (1u << 6)) ? "6" : "-",
                           (unsigned)back, t,
-                          (t > 100ul) ? "   <<< CHANGED" : "");
+                          (t >= 60000ul) ? "   TIMED OUT - not a measurement"
+                                         : (t > 100ul) ? "   <<< CHANGED" : "");
+            /*
+             * The control row is combo 0 - no extra bits - and it must retire
+             * in ~9 us like every other transfer in this document. If it does
+             * not, the channel is in a state this sweep did not create and no
+             * row below it means anything. The first version had this row and
+             * printed "<<< CHANGED" on it like all the others, which is a
+             * control that cannot contradict the result.
+             */
+            if (combo == 0u && t >= 60000ul) {
+                Serial.println("    [!] THE CONTROL ROW TIMED OUT. The channel is");
+                Serial.println("        wedged before the sweep began - power-cycle");
+                Serial.println("        and run 't' first. Sweep abandoned.");
+                break;
+            }
             /* Clear them again so each row is the bits it names, not the
              * union of every row before it - the mistake the route sweep in
              * this document made and had to redo. */
