@@ -5562,3 +5562,61 @@ flash host, plus the two above and the console at `0x40091000` from §26.
 `0x00820DF8(24)` and `0x00820284`, both in `hardware_init`; ROM `0x3BFC`,
 which it calls before either; and the console block's register map beyond
 `+0x10`/`+0x14`, which is behind ROM `0x0000023D`.
+
+### [M] The filesystem stack, end to end: it stops where predicted
+
+`examples/SdFiles`, 2026-08-14:
+
+```
+begin: 3 (no response)
+read:  3 (no response)
+```
+
+The second line is the only new datum, and it is small: the block read fails
+at the **command**, not the drain, so the FIFO wait is never reached. CMD17
+behaves exactly as CMD0 does. Nothing above the controller was ever going to
+run, and nothing did.
+
+What that leaves is worth stating plainly, because the shape of the problem
+has not changed in six runs: **everything above the command state machine is
+either working or tested.** The gates are right (writes go from dropped to
+sticking across them, measured on a fresh boot), the pads are the product's
+own six, the datapath is clocked (the FIFO fills and its flags move), and the
+filesystem layer reads real FAT16 and FAT32 volumes on the host. The
+controller accepts a command word, drops its busy bit inside 300 ns, and sets
+nothing.
+
+### One more hypothesis checked and closed: `0x400F7000 +0x60` / `+0xD8`
+
+The clock-tree routine (§25) writes `[0x400F7000 + 0x60] = 0` and
+`[+0xD8] &= ~2`, and a function at `0x00822310` writes `+0x60 = 1` next to
+pad code — which suggested a storage mux shared between the SPI flash host and
+the SD host, and therefore a route to the card that a payload never enables.
+
+It is not that.
+
+- `0x0082A06C` is the other `+0xD8` toucher, and it is flash: it reads the id
+  through the `+0x84`/`+0x88` accessors at `0x00822474`/`0x00822480` and its
+  three callers are all in the update path.
+- `0x00822310`, the one that writes `+0x60 = 1`, **has no callers** anywhere
+  in the image. Dead code.
+
+So both registers belong to the flash side of `0x400F7000`, and there is no
+mux. Recorded because it is a plausible idea that costs an hour to have twice.
+
+### The cheap software experiments are exhausted
+
+| Ruled out | By |
+|---|---|
+| a functional-clock bit in `0x400E0000` | `SdWall` — the register is seven bits wide, all seven tried |
+| the clock into the block | `SdClock` — 64 settings, found already enabled and undivided |
+| a CTRL enable the reset destroys | `SdCtrl` — every writable bit, before and after the reset |
+| the block being gated | `SdProbe` on a fresh boot — writes dropped cold, sticking after bring-up |
+| the core being stopped | `SdLife` — the FIFO fills and its flags move |
+| the wrong pad set | §24 — the bootloader's six are now what the driver configures |
+| a storage mux at `0x400F7000` | this section |
+
+What is left is not another sketch. It is `MODE=firmware`, which removes the
+one structural difference between this driver and the bootloader that reads
+cards on this hardware — the bootloader runs as firmware, and the mask ROM
+never touches the SD host in bootloader mode — or an instrument on the socket.
