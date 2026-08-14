@@ -5968,3 +5968,44 @@ to 1 would ask for 384 MHz directly rather than through a routine that
 evidently drives something else. That doubles the core clock, which breaks
 every `delay()` in flight and may take USB with it — recoverable, but it
 should be its own sketch with its own countdown, not a line in an SD probe.
+
+### [M] FirmBoot works: the stock application starts from a payload
+
+2026-08-14. `examples/FirmBoot` booted the vendor's firmware, which took USB
+with it and stopped sketch upload until a power cycle — which is precisely
+what success looks like, since the application re-enumerates as a card reader
+and the ROM's download endpoint goes away.
+
+Three things this establishes, none of which had been:
+
+- **The flash image is intact and startable from RAM.** The whole application
+  runs from a copy a payload made, with nothing written anywhere persistent
+  and a power cycle to undo it.
+- **§7m's load address is confirmed on hardware.** The header names an entry
+  and not a load address; the derivation is the entry less the 256-entry
+  vector table, `0x00804800`. §7m established that by counting which
+  candidate base put SRAM call targets on function prologues, and §28's parse
+  checked it against the image's own vector table before jumping. A wrong
+  derivation would have been a hard fault with USB already gone; instead the
+  product started.
+- **`MODE=firmware` has a rehearsal now.** The one thing in this tree that can
+  leave a device that does not boot can be approached by way of something that
+  cannot.
+
+**The SD question has not been asked yet.** The run that matters is the same
+one with a card in the slot, watching the host: if it enumerates `301a:2801`
+and the card mounts, then the socket, the card and the SD host all work under
+the vendor's firmware, and §23 stops being "is the block broken" and becomes
+"what does bootloader mode withhold" — a question with a finite answer.
+
+### And this raises the value of the serial port
+
+While the application runs there is no console, because USB belongs to it.
+But the application prints — every `boot--->`, `sdio(i):` and `hal_sd(i):`
+string in §"the bootloader inventoried" goes to the port at `0x40091000`, and
+FIRM brings that port up with the same routine (§26).
+
+So a wire on bank 1 pin 2 would let this project **watch the vendor's own SD
+driver run**: which commands it sends, what errorstate it reports, whether it
+mounts. That is a direct read on the question eight closed hypotheses have
+not settled, and it needs a meter, `examples/UartPin`, and one soldered wire.
