@@ -87,10 +87,21 @@ extern "C" {
 #define SL6806_UART_REG14       0x14u   /* |= 3 at bring-up, [?] */
 #define SL6806_UART_MODE        0x20u   /* [I] parity and stop bits */
 
-/* [V] STATUS bits, from the two spin loops. */
-#define SL6806_UART_TX_READY    0x00000010u   /* ROM 0x1D0 waits for this */
+/*
+ * [V] STATUS bits, from the two spin loops - and the transmit one is a
+ * five-bit FIELD, not a single bit.
+ *
+ * ROM 0x1D0 is `lsls r2, r2, #27` then `beq` back. That shifts bits [4:0]
+ * into the top of the word and branches while the result is zero, so the
+ * condition is `(status & 0x1F) != 0` - the whole transmit level, which
+ * ROM 0x232 also reads as a field. Reading `lsls #27` as "test bit 4" is
+ * wrong by four bits and was in this file for one hardware run: the port
+ * reported status 0x00000001, the ROM's condition would have passed, and
+ * every putc timed out waiting for a bit that never sets.
+ */
+#define SL6806_UART_TX_READY    0x0000001Fu   /* ROM 0x1D0: any of [4:0] */
 #define SL6806_UART_RX_LEVEL    0x00001F00u   /* ROM 0x1E2 / 0x228 */
-#define SL6806_UART_TX_LEVEL    0x0000001Fu   /* ROM 0x232 */
+#define SL6806_UART_TX_LEVEL    0x0000001Fu   /* ROM 0x232, the same field */
 
 /* [V] the two clock ids, and the pad. */
 #define SL6806_UART_MODULE_ID   73u

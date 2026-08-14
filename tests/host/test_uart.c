@@ -6,7 +6,13 @@
  * of which a plausible tidy-up would break in a way no host test would
  * otherwise catch:
  *
- *   1. **Wait, then write.** ROM 0x1D0 spins on status bit 4 and only then
+ *   0. **What "ready" means.** ROM 0x1D0's `lsls r2, r2, #27` tests the whole
+ *      five-bit transmit level, not bit 4. The driver had it as bit 4 for one
+ *      hardware run, the device reported status 0x01, and every putc timed
+ *      out. The model below returns 0x01 for a ready port, so a driver that
+ *      goes back to testing a single bit fails here instead of on a bench.
+ *
+ *   1. **Wait, then write.** ROM 0x1D0 spins on that field and only then
  *      stores the byte. Storing first and checking afterwards would drop
  *      characters on a port whose FIFO is full, which is every port under
  *      load, and would look fine on a model that is always ready.
@@ -75,7 +81,10 @@ uint32_t sl6806_mmio_read(uint32_t addr)
             return 0;
         if (i == SL6806_UART_STATUS / 4u) {
             waiting = 1;
-            return tx_ready ? SL6806_UART_TX_READY : 0u;
+            /* The device reported 0x01 here on hardware: a transmit level of
+             * one, in the field ROM 0x1D0 actually tests. A model that
+             * returned 0x10 would have agreed with the driver's bug. */
+            return tx_ready ? 0x00000001u : 0u;
         }
         return reg[i];
     }

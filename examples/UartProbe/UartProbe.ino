@@ -160,7 +160,15 @@ void loop()
             Serial.print("  IRQEN <- 0x2A reads ");
             printHex(got);
             Serial.println((got & 0x2Au) ? "   writes stick"
-                                         : "   DROPPED - still gated");
+                                         : "   this register does not hold");
+            /* Measured 2026-08-14: IRQEN does not hold, while CTRL, +0x10 and
+             * +0x14 all did in the dump above. So a nonce test on ONE
+             * register cannot say whether a block is gated - it says whether
+             * that register is writable. The dump is the real evidence, and
+             * the first version of this sketch printed "still gated" on the
+             * strength of the wrong one. */
+            Serial.println("  (a register that does not hold is not the same");
+            Serial.println("   as a gated block - compare the dump above)");
         }
 
         Serial.print("  transmit-ready bit: ");

@@ -14,7 +14,7 @@
 
 /*
  * How long to wait for transmit-ready. The ROM spins forever
- * (`while (!(base[8] & 0x10));` at 0x1D0), and on a port that is not
+ * (`while (!(base[8] & 0x1F));` at 0x1D0), and on a port that is not
  * configured that never returns - inside the boot ROM's USB handler, which
  * takes the device off the bus with nothing printed. A driver whose whole
  * purpose is to report things must not be able to hang.

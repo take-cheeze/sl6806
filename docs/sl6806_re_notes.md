@@ -5671,3 +5671,54 @@ the failure would otherwise have been silent on the bench.
 What is still unknown is the rate itself and the framing, and **where bank 1
 pin 2 comes out on this board** — which no software can answer, because a pad
 in function 6 is unreadable (§"the pad input buffer is off").
+
+### [M] The console block answers — and the driver was waiting on the wrong bits
+
+`examples/UartProbe`, 2026-08-14, first run:
+
+```
+as found:   module 73 disabled, ROM clock 22 disabled
+            CTRL 0x000D0000   STATUS 0x00000001   everything else zero
+after:      CTRL 0x000D0007   STATUS 0x00000101   +0x10 0xB0   +0x14 0x03
+            transmit-ready bit: clear - every putc will time out
+            *** received 0x000 ***
+```
+
+Four things, and only one of them is bad news.
+
+**The block is alive.** Every register the bring-up writes took its value —
+`CTRL`, `+0x10`, `+0x14` all changed and read back. The boot ROM does *not*
+bring this port up in bootloader mode (both clocks read disabled cold), so
+this is the payload's own bring-up working.
+
+**And it responded on its own.** After bring-up `STATUS` read `0x00000101` —
+bit 8 set, which is the bottom of the receive-level field — the probe's
+`getc()` returned a byte, and `STATUS` then went back to `0x00000001` with
+the level cleared. A block that produces a receive event and clears it when
+read is running, not merely accepting writes.
+
+**`CTRL` was `0x000D0000` before anything touched it.** Bits 16, 18 and 19,
+which is the region §"the console's register map" places the rate fields in —
+so a rate is configured even though the enable bits are not. That is
+consistent with the fields being at 12 and 16, and it is why this driver
+leaves them alone.
+
+**And the driver's transmit wait was wrong.** ROM `0x1D0` is
+`lsls r2, r2, #27` followed by `beq` back, which shifts bits `[4:0]` into the
+top of the word and loops while the result is zero — so the condition is
+`(status & 0x1F) != 0`, the whole five-bit transmit level that ROM `0x232`
+reads as a field. This file recorded it as "bit 4". The device reported
+`STATUS = 0x01`: the ROM's condition passes, and the driver's does not, so
+every `putc` timed out waiting for a bit that never sets.
+
+Fixed, and the host model now returns `0x01` for a ready port so the bug
+cannot come back silently. **`lsls #n` tests a field of n bits, not the one
+bit that lands in the sign position** — the third time in this investigation
+that a shift-and-branch has been read as a single-bit test, after §23's
+status decode and §25's PLL fields.
+
+One method note: the probe's nonce test wrote `0x2A` to `IRQEN`, read back
+zero, and printed "still gated" — while the dump three lines above showed
+three other registers holding their writes. **A nonce test on one register
+says whether that register is writable, not whether the block is gated.**
+The sketch now says so.
