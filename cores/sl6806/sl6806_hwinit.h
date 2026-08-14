@@ -134,6 +134,40 @@ int sl6806_pll_set_384(void);
  */
 uint32_t sl6806_pll_set_divider(unsigned d);
 
+/*
+ * The bootloader's whole clock sequence, performed by calling the mask ROM's
+ * own routines rather than transcribing them.
+ *
+ * This is `0x008206D0(2, 384000000, 32000000)` from hardware_init (§24),
+ * step for step:
+ *
+ *     [0x400F7000 + 0x60] = 0
+ *     ROM 0x2E5C(3, 10)   ROM 0x2E5C(6, 10)     clock source select
+ *     ROM 0x3A6C(2, 384000000)                  the rate
+ *     ROM 0x24C4(8)       ROM 0x24C4(9)         two ROM clocks off
+ *     [0x400F7000 + 0xD8] &= ~2
+ *     ROM 0x289C(3, 2)  (4, 1)  (5, 1)  (6, 12) the dividers
+ *
+ * **Calling the ROM rather than transcribing is a deliberate exception to how
+ * everything else in cores/ is written.** The rule exists because the ROM's
+ * polls are unbounded and a payload that hangs in one is off the bus with no
+ * log (sl6806_sd.h says this at length). None of these routines polls: they
+ * are dispatchers ending in a register write. And the reason to prefer the
+ * ROM here is that the transcription of one of them was already wrong once -
+ * §30 - so where the vendor's own code can be called, calling it removes a
+ * class of mistake rather than adding one.
+ *
+ * Returns the PLL rate afterwards, by sl6806_pll_hz(). It is worth printing:
+ * §30 measured that ROM 0x3A6C does **not** move that register, so if this
+ * returns the same 192 MHz it went in with, the vendor's 384 MHz is going
+ * somewhere this project has not found.
+ *
+ * ⚠ Intended to be called immediately before handing the device to the
+ * application (examples/FirmBoot). It changes clocks the boot ROM's USB may
+ * be using.
+ */
+uint32_t sl6806_hwinit_clocks(void);
+
 #ifdef __cplusplus
 }
 #endif

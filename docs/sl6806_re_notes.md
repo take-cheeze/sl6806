@@ -6009,3 +6009,39 @@ So a wire on bank 1 pin 2 would let this project **watch the vendor's own SD
 driver run**: which commands it sends, what errorstate it reports, whether it
 mounts. That is a direct read on the question eight closed hypotheses have
 not settled, and it needs a meter, `examples/UartPin`, and one soldered wire.
+
+### [M] FirmBoot's USB came up unstable — and the clock sequence is the difference
+
+The first `FirmBoot` run started the application: the panel came up and the
+upload endpoint went away, which is what success looks like. **But its USB was
+unstable enough that `lsusb` could not be run against it**, so the card
+question — the reason the sketch exists — is still unanswered.
+
+The obvious difference from the vendor's path is the clock tree. USB needs an
+exact 48 MHz; the application derives it assuming the bootloader has already
+run `hardware_init`, and `FirmBoot` jumped without doing any of it. A USB
+divider computed from the wrong PLL rate is exactly what unstable enumeration
+looks like.
+
+So `sl6806_hwinit_clocks()` now performs `0x008206D0`'s sequence — the source
+selects, the rate, the two ROM-clock disables, the flash-host writes and the
+four dividers — and `FirmBoot` calls it immediately before the jump.
+
+**It calls the mask ROM's routines rather than transcribing them**, which is a
+deliberate exception to how everything else in `cores/` is written. The rule
+against calling the ROM exists because its polls are unbounded and a payload
+that hangs in one is off the bus with no log; none of these four routines
+polls — they are dispatchers ending in a register write. And the reason to
+prefer the ROM here is §30: the transcription of one of these was already
+wrong once, so where the vendor's own code can be called, calling it removes a
+class of mistake instead of adding one.
+
+`-DFIRMBOOT_CLOCKS=0` restores the previous behaviour, which is worth keeping
+because it is the known-working half of a comparison: it boots, and its USB is
+bad.
+
+Worth printing and reporting either way: `sl6806_hwinit_clocks()` returns the
+PLL rate afterwards. §30 measured that ROM `0x3A6C` does **not** move
+`0x40080000`, so if it still reads 192 MHz after the vendor's own sequence,
+the 384 MHz the bootloader asks for is going somewhere this project has not
+found — which would be worth more than the boot.

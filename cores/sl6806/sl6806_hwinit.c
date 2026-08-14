@@ -57,3 +57,53 @@ uint32_t sl6806_pll_set_divider(unsigned d)
 
     return sl6806_pll_hz();
 }
+
+/* ------------------------------------------------------------------ */
+/* The vendor's clock sequence, by calling the ROM                     */
+/* ------------------------------------------------------------------ */
+
+/*
+ * [V] Mask ROM entry points, from §24 and §25. Thumb, so the low bit is set.
+ *
+ *   0x2E5C  clock source select (id, selector)
+ *   0x3A6C  set a clock's rate   (id, hz)
+ *   0x24C4  ROM clock disable    (id)
+ *   0x289C  set a divider        (id, value)
+ */
+typedef void (*rom_2_t)(uint32_t, uint32_t);
+typedef void (*rom_1_t)(uint32_t);
+
+#define ROM_SRC_SELECT  ((rom_2_t)0x00002E5Du)
+#define ROM_SET_RATE    ((rom_2_t)0x00003A6Du)
+#define ROM_CLK_DISABLE ((rom_1_t)0x000024C5u)
+#define ROM_SET_DIVIDER ((rom_2_t)0x0000289Du)
+
+#define FLASH_HOST 0x400F7000u
+
+uint32_t sl6806_hwinit_clocks(void)
+{
+    /* Every line is 0x008206D0's, in its order. The two flash-host writes
+     * bracket the rest there and are kept where they are: §27 established
+     * that +0x60 and +0xD8 belong to the flash side of that block, so this
+     * is the vendor touching its own storage controller around a clock
+     * change, and reordering it would be inventing a reason. */
+    sl6806_mmio_write(FLASH_HOST + 0x60u, 0);
+
+    ROM_SRC_SELECT(3u, 10u);
+    ROM_SRC_SELECT(6u, 10u);
+
+    ROM_SET_RATE(2u, SL6806_PLL_TARGET_HZ);
+
+    ROM_CLK_DISABLE(8u);
+    ROM_CLK_DISABLE(9u);
+
+    sl6806_mmio_write(FLASH_HOST + 0xD8u,
+                      sl6806_mmio_read(FLASH_HOST + 0xD8u) & ~2u);
+
+    ROM_SET_DIVIDER(3u, 2u);
+    ROM_SET_DIVIDER(4u, 1u);
+    ROM_SET_DIVIDER(5u, 1u);
+    ROM_SET_DIVIDER(6u, SL6806_PLL_TARGET_HZ / 32000000u);   /* 12 */
+
+    return sl6806_pll_hz();
+}

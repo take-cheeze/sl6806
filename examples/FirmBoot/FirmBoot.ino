@@ -43,9 +43,14 @@
  *     becomes "what does bootloader mode withhold", which is a much better
  *     question because it has a finite answer.
  *   - **Nothing happens.** The application needs something the bootloader's
- *     hardware_init does that this does not - the PLL at 384 MHz is the
- *     first candidate (notes §25) - and the next version of this sketch does
- *     that first.
+ *     hardware_init does that this does not.
+ *
+ * [M] 2026-08-14, the first run: **it booted.** The panel and the loss of the
+ * upload endpoint both said so, which also confirms §7m's load address on
+ * hardware. But the application's USB came up unstable - unstable enough that
+ * `lsusb` could not be run against it - so the card question is still open,
+ * and this sketch now runs the bootloader's clock sequence before handing
+ * over. See FIRMBOOT_CLOCKS below.
  *
  * ===================================================================
  *  WHAT IT CHECKS BEFORE JUMPING
@@ -67,7 +72,26 @@
 
 extern "C" {
 #include "sl6806_firm.h"
+#include "sl6806_hwinit.h"
 }
+
+/*
+ * Whether to run the bootloader's clock sequence before handing over.
+ *
+ * [M] 2026-08-14: without it the application starts - the panel and the loss
+ * of the upload endpoint both confirm that - but **its USB comes up
+ * unstable**, enough that `lsusb` could not be run against it. USB needs an
+ * exact 48 MHz, and the application derives that assuming the bootloader has
+ * already set the clock tree, which this did not.
+ *
+ * So this now does, by calling the mask ROM's own routines
+ * (sl6806_hwinit_clocks()). Build with -DFIRMBOOT_CLOCKS=0 to go back to the
+ * behaviour that booted but enumerated badly - worth having, because it is
+ * the known-working half of a comparison.
+ */
+#ifndef FIRMBOOT_CLOCKS
+#define FIRMBOOT_CLOCKS 1
+#endif
 
 /* Seconds of grace before the jump, so the console can be read and the run
  * abandoned by unplugging. */
@@ -148,6 +172,14 @@ void setup()
     Serial.println("  address is right - see the sketch header for why that");
     Serial.println("  is the thing worth checking.");
     Serial.println();
+    Serial.print("  PLL now      ");
+    Serial.print(sl6806_pll_hz() / 1000000u);
+    Serial.println(" MHz");
+    Serial.print("  clock setup  ");
+    Serial.println(FIRMBOOT_CLOCKS
+                   ? "the bootloader's sequence, just before the jump"
+                   : "SKIPPED (-DFIRMBOOT_CLOCKS=0)");
+    Serial.println();
     Serial.println("--- what to watch after the jump ---");
     Serial.println("  the panel: the P20 interface means it booted");
     Serial.println("  the host:  301a:2801 mass storage means the card works");
@@ -184,6 +216,16 @@ void loop()
 
     /* Give the host one more poll to collect that before USB disappears. */
     delay(50);
+
+#if FIRMBOOT_CLOCKS
+    /*
+     * Last thing before the handover, and deliberately after the flush: this
+     * changes clocks the boot ROM's USB may be running on, so anything not
+     * already collected is lost either way. The application is about to
+     * reconfigure all of it regardless.
+     */
+    sl6806_hwinit_clocks();
+#endif
 
     sl6806_firm_boot(&firm);
 
