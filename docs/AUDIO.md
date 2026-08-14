@@ -880,3 +880,395 @@ rate, and three things are worth trying in order:
 
 The length sweep is now the standing instrument for all three: real time is
 1×, and anything that introduces pacing moves the slope by a factor of 2667.
+
+### [!] Correction to the section above — the audio PLL was already ours
+
+Two claims in the preceding section overstate what was new, and the mistake is
+the one this project keeps making: publishing a novelty claim without grepping
+for the thing first.
+
+**The audio PLL registers were already decoded here.** `sl6806_audio.h` has
+carried `SL6806_AUD_PLL_SEL` (`0x40080010`) and `SL6806_AUD_PLL_RATIO`
+(`0x40080014`) with the identical `KEEP`/`SET` masks, the identical
+`ratio << 14` placement, and the `rate % 8000` family selection, for as long as
+this document has existed. `0x00807300` is the routine those constants were
+read out of. Calling it "a second PLL, distinct from the `0x40080008` one" is
+right; implying it was newly found is not.
+
+**And `sl6806_audio_begin()` already writes it.** `audio_pll_set()` is called
+from line 179 of `sl6806_audio.c`. So when `examples/AudioPll` reported the
+PLL "already programmed for exactly 24.576 MHz", what it had actually
+confirmed is that **the driver's own write, performed seconds earlier in
+`setup()`, landed correctly**. That is a useful result — `audio_pll_set()`
+demonstrably works, and the `0x8C498C00` readback validates the whole
+`KEEP`/`SET`/shift decode against hardware — but it is not evidence about how
+the chip comes up, and the section above reads as though it were.
+
+One further detail the comparison turned up: the driver's busy loop is bounded
+and then **writes anyway**, while the probe's returned early on timeout. The
+driver's behaviour is why the register holds a correct value at all; had the
+probe's early return been the driver's, the PLL would never have been set.
+
+**What is genuinely new from the XIP read stands:** `romclk_enable(0)`,
+`module_enable(87)`, `romclk_enable(31)` (a ROM no-op), `romclk_enable(56)`,
+and the three registers in `0x4009B000` — that block really is unnamed
+anywhere in this tree, and none of that chain is performed by
+`sl6806_audio_begin()`. So does the negative: applying all of it, with
+readback confirming each step, moved the length sweep not at all.
+
+## `examples/ToneDemo`, rewritten around what is left
+
+The old sketch re-ran twelve route/source combinations against a single
+descriptor length and reported a mean. That is the measurement whose constant
+10 µs was mistaken for a negative, and re-running it would only reproduce the
+mistake — so the sketch now goes after the parts of the pacing path that have
+never been examined, with an instrument that cannot report a constant where a
+slope belongs.
+
+**A — state, and a census of the pacing path.** One bit at a time, restored
+after each, on `0x40080094` and on the three `0x4009B000` registers the vendor
+writes. All-ones in a single write would be quicker and is exactly how the
+PWM's pair register came to be recorded as `0x10F` for a year when it is
+`0x1FF`: the probe wrote `0x3F0F`, which does not set bits [7:4] at all. Any
+implemented bit outside what the driver writes is a field nobody has tried.
+
+**B — pacing, measured at two lengths.** A single length cannot separate "the
+DMA is unpaced" from "the DMA is not running" — both give a small constant.
+Two can: unpaced is bus speed, paced is 192 KB/s, and the two differ by 2667×.
+Reported as bytes/µs and as a multiple of real time so the comparison needs no
+arithmetic from the reader.
+
+**C — the bit clock divider.** `sl6806_audio.c` writes `DIV - 1 = 7` into
+`0x40080094[10:8]`, so the vendor's divide-by-8 is field 7 and fields 0..6 —
+divide by 1 through 7 — have never been tried. The justification for 8 is that
+24.576 MHz / 8 is 64 fs for 32-bit stereo frames, which assumes a frame size
+nothing has confirmed.
+
+**D — module 2 cycled off and on**, which is the one difference between the
+vendor's stream start and ours that has never been reproduced. It only ever
+switches off an id it immediately switches back on; `sl6806_module.h` records
+that the disable direction is the dangerous one.
+
+The sine still plays throughout, so a success is audible before it is
+readable — but **the ratio is the result**. Five rounds of the PWM work were
+lost to trusting an impression over a number, and one of them to a panel that
+was blinking rather than dimming.
+
+### [M] `ToneDemo` first run — the census earned its keep, phases B–D did not
+
+**The census found the thing it was built to find.**
+
+| Register | implemented | holds | implemented but **never written** |
+|---|---|---|---|
+| `0x40080094` bit clock | `0x00000711` | `0x00000701` | **bit 4** |
+| `0x4009B040` | `0x80000039` | `0x80000001` | bits 3, 4, 5 |
+| `0x4009B04C` | `0x3FFFFFFF` | `0x0E900000` | 25 bits |
+| `0x4009B050` | `0x000000FF` | `0x0000001B` | bits 2, 5, 6, 7 |
+
+`0x40080094` implements bit 0 (enable), bits [10:8] (divider) and **bit 4**,
+and nothing in this tree or in the vendor's code has ever written bit 4.
+
+Put that next to the PWM's clock register. `0x400800F4` is bit 0 = enable,
+**bit 4 = source select** — and on the PWM, setting bit 4 swaps a 24 MHz source
+for a 25 kHz one. Same CRU, same family, same bit position, same role for
+bit 0. If `0x40080094` follows the family then **bit 4 selects what feeds the
+bit clock**, and a bit clock fed from nothing is precisely a DMA that drains
+without being paced. `ToneDemo` phase `e` tries it both ways.
+
+**Phases B, C and D measured nothing.** `pace()` used `small = 4796` and
+`big = sizeof(wave)` — and `sizeof(wave)` *is* 4796, because `FRAMES` is
+`PERIOD * 11` = 1199 frames = 4796 bytes. It timed the same length twice. So
+the divider sweep and the module-2 cycle each compared one length against
+itself, and neither says anything about pacing.
+
+That is the third instrument of this kind in this investigation, after the
+`PwmMode` sweep that measured inside the settling window and the `AudioLen`
+rows that were all rejected on alignment. The fix is the same shape as before:
+the two lengths are now 480 and 4796 from the same buffer, the ratio is printed
+so a broken pair is visible as `1.0:1`, and the long row is deliberately not
+made bigger — at real time 4796 bytes is 25 ms, inside the 60 ms poll bound,
+whereas a 10× buffer would be 250 ms and would read as a timeout on the very
+run where pacing finally worked.
+
+**And one real observation fell out of the bug.** Two descriptors submitted
+back to back with nothing between them: the first completed in 10–11 µs and
+**the second timed out at 60 ms, on all ten rows**. `examples/AudioLen`, which
+prints between transfers, never saw it. That is either a genuine re-arm
+requirement between descriptors or an artifact of the gap — worth knowing
+either way, so `pace()` now puts an explicit 2 ms settle between the two
+timings rather than depending on `printf` for it.
+
+No sound, which is expected: nothing is paced, and the only thing that has ever
+been established about the output stage is that it is configured.
+
+### [M] `ToneDemo` second run — the instrument is sound, and two more clean negatives
+
+The two-length pair now differs, and the numbers validate against an
+independent measurement: a two-point slope of **540 B/µs** against
+`examples/AudioLen`'s eight-point fit of **519 B/µs**. Two sketches, two
+instruments, the same rate.
+
+The printed ratio is 3.6:1 for a 10:1 length ratio, and that is the fixed
+overhead rather than a fault — `AudioLen` measured a constant 1.4 µs term, and
+`480 × 0.00185 + 1.4 = 2.3` against a measured 3, `4796 × 0.00185 + 1.4 = 10.3`
+against a measured 11. The *slope* is what carries the result; the ratio is
+there so a pair that has collapsed to one length shows up as `1.0:1`.
+
+Two negatives, both taken with a working instrument and real variation applied:
+
+- **The bit clock divider is not the pacing.** All eight settings of
+  `0x40080094[10:8]` — divide by 1 through 8 — give 2270× real time. The
+  vendor's 8 is not special, and nor is anything else.
+- **Cycling module 2 off and on changes nothing.** The one difference between
+  the vendor's stream start and ours that had never been reproduced, now
+  reproduced, with no effect.
+
+Also worth recording: `TX ctrl +0x108` read `0xFA000910` on the previous run
+and `0x12BC0910` on this one. `0x12BC` is 4796, this sketch's length;
+`0xFA00` is 64000, which is `AudioLen`'s longest row and a sketch that had run
+earlier in the same power session. The length field simply holds whatever was
+last written, across payloads — a reminder that uploading does not reset this
+block either.
+
+**Phase `e` has still not been run.** It is the one the census pointed at, and
+it is the only untried item on the list.
+
+### [!] `e` did nothing because it was never wired up
+
+The one experiment the census pointed at has still not run, and the reason is
+a two-character omission: the key dispatch read
+
+```c
+if (key == 'a' || key == 'b' || key == 'c' || key == 'd')
+```
+
+while the switch below it had grown a `case 'e':`. Pressing `e` therefore set
+no phase, printed nothing, and returned — **no output at all**, which is
+indistinguishable from a device that has stopped responding. A hardware round
+was spent discovering that the only untried item had silently not been tried.
+
+Fixed two ways, and the second is the general one:
+
+1. the dispatch is a range, `key >= 'a' && key <= 'e'`, so adding a case cannot
+   leave it behind;
+2. **every keypress now produces output** — the accepted key is echoed as
+   `[e]`, an unrecognised one says so, and the switch's `default:` reports a
+   phase with no implementation instead of falling through silently.
+
+A probe that can accept input and give no sign of it is a probe that can waste
+a bench session, and this one did. The same rule as the rejected rows and the
+constant columns: **the transcript must show what happened, including
+nothing.**
+
+The runs either side of it reproduce cleanly — baseline and all eight divider
+fields at 2270–2497× real time, module 2 unchanged — so the negatives above
+stand and only `e` is outstanding.
+
+### [M] Bit 4 is not it either — and the vendor's stream start read properly
+
+Phase `e` finally ran. `0x40080094` bit 4 clear and set, readback confirming
+both (`00000701` / `00000711`), and **2270× real time either way.** Bit 4 is
+not the pacing.
+
+That exhausts every candidate this document had. So, before sweeping the 32
+implemented-but-never-written bits the census turned up, the vendor's code was
+read properly — which is what cracked the PWM.
+
+**`0x4009B000` appears exactly once in the entire 4 MB image**, at the literal
+`0x00D9A298` already disassembled. The vendor writes those three registers and
+nothing else; there is no further static material about that block.
+
+**The stream start at `0x00D9662C`, in full, against what the driver does:**
+
+| vendor | `sl6806_audio_clock_start()` |
+|---|---|
+| `module_disable(2)` | **not done** |
+| `delay(10)` | — |
+| `module_enable(2)` | `module_enable(2)` |
+| `delay(10)` | `delay(10)` |
+| `romclk_setdiv(44, 8)` | `mmio_field(0x40080094[10:8], 7)` |
+| `romclk_enable(44)` | `mmio_set(0x40080094 bit 0)` |
+| `[0x40009400] \|= 0x80` | `EQ_CTRL \|= START` — same register, same bit |
+| mode field 4 → 6 | same three cases |
+| `if ([0x4000940C] & bit31)` … | **not done, and never read** |
+
+(`0x00807214` tail-calls ROM `0xBC1E`, one of the two scaled busy-waits decoded
+during the PWM work, so the vendor's `0x807214(10)` is `delay(10)`.)
+
+Two gaps, and the second is the larger:
+
+1. **The module-2 cycle.** The vendor disables, waits, enables, waits;
+   `sl6806_audio.c` only enables, and its comment records the deviation
+   deliberately. The `d` phase that "tested" it omitted both delays, so it
+   tested a bare off/on rather than the vendor's sequence. Now fixed.
+2. **`0x4000940C` bit 31 gates twenty-one further calls** — ten to
+   `0x00D958B4` over odd indices 1..19, one with 0, ten to `0x00D95854` over
+   the even ones, then `0x00D95CC4`. Nothing here has ever read that register,
+   let alone run any of it. Its neighbour at `+0x400` is `EQ_CTRL`, so this is
+   plausibly the coefficient load rather than pacing — but "plausibly" is how
+   four wrong conclusions in this file started, so the sketch now reads it and
+   prints whether bit 31 is set.
+
+### [M] Everything on the list is now negative — and the linearity argument does not prove what it claimed
+
+The full sweep, all with a verified two-length instrument and readback on every
+applied change:
+
+| Tried | Result |
+|---|---|
+| four output routes, three source modes | 2270× |
+| all 32 bits of `0x400E0000` | 2270× |
+| bit clock divider, all 8 fields | 2270× |
+| module 2, bare off/on | 2270× |
+| module 2, the vendor's cycle **with both `delay(10)`s** | 2270× |
+| bit clock `0x40080094` **bit 4**, clear and set | 2270× |
+| the vendor's wider clock chain (romclk 0/31/56, module 87, `0x4009B000`) | 2270× |
+| audio PLL | already correct |
+
+And `+0x40C` reads `0x02200000` — **bit 31 clear**, so the vendor skips its
+twenty-one extra calls in this state too. That is not an untried difference; it
+is no difference at all.
+
+#### [!] The linearity argument is weaker than this document now claims
+
+The retraction above says: *a descriptor retired without doing anything takes
+constant time; completion is linear in length; therefore data moves.* **That
+does not follow.** Two things are linear in length:
+
+1. a DMA reading N bytes of SRAM at bus speed;
+2. a hardware **length counter** decrementing at bus speed, reading nothing.
+
+Linearity proves the block *processes the length*. It does not prove it touches
+RAM. The retraction of "nothing is transferred" was right to reject the old
+480 MB/s reasoning — that was computed against the wrong clock — but it
+replaced it with a conclusion its evidence does not carry.
+
+Only a test that **observes memory** separates the two, and a TX engine cannot
+be caught in the act; RX can. The single capture test ever run is already
+recorded here as weak, and the reason is now exact: `sl6806_audio_begin()` sets
+`TX_ENABLE` bit 0 at `sl6806_audio.c:154` and **never touches `RX_ENABLE`**, so
+that test submitted a capture descriptor to a disabled direction.
+
+`ToneDemo` phase `f` runs it properly — an address-derived pattern in a
+dedicated buffer, `RX_ENABLE` bit 0 set, and the same test repeated with it
+clear, because "memory changed" is only evidence if it does not also change
+with the direction switched off.
+
+| Outcome | Meaning |
+|---|---|
+| changed with RX set, unchanged with it clear | the DMA really moves memory; only the pacing is missing, and the retraction stands on proper evidence |
+| unchanged both ways | the length is a counter and nothing has ever been transferred — which would retract the retraction |
+
+That is the question this block has actually been sitting on since the
+beginning, and nothing has ever asked it with the capture direction enabled.
+
+### [M] Capture never runs — and phase `f` answered a different question than it asked
+
+```
+RX enable clear -> +0x200 = 02300700   TIMED OUT after 60081 us, 0 of 512 changed
+RX enable SET   -> +0x200 = 02300701   TIMED OUT after 60082 us, 0 of 512 changed
+```
+
+Two findings, and a flaw in the test.
+
+**The capture direction does not retire at all.** 60 ms, no completion flag,
+against a TX direction that retires in 10 µs. That asymmetry is itself
+informative: a generic length counter would retire on *both* directions, since
+it is the same mechanism one page apart. So TX's retire is not simply a
+counter running down.
+
+**`+0x200` bit 0 does not clear.** The second run of the phase read `02300701`
+on its "clear" row, so both rows had RX enabled and its control was not a
+control. Only the first run's pair is valid. The sketch now prints the register
+beside the intent and flags a row whose write did not take, because reporting
+what was *meant* rather than what *happened* is how a non-control gets read as
+a control.
+
+**And the test cannot answer its own question.** Watching a capture buffer says
+nothing about whether the DMA reads memory when the direction being watched
+never runs. `f` established that RX does not work; it did not establish
+anything about TX.
+
+#### The test it should have been: vary the source, not the destination
+
+The question is whether the direction that *does* complete reads its source.
+That needs no second direction and no memory to be written:
+
+> A transfer's time depends on how fast its **source** can be read.
+> A length counter's does not.
+
+Phase `g` submits the same length from three sources of very different speed —
+SRAM, XIP flash (off-chip over SPI, far slower), and the mask ROM. All three
+are plainly readable, so nothing can fault.
+
+| Outcome | Meaning |
+|---|---|
+| times differ by source | the DMA reads memory — settled, and only the pacing is missing |
+| times identical | it reads nothing, the length is a counter, and the retraction in this document is itself retracted |
+
+Same shape as the length sweep that started this, moved to the one variable
+nothing has ever varied.
+
+## [M] SETTLED — the DMA does not read its source. The original negative was right.
+
+```
+SRAM (wave)  00838b38  4796 bytes in 9 us  (532 B/us)
+XIP flash    00c10000  4796 bytes in 9 us  (532 B/us)
+```
+
+**Identical.** XIP flash is off-chip SPI, and the bootloader sets that clock to
+32 MHz (`romclk_set(6, 12)`, 384 MHz / 12). Reading 4796 bytes from it:
+
+| mode | rate | time |
+|---|---|---|
+| single-bit SPI | 4 MB/s | 1199 µs |
+| dual | 8 MB/s | 600 µs |
+| quad | 16 MB/s | 300 µs |
+| **measured** | | **9 µs** |
+
+532 MB/s out of SPI flash is impossible by any margin, cache or not. A transfer's
+time depends on how fast its source can be read; this one does not depend on it
+at all. **The DMA does not read its source.**
+
+(The mask ROM row was rejected: `sl6806_audio_play()` refuses a NULL buffer,
+which is correct of it. The sketch now uses `0x00000100`. Two sources four
+orders of magnitude apart already settle it.)
+
+### So the retraction is itself retracted
+
+`docs/AUDIO.md`'s original conclusion — *the block accepts a descriptor and
+retires it having moved nothing* — **was right.** What was wrong was only its
+reasoning: 480 MB/s was called impossible against a 64 MHz core, and §30 had
+already measured the bus PLL at 192 MHz, where that rate is unremarkable. The
+conclusion survived its own bad argument.
+
+And my replacement was worse, because it was confidently stated: *linear in
+length, therefore data moves.* A length counter decrementing at bus rate is
+linear in length too. ~519 B/µs is about 130 M words/s, which against a 192 MHz
+bus is a counter retiring roughly one word per one-and-a-half cycles — exactly
+what a descriptor being read down without any fetch looks like.
+
+The state of the block, on evidence that now holds:
+
+| | |
+|---|---|
+| TX descriptor | retires in time linear in length, **independent of source memory** — an internal counter |
+| RX descriptor | never retires at all |
+| memory | never observed to change, in either direction |
+| routes, source modes, `0x400E0000`, bit clock divider and bit 4, module 2 cycle, the vendor's wider clock chain, audio PLL | all applied with readback, all negative |
+
+So `0x40009000` is configured, its registers hold what the vendor's code puts
+there, and **nothing in it fetches**. The question is no longer "what paces the
+DMA" — it is "what makes the DMA fetch at all", which is a different and
+earlier question than this document has been asking since the beginning.
+
+### What that leaves
+
+The census already mapped the unexplored surface: 25 implemented-but-never-written
+bits in `0x4009B04C`, four in `0x4009B050`, three in `0x4009B040`. Beyond that,
+the audio block's own registers have never had an implemented-bit census of
+their own — only `0x40009400` and `0x4000940C` have been read, and the reset
+values of thirty others were recorded without ever asking which of their bits
+are writable.
+
+That is where a fetch enable would be, if it is anywhere reachable.
