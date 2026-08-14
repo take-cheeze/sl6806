@@ -172,7 +172,8 @@ void setup()
     sl6806_audio_route(1, 1, 0);
     sl6806_audio_clock_start(1);
     Serial.println("'b' baseline  'm' module ids  'r' romclk ids"
-                   "  'c' census the audio block  'q' stop");
+                   "  'c' census the audio block\n"
+                   "'a' does TX_ADDR ADVANCE?  'q' stop");
 }
 
 void loop()
@@ -182,11 +183,11 @@ void loop()
     if (!up)
         return;
     if (key == 'q') { phase = -1; Serial.println("stopped."); return; }
-    if (key == 'b' || key == 'm' || key == 'r' || key == 'c') {
+    if (key == 'b' || key == 'm' || key == 'r' || key == 'c' || key == 'a') {
         phase = key; idx = 0; hits = 0; announced = false;
         Serial.printf("\n[%c]\n", key);
     } else if (key >= 0 && key != '\r' && key != '\n') {
-        Serial.printf("unknown key '%c' - try b m r c q\n", key);
+        Serial.printf("unknown key '%c' - try b m r c a q\n", key);
         return;
     }
     if (phase < 0)
@@ -297,6 +298,55 @@ void loop()
                           (unsigned)(mask & ~saved));
         }
         Serial.println("    the 'unwritten' column is the search space.");
+        phase = -1;
+        break;
+    }
+
+    case 'a': {
+        /*
+         * [M] THE SOURCE TEST WAS VOID, and the census is what caught it.
+         * +0x10C implements bits [19:2] and bit 23 ONLY - bits 20..22 are
+         * absent - so it reaches SRAM and the low megabyte and CANNOT HOLD A
+         * FLASH ADDRESS. Writing 0x00C10000 leaves 0x00810000, which is
+         * exactly what the register was found holding. Both rows of that test
+         * read SRAM, and their identical times were guaranteed by the hardware
+         * truncating the address rather than by anything the DMA did.
+         *
+         * So "the DMA does not read its source" is retracted. With both
+         * reachable regions on-chip there is no source-speed comparison left
+         * to make - but there is a better test, and it needs no second memory:
+         *
+         *     if the engine walks the buffer, the address register moves.
+         *
+         * Write it, run one transfer, read it back. An engine that fetches
+         * leaves it advanced by the length; a counter leaves it where it was.
+         */
+        uint32_t before, after;
+        unsigned long us;
+
+        Serial.println("\n--- does TX_ADDR advance across a transfer?");
+        sl6806_mmio_write(SL6806_AUD_TX_ADDR, (uint32_t)(uintptr_t)wave);
+        before = sl6806_mmio_read(SL6806_AUD_TX_ADDR);
+        if (before != ((uint32_t)(uintptr_t)wave & 0x008FFFFCu)) {
+            Serial.printf("    wrote %08x, reads %08x - not even the truncated"
+                          " value; stop here\n",
+                          (unsigned)(uintptr_t)wave, (unsigned)before);
+            phase = -1;
+            break;
+        }
+        us = timeOne(wave);
+        after = sl6806_mmio_read(SL6806_AUD_TX_ADDR);
+        settle();
+
+        Serial.printf("    before %08x   after %08x   delta %ld   (len %u, %lu us)\n",
+                      (unsigned)before, (unsigned)after,
+                      (long)(after - before), TESTLEN, us);
+        if (after == before)
+            Serial.println("    UNCHANGED - the engine did not walk the buffer.");
+        else if (after - before == TESTLEN)
+            Serial.println("    ADVANCED BY THE LENGTH - IT READS MEMORY.");
+        else
+            Serial.println("    moved, but not by the length - worth explaining");
         phase = -1;
         break;
     }

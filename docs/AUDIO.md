@@ -1542,3 +1542,67 @@ That leaves, of the four hypotheses:
 2. ~~the source address is a descriptor pointer~~ — ruled out here;
 3. a bus-master enable outside both clock families;
 4. a generate-rather-than-fetch mode, which still fits every measurement.
+
+## [M] The census invalidates the source test — `+0x10C` cannot hold a flash address
+
+```
++0x10C TXadr  holds 00810000  implemented 008FFFFC
+```
+
+**Bits [19:2] and bit 23. Bits 20, 21 and 22 are absent.** So the TX address
+register reaches SRAM (`0x008xxxxx`) and the low megabyte, and **cannot hold a
+flash address at all**:
+
+| written | retained |
+|---|---|
+| `0x00838B38` SRAM buffer | `0x00838B38` |
+| `0x00C10000` XIP flash | **`0x00810000`** |
+| `0x00000100` mask ROM | `0x00000100` |
+
+And `0x00810000` is exactly what the register was found holding — the truncated
+remains of the last flash-source test.
+
+**So the source-memory test never pointed at flash. Both of its rows read
+SRAM**, and their identical times were guaranteed by the hardware truncating
+the address rather than by anything the DMA did or did not do. `docs/AUDIO.md`'s
+"SETTLED — the DMA does not read its source" is **retracted**. It is unproven
+in both directions.
+
+That is the fifth instrument failure in this investigation and the first one
+caught by a control built for the purpose. The census was added to look for a
+fetch enable; what it found was that a measurement three sections above it was
+void. Worth the run on its own.
+
+### The trigger register, explained rather than blamed
+
+```
++0x104 TXtrg  holds 0E0C0000  implemented FFFC0002
+```
+
+The watermark field is **[31:18]**, not [31:16], and the driver's write of
+`(3 × len / 4) << 16 | 1` comes back as `0x0E0C0000` — bits 16, 17 and 0
+dropped, exactly as the mask predicts.
+
+That looked like a bug and is not. The vendor writes a **byte** count at bit 16;
+the field sits at bit 18, so it sees `value >> 2`; and `3·len/16` **words** is
+`3·len/4` **bytes**. The two cancel. The field counts words, the vendor's value
+lands correctly, and the odd position is explained.
+
+What is *not* explained: **bit 0 is not implemented and bit 1 is**, and nothing
+writes bit 1. `SL6806_AUD_TRIG_ARM` is `(1u << 0)` and has therefore never set
+anything.
+
+### The test that replaces the source comparison
+
+Both reachable regions are on-chip, so there is no source-speed comparison left
+to make. But there is a better test that needs no second memory:
+
+> If the engine walks the buffer, **the address register moves.**
+
+Write it, run one transfer, read it back. An engine that fetches leaves it
+advanced by the length; a counter leaves it where it was. `examples/AudioFetch`
+phase `a`.
+
+Other unwritten fields the census turned up, for later: `+0x000` bits [11:0]
+and [31:26]; `+0x108` bits 2, 5, 6 and [31:16] beyond the length; `+0x200` and
+`+0x208` broadly. The `unwritten` column of each row is the search space.
