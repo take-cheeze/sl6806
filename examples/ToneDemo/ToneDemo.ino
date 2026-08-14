@@ -336,6 +336,22 @@ void loop()
         census("0x4009B040", 0x4009B040u);
         census("0x4009B04C", 0x4009B04Cu);
         census("0x4009B050", 0x4009B050u);
+        /*
+         * [V] 0x4000940C gates a whole block of vendor init that this driver
+         * does not perform: at 0x00D9668C the stream start tests bit 31 and,
+         * if it is set, runs ten calls to 0x00D958B4 over odd indices 1..19,
+         * one more with 0, ten to 0x00D95854 over even indices, and finally
+         * 0x00D95CC4. Nothing here has ever read this register, let alone run
+         * that. Its neighbour +0x400 is EQ_CTRL, so the block is plausibly the
+         * coefficient load rather than anything to do with pacing - but
+         * "plausibly" is how four wrong conclusions started, so read it.
+         */
+        report("  EQ  +0x400       ", sl6806_mmio_read(SL6806_AUD_EQ_CTRL));
+        report("  EQ? +0x40C       ", sl6806_mmio_read(SL6806_AUD_REG(0x40C)));
+        Serial.printf("  +0x40C bit 31 %s - the vendor runs 21 more calls when"
+                      " it is set\n",
+                      (sl6806_mmio_read(SL6806_AUD_REG(0x40C)) & 0x80000000u)
+                          ? "SET" : "clear");
         Serial.println("  any implemented bit outside what the driver writes is");
         Serial.println("  a field nobody has tried.");
         phase = -1;
@@ -382,13 +398,24 @@ void loop()
          * is the dangerous one - so this only ever switches off an id it is
          * about to switch back on, in that order, and nothing else.
          */
-        Serial.println("\n--- module 2 off-then-on, then measure");
+        /*
+         * [V] The vendor's cycle is disable, delay(10), enable, delay(10) -
+         * 0x00D96644..0x00D96658, where 0x00807214 tail-calls ROM 0xBC1E, one
+         * of the two scaled busy-waits decoded during the PWM work. The first
+         * version of this phase omitted both delays, so what it tested was a
+         * bare off/on and not the vendor's sequence. sl6806_audio.c's own
+         * comment records the deviation: "enable rather than the vendor's
+         * disable-then-enable".
+         */
+        Serial.println("\n--- module 2, the vendor's full cycle with delays");
         sl6806_module_disable(2);
-        Serial.printf("  module 2 off, enabled: %s\n",
+        Serial.printf("  off: %s\n",
                       sl6806_module_enabled(2) ? "STILL ON" : "off");
-        Serial.printf("  module 2 on: %s\n",
+        delay(10);
+        Serial.printf("  on:  %s\n",
                       sl6806_module_enable(2) ? "acked" : "REFUSED");
-        pace("after the cycle");
+        delay(10);
+        pace("after the full cycle");
         phase = -1;
         break;
 

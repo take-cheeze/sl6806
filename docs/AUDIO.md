@@ -1063,3 +1063,48 @@ nothing.**
 The runs either side of it reproduce cleanly — baseline and all eight divider
 fields at 2270–2497× real time, module 2 unchanged — so the negatives above
 stand and only `e` is outstanding.
+
+### [M] Bit 4 is not it either — and the vendor's stream start read properly
+
+Phase `e` finally ran. `0x40080094` bit 4 clear and set, readback confirming
+both (`00000701` / `00000711`), and **2270× real time either way.** Bit 4 is
+not the pacing.
+
+That exhausts every candidate this document had. So, before sweeping the 32
+implemented-but-never-written bits the census turned up, the vendor's code was
+read properly — which is what cracked the PWM.
+
+**`0x4009B000` appears exactly once in the entire 4 MB image**, at the literal
+`0x00D9A298` already disassembled. The vendor writes those three registers and
+nothing else; there is no further static material about that block.
+
+**The stream start at `0x00D9662C`, in full, against what the driver does:**
+
+| vendor | `sl6806_audio_clock_start()` |
+|---|---|
+| `module_disable(2)` | **not done** |
+| `delay(10)` | — |
+| `module_enable(2)` | `module_enable(2)` |
+| `delay(10)` | `delay(10)` |
+| `romclk_setdiv(44, 8)` | `mmio_field(0x40080094[10:8], 7)` |
+| `romclk_enable(44)` | `mmio_set(0x40080094 bit 0)` |
+| `[0x40009400] \|= 0x80` | `EQ_CTRL \|= START` — same register, same bit |
+| mode field 4 → 6 | same three cases |
+| `if ([0x4000940C] & bit31)` … | **not done, and never read** |
+
+(`0x00807214` tail-calls ROM `0xBC1E`, one of the two scaled busy-waits decoded
+during the PWM work, so the vendor's `0x807214(10)` is `delay(10)`.)
+
+Two gaps, and the second is the larger:
+
+1. **The module-2 cycle.** The vendor disables, waits, enables, waits;
+   `sl6806_audio.c` only enables, and its comment records the deviation
+   deliberately. The `d` phase that "tested" it omitted both delays, so it
+   tested a bare off/on rather than the vendor's sequence. Now fixed.
+2. **`0x4000940C` bit 31 gates twenty-one further calls** — ten to
+   `0x00D958B4` over odd indices 1..19, one with 0, ten to `0x00D95854` over
+   the even ones, then `0x00D95CC4`. Nothing here has ever read that register,
+   let alone run any of it. Its neighbour at `+0x400` is `EQ_CTRL`, so this is
+   plausibly the coefficient load rather than pacing — but "plausibly" is how
+   four wrong conclusions in this file started, so the sketch now reads it and
+   prints whether bit 31 is set.
