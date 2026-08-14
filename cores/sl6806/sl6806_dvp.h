@@ -320,6 +320,72 @@ typedef struct {
 #define SL6806_DVP_DMA_LEN20        0x3C    /* [I] 20 bits                 */
 #define SL6806_DVP_ALIAS            0x80    /* [M] the block repeats here  */
 
+/* [M] +0x38's writable span, from the DvpProbe census: the top nibble is
+ * fixed at the SRAM base and only [19:2] takes writes - 1 MB at 4-byte
+ * alignment. */
+#define SL6806_DVP_SRAM_BASE        0x00800000u
+#define SL6806_DVP_SRAM_SPAN        (1u << 20)
+#define SL6806_DVP_DMA_ADDR_MASK    0x000FFFFCu
+
+/* [I] +0x3C's field, sized to match +0x38's 20-bit span - the best-supported
+ * reading of "a length over the same span". +0x34 is left alone by the
+ * driver below: the census cannot tell a byte count from a second address,
+ * and writing a length into what might be an address is a worse guess than
+ * writing nothing. */
+#define SL6806_DVP_DMA_LEN_MASK     0x000FFFFFu
+
+/* [I] The three writable bits of +0x30, all set together until one is shown
+ * unnecessary - there is no vendor sequence to transcribe here, since
+ * nothing in the dump ever writes these four registers (see above). */
+#define SL6806_DVP_DMA_CTRL_MASK    0x0Bu
+#define SL6806_DVP_DMA_CTRL_START   SL6806_DVP_DMA_CTRL_MASK
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * sl6806_dvp_capture_start() - point the +0x30..0x3C cluster at a buffer
+ * and set every writable CTRL bit.
+ *
+ * This is this driver's own convention, not a transcription: address, then
+ * length, then start, matching the order every other DMA-shaped block in
+ * this tree uses (see sl6806_audio.c), because nothing in the vendor's own
+ * code ever touches these four registers to copy.
+ *
+ * dst must be a word-aligned address inside the chip's 1 MB SRAM span, and
+ * len must be a nonzero multiple of 4 that fits the 20-bit length field.
+ * Returns 0 on a syntactically valid request, -1 on a rejected one - neither
+ * says whether the hardware moves a single byte, which no register in this
+ * cluster reports (see sl6806_dvp_capture_writable()).
+ */
+int sl6806_dvp_capture_start(void *dst, uint32_t len);
+
+/* Clears the CTRL bits this driver sets. Does not touch ADDR or the length
+ * registers, so a stopped descriptor can be re-armed with the same
+ * geometry by calling sl6806_dvp_capture_start() again. */
+void sl6806_dvp_capture_stop(void);
+
+/*
+ * The write-and-read-back proof, same discipline as
+ * sl6806_audio_writable(): a gated block reads zero and drops every write,
+ * so a plausible-looking register proves nothing on its own. This writes a
+ * distinguishing test pattern into ADDR and the length field, reads it back,
+ * and restores whatever sl6806_dvp_capture_start() (or the cold reset value)
+ * held before returning. 1 if the descriptor registers hold what they are
+ * given, 0 if the block is gated or otherwise drops the write.
+ */
+int sl6806_dvp_capture_writable(void);
+
+/* Read back what the descriptor registers currently hold, decoded to plain
+ * values rather than the raw fixed-base/masked-field encoding. */
+void *sl6806_dvp_capture_addr(void);
+uint32_t sl6806_dvp_capture_len(void);
+
+#ifdef __cplusplus
+}
+#endif
+
 /* ------------------------------------------------------------------ */
 /* [V] What the SENSOR's own init enables, which the DVP path does not  */
 /* ------------------------------------------------------------------ */

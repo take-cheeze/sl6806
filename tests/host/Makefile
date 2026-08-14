@@ -11,7 +11,8 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
 TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
-         test_regfile test_audio test_bt test_sd test_fat test_uart test_firm test_hwinit
+         test_regfile test_audio test_bt test_sd test_fat test_uart test_firm test_hwinit \
+         test_dvp
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -71,6 +72,9 @@ run-test_firm: test_firm
 	./$<
 
 run-test_hwinit: test_hwinit
+	./$<
+
+run-test_dvp: test_dvp
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -160,6 +164,15 @@ test_firm: test_firm.c $(CORE)/sl6806_firm.c
 # wrong on hardware: a bad decode gives a plausible number, and a widened
 # mask clears a field nothing here knows the meaning of.
 test_hwinit: test_hwinit.c $(CORE)/sl6806_hwinit.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $(filter %.c,$^) -o $@
+
+# The DVP DMA cluster against a model of just those four registers and a
+# gate flag. Nothing in this cluster is in the vendor's own code - DvpProbe
+# found it by writing and reading back, not by reading a routine - so there
+# is no sequence to hold the driver to beyond the one it states for itself:
+# rejections before any register is touched, address before length before
+# start, and a write-and-read-back proof that a gated block cannot fake.
+test_dvp: test_dvp.c $(CORE)/sl6806_dvp.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $(filter %.c,$^) -o $@
 
 clean:

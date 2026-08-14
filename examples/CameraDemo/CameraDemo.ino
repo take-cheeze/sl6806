@@ -124,6 +124,7 @@
  */
 
 #include <Arduino.h>
+#include <string.h>
 #include "sl6806_padctl.h"
 #include "sl6806_regfile.h"
 #include "sl6806_dvp.h"
@@ -1340,6 +1341,94 @@ static void dvpBringUp(void)
 
 /*
  * ===================================================================
+ *  THE DMA CLUSTER AT +0x30..0x3C - TRIGGERED, NOT JUST MAPPED
+ * ===================================================================
+ * sl6806_dvp.h's own words about +0x30..0x3C: "nothing has been run". This
+ * runs it - independently of whether the sensor ever answers, since the
+ * cluster takes writes as soon as the front end is awake (dvp_awake), and
+ * nothing about it depends on a working I2C bus.
+ *
+ * Two separate claims, and this only supports the first:
+ *
+ *   1. The descriptor registers hold what they are given.
+ *      sl6806_dvp_capture_writable() proves this the way
+ *      sl6806_audio_writable() proves it for the audio DMA - a distinguishing
+ *      test pattern in, the same pattern read back, restored either way.
+ *
+ *   2. Bytes actually move into the buffer.
+ *      No register in this cluster is known to report completion - unlike
+ *      audio's CTRL, nothing here has a flag this driver can poll - so the
+ *      only witness is the buffer's own contents. It is filled with a
+ *      pattern before the trigger and dumped after, exactly the AudioWall
+ *      method: 0 bytes changed is a real negative, and a changed byte is the
+ *      first positive result this cluster would ever have produced.
+ *
+ * Claim 2 needs whatever time the block takes to run, which nothing here
+ * measures - so this checks immediately and lets the caller re-check later
+ * from the monitor if the first pass shows nothing.
+ */
+#define DVP_CAP_LEN   256u
+static uint8_t dvp_cap_buf[DVP_CAP_LEN] __attribute__((aligned(4)));
+
+static void dvpCaptureProbe(void)
+{
+    unsigned i, changed = 0;
+
+    if (!dvp_awake) {
+        Serial.println("DMA cluster: skipped - the front end itself never");
+        Serial.println("came up, and there is no reason to trust a register");
+        Serial.println("behind a block that is not running.");
+        return;
+    }
+
+    Serial.println();
+    Serial.println("DMA cluster (+0x30..0x3C): the descriptor test");
+
+    if (!sl6806_dvp_capture_writable()) {
+        Serial.println("  the descriptor registers drop writes. Awake enough");
+        Serial.println("  to hold a geometry write and this is still a");
+        Serial.println("  different claim - see sl6806_dvp_capture_writable().");
+        return;
+    }
+    Serial.println("  ADDR and LEN20 hold a distinguishing test pattern and");
+    Serial.println("  read it back. That is new: nothing in this cluster had");
+    Serial.println("  ever taken a write before this run.");
+
+    memset(dvp_cap_buf, 0xAAu, sizeof(dvp_cap_buf));
+
+    if (sl6806_dvp_capture_start(dvp_cap_buf, DVP_CAP_LEN) != 0) {
+        Serial.println("  sl6806_dvp_capture_start() rejected its own buffer -");
+        Serial.println("  that is a bug in this sketch, not a hardware result.");
+        return;
+    }
+
+    Serial.print("  triggered: ADDR reads back 0x");
+    Serial.print((uint32_t)(uintptr_t)sl6806_dvp_capture_addr(), HEX);
+    Serial.print(", LEN 0x");
+    Serial.println(sl6806_dvp_capture_len(), HEX);
+
+    for (i = 0; i < sizeof(dvp_cap_buf); i++)
+        if (dvp_cap_buf[i] != 0xAAu)
+            changed++;
+
+    Serial.print("  buffer check, immediately after the trigger: ");
+    Serial.print(changed);
+    Serial.print(" of ");
+    Serial.print((unsigned)sizeof(dvp_cap_buf));
+    Serial.println(" bytes differ from the fill pattern.");
+    if (changed == 0) {
+        Serial.println("  0 changed is a real negative, the same as AudioWall's -");
+        Serial.println("  it does not by itself mean the block never writes; only");
+        Serial.println("  that it had not by the time this line ran.");
+    } else {
+        Serial.println("  NONZERO. First positive result this cluster has ever");
+        Serial.println("  produced. Do not trust the pixel values yet - only that");
+        Serial.println("  something wrote them.");
+    }
+}
+
+/*
+ * ===================================================================
  *  STOP ASKING THE SENSOR AND WATCH ITS PINS
  * ===================================================================
  * Every question so far has been "does 0x68 answer", and I2C needs the sensor
@@ -2187,6 +2276,8 @@ void loop()
             /* After the rail, before any pad the front end owns: the block
              * has to be running before its pads are muxed to it. */
             dvpBringUp();
+            /* Independent of the sensor - see dvpCaptureProbe() above. */
+            dvpCaptureProbe();
 #endif
             sub = 0;
 #if DVP_BRINGUP
@@ -2545,9 +2636,16 @@ void loop()
         }
 
         Serial.println();
-        Serial.println("What is still missing for an image: the DVP front end at");
-        Serial.println("0x400E1000 is mapped (sl6806_dvp.h) but its enable lives in");
-        Serial.println("0x400E0000, which no payload has ever written successfully.");
+        if (dvp_awake) {
+            Serial.println("The DVP front end at 0x400E1000 is awake and geometry-");
+            Serial.println("configured (see the DMA cluster report above) - so what is");
+            Serial.println("still missing for an image is pixels actually leaving the");
+            Serial.println("sensor, not the front end that would receive them.");
+        } else {
+            Serial.println("What is still missing for an image: the DVP front end at");
+            Serial.println("0x400E1000 is mapped (sl6806_dvp.h) but did not come up");
+            Serial.println("awake in this run - see dvpBringUp()'s own report above.");
+        }
 
         samples   = 0;
         sample_at = millis();

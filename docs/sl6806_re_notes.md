@@ -1761,6 +1761,34 @@ it only runs once the block is streaming — and the sensor cannot stream
 without it, which would be a chicken-and-egg the vendor must break somewhere
 that has not been read yet.
 
+**WRITTEN, NOT YET RUN: a driver for this cluster.**
+[`cores/sl6806/sl6806_dvp.c`](../cores/sl6806/sl6806_dvp.c) now programs
+`+0x38`/`+0x3C`/`+0x30` — address, length, then every writable `+0x30` bit as
+the start trigger, in that order, as its own three writes. That order is this
+driver's own convention, not a transcription: there is nothing to transcribe,
+since no vendor routine that has been read ever touches these four registers.
+`+0x34` is left at its cold value, on purpose — the census above cannot tell a
+byte count from a second address, and writing a length into what might be an
+address is a worse guess than writing nothing.
+
+Two functions, two different claims:
+
+- `sl6806_dvp_capture_writable()` is the same proof `sl6806_audio_writable()`
+  gives the audio DMA: a distinguishing test pattern into `ADDR`/`LEN20`, read
+  back, restored. It says the descriptor registers hold what they are given -
+  nothing about whether the hardware acts on it.
+- `sl6806_dvp_capture_start(dst, len)` arms the descriptor and leaves it
+  running. No register in this cluster is known to report completion, so
+  `examples/CameraDemo`'s `dvpCaptureProbe()` uses the `AudioWall` method
+  instead: fill the destination with a pattern, trigger, and count what
+  changed. `dvpCaptureProbe()` runs immediately after `dvpBringUp()`,
+  independently of whether the sensor ever answers on I2C.
+
+31 host tests (`tests/host/test_dvp.c`) hold the driver to its own stated
+contract — rejections before any register is touched, the write order, the
+masks matching the census table above — against a model of just these four
+registers. None of it has run on a P20 yet; that is the next hardware pass.
+
 ### The sensor's outputs are high-impedance — the first reading here that discriminates
 
 Sampled against the vendor's own pull-up (selector 8), with the whole bring-up
