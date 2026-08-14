@@ -17,26 +17,30 @@
  *   which is a different operation, and skipped bank 1's low pins as "the
  *   panel's bus" - true of pins 1-8, not of pin 0.
  *
- *   And bit 8 of the pair register at 0x40084014 is the counter's clock
- *   enable. Nothing in the firmware writes it, so no amount of reading the
- *   vendor's code produces it; it was found by holding each of that
- *   register's 32 reachable settings and watching the panel.
+ *   And bit 8 of the pair register at 0x40084014 is what drives the pad.
+ *   Nothing in the firmware writes it, so no amount of reading the vendor's
+ *   code produces it; it was found by holding each of that register's 32
+ *   reachable settings and watching the panel. [M] It was removed from the
+ *   driver on 2026-08-14 on a theory that lasted an afternoon, and removing
+ *   it turns the backlight off. It is back. Do not remove it.
  *
- * THE TRAP THAT COST THE MOST. CTRL bit 28 looks exactly like a busy flag -
- * the vendor's own setter spins on it - and it is set while the backlight is
- * running perfectly. Three separate "the counter never starts" conclusions
- * came from testing it. The panel is the only detector that was ever right.
+ * WHAT IT STILL CANNOT DO IS DIM, and the reason is now measured rather than
+ * guessed at: the counter does not run in any configuration anyone has found.
+ * examples/PwmClock walks the clock and the force bit together and reports a
+ * commit witness - retiring CTRL bit 8 needs a period boundary - which comes
+ * back 0/4 every time.
  *
- * WHAT IT STILL CANNOT DO IS DIM. The counter does not run: duty 0 and duty
- * 100 are indistinguishable, and both of the block's plausible status bits -
- * CTRL bit 8 and bit 28 - are stuck. Bit 8 of the pair register is driving
- * the pad to a level, not making a waveform.
+ * THE TRAP THAT COST THE MOST IS STILL CTRL BIT 28, in both directions. This
+ * file used to call it a liar; then, briefly, an authority. It is neither. It
+ * clears when romclk 39 (0x400800F4 bit 0) is enabled and is set otherwise,
+ * so it reports something like "the block has a clock" - and the panel is
+ * DARK in one of the configurations where it says "running". Do not conclude
+ * anything from it that a witness observing an effect has not also said.
  *
- * PRESS 'h' IN THE MONITOR to hunt for the counter's clock. It walks all 128
- * module ids and tests each one by asking whether any word in the channel
- * block changes between two reads, which is the detector the earlier walks
- * should have used - they tested CTRL bit 28, which never answers, so their
- * negatives mean nothing. Anything is only ever switched on, never off.
+ * PRESS 'h' IN THE MONITOR to walk the 128 module ids. [M] §14a's walk was a
+ * correct negative about bit 28, which is not the same question as what
+ * starts the counter, so it is worth re-running against a better detector.
+ * Anything is only ever switched on, never off.
  *
  *     make SKETCH=examples/Backlight RUN_MODE=poll run
  */
