@@ -39,6 +39,7 @@
 
 #include "sl6806_uart.h"
 #include "sl6806_module.h"
+#include "sl6806_console.h"
 
 void delay(uint32_t ms) { (void)ms; }
 void delayMicroseconds(uint32_t us) { (void)us; }
@@ -239,6 +240,39 @@ static void test_alive_and_rx(void)
     CHECK(sl6806_uart_getc() == -1, "getc returns -1 when nothing arrived");
 }
 
+/* The console mirror. It must refuse to install itself on a port that is not
+ * transmitting - otherwise every Serial.print() in a sketch turns into a
+ * bounded wait for a character that never goes out, which is slower than the
+ * problem it was added to solve. */
+static void test_console_mirror(void)
+{
+    static const uint8_t msg[] = "xy";
+
+    printf("mirroring the console\n");
+
+    model_reset(1);
+    sl6806_uart_begin(0);
+    n_sent = 0;
+    sl6806_uart_console_mirror(1);
+    sl6806_console_write(msg, 2);
+    CHECK(n_sent == 2 && sent[0] == 'x' && sent[1] == 'y',
+          "console output reaches the port");
+
+    n_sent = 0;
+    sl6806_uart_console_mirror(0);
+    sl6806_console_write(msg, 2);
+    CHECK(n_sent == 0, "and stops when the mirror is removed");
+
+    /* A port that is up but not transmitting. */
+    model_reset(1);
+    sl6806_uart_begin(0);
+    tx_ready = 0;
+    n_sent = 0;
+    sl6806_uart_console_mirror(1);
+    sl6806_console_write(msg, 2);
+    CHECK(n_sent == 0, "a port that is not ready gets no sink installed");
+}
+
 int main(void)
 {
     printf("test_uart\n");
@@ -249,6 +283,7 @@ int main(void)
     test_bounded();
     test_newline();
     test_alive_and_rx();
+    test_console_mirror();
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;

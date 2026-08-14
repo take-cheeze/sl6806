@@ -165,6 +165,18 @@ int sl6806_uart_write(const void *buf, unsigned len);
 /* A byte if one has arrived, or -1. Never blocks. */
 int sl6806_uart_getc(void);
 
+/*
+ * Send everything the console prints to this port as well.
+ *
+ * Costs nothing when the port is not there: the sink checks
+ * sl6806_uart_alive() once when it is installed, and a putc that times out
+ * gives up in a bounded loop rather than blocking. Call it after
+ * sl6806_uart_begin(), and after Serial.begin() if you want the banner.
+ *
+ * Passing 0 removes the sink.
+ */
+void sl6806_uart_console_mirror(int on);
+
 /* The raw status word, for a probe. */
 uint32_t sl6806_uart_status(void);
 

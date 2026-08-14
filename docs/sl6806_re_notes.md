@@ -5722,3 +5722,53 @@ zero, and printed "still gated" — while the dump three lines above showed
 three other registers holding their writes. **A nonce test on one register
 says whether that register is writable, not whether the block is gated.**
 The sketch now says so.
+
+### [M] It transmits — and the console can be mirrored to it
+
+`examples/UartProbe`, second run, with the transmit mask fixed:
+
+```
+transmit-ready bit: SET - the write path will proceed
+sent 20 bytes, status 0x00000000
+sent 20 bytes, status 0x00000000
+```
+
+**The port accepts bytes.** Twenty per banner, once a second, with no
+timeouts.
+
+The status field is now pinned more precisely than the ROM's mask pins it.
+`STATUS & 0x1F` reads **1 at rest and 0 immediately after a burst**, so bit 0
+is a transmit-idle flag and the ROM's five-bit test is a superset of it. That
+is the right way round for a driver — the ROM's mask is what this transcribes,
+and it happens to be more tolerant than the single bit — but it is worth
+recording that the bit which actually moves is bit 0.
+
+⚠ And the same leftover trap as everywhere else: this run's "as found" section
+reports module 73 **ENABLED** with `CTRL` already `0x000D0007`, which is the
+*previous run's* bring-up, not the ROM's. Uploading a payload does not reset
+the chip. The first run, from a colder device, showed both clocks disabled —
+that is the ROM's state, and it means **the boot ROM does not bring this port
+up in bootloader mode.**
+
+### The console mirror, which is the point of all this
+
+`sl6806_console_set_sink()` gives the console a second destination, called
+with the bytes before they reach the ring — before anything can be dropped,
+since a sink exists precisely to receive what the ring would lose.
+`sl6806_uart_console_mirror(1)` installs one that writes to this port.
+
+That turns every existing sketch's output lossless without touching any of
+them, and retires the pattern this investigation kept re-inventing: emitting
+one section per USB poll and waiting for `sl6806_console_space()`, which is
+what `examples/BtProbe`, `SdLife`, `PadMap` and `SdFiles` all do. It also
+survives the one failure the USB console cannot report at all, which is a
+payload wedging the USB handler.
+
+The mirror **refuses to install itself on a port that is not transmitting**
+(`sl6806_uart_alive()`), because a sink whose every character times out in a
+bounded loop would make printing slower than the problem it was added to
+solve.
+
+What is still unproven is the last hop: whether those bytes leave the chip on
+a pin, at a rate and framing something can read. The block accepting them is
+not the same claim.

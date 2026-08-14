@@ -56,6 +56,7 @@ extern "C" {
 #include "sl6806_uart.h"
 #include "sl6806_mmio.h"
 #include "sl6806_module.h"
+#include "sl6806_console.h"
 }
 
 static int  phase;
@@ -182,6 +183,13 @@ void loop()
     }
 
     case 2:
+        Serial.println();
+        Serial.println("--- mirroring the console ---");
+        sl6806_uart_console_mirror(1);
+        Serial.println("  From here on, everything printed to USB also goes");
+        Serial.println("  out the serial port. If you can read this on the");
+        Serial.println("  adapter, this project has a console that cannot");
+        Serial.println("  overflow and does not need the USB handler.");
         Serial.println();
         Serial.println("--- sending ---");
         Serial.println("  A banner goes out once a second from here on.");

@@ -9,6 +9,7 @@
 #include "sl6806_mmio.h"
 #include "sl6806_module.h"
 #include "sl6806_padctl.h"
+#include "sl6806_console.h"
 
 #define U(off) (SL6806_UART_BASE + (off))
 
@@ -154,4 +155,32 @@ int sl6806_uart_getc(void)
 uint32_t sl6806_uart_status(void)
 {
     return sl6806_mmio_read(U(SL6806_UART_STATUS));
+}
+
+/* ------------------------------------------------------------------ */
+/* Mirroring the console                                               */
+/* ------------------------------------------------------------------ */
+
+static void uart_console_sink(const uint8_t *buf, size_t len)
+{
+    /* No newline expansion: the console's own output already carries CR LF
+     * where it wants them, and doubling them would show up as blank lines on
+     * whatever is listening. */
+    sl6806_uart_write(buf, (unsigned)len);
+}
+
+void sl6806_uart_console_mirror(int on)
+{
+    if (!on) {
+        sl6806_console_set_sink(0);
+        return;
+    }
+
+    /* Refuse rather than install a sink that will stall on every character:
+     * a port that is not transmitting turns each print into a bounded wait,
+     * and a sketch that prints in a loop would slow to a crawl for nothing. */
+    if (!sl6806_uart_alive())
+        return;
+
+    sl6806_console_set_sink(uart_console_sink);
 }

@@ -124,7 +124,7 @@ test_fat: test_fat.c $(CORE)/sl6806_fat.c
 # performs the mask ROM's sequence: wait then write, bounded, nine bits, CR
 # expansion, and gates before registers.
 test_uart: test_uart.c $(CORE)/sl6806_uart.c $(CORE)/sl6806_module.c \
-           $(CORE)/sl6806_padctl.c
+           $(CORE)/sl6806_padctl.c $(CORE)/sl6806_console.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:

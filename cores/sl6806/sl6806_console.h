@@ -78,6 +78,29 @@ extern sl6806_console_t _sl6806_console;
 
 void   sl6806_console_init(void);
 void   sl6806_console_write(const uint8_t *buf, size_t len);
+
+/*
+ * A second destination for everything the console prints.
+ *
+ * WHY THIS EXISTS. The ring above overwrites rather than blocking, and in
+ * RUN_MODE=poll the host drains it only between loop() calls - so a sketch
+ * that prints more than about two kilobytes without returning loses the
+ * beginning of it. Nine runs in the SD investigation opened with
+ * `[lost output - device outran the poll rate]`, and the standing workaround
+ * is to restructure a probe as a state machine so it emits one section per
+ * poll (examples/BtProbe, SdLife, PadMap).
+ *
+ * A sink that writes to the serial port at 0x40091000 removes the problem
+ * rather than working around it: the port has no ring to overflow, and it
+ * keeps working when the USB handler is wedged - the one failure the USB
+ * console cannot report. sl6806_uart_console_mirror() installs exactly that.
+ *
+ * The sink is called with the bytes as they are written, before they go into
+ * the ring, and must not print: it is called from inside Serial.print(). NULL
+ * removes it.
+ */
+typedef void (*sl6806_console_sink_fn)(const uint8_t *buf, size_t len);
+void   sl6806_console_set_sink(sl6806_console_sink_fn fn);
 void   sl6806_debug_print(const char *s);
 
 /* Free space in the transmit ring, in bytes. */
