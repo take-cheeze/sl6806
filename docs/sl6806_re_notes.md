@@ -6202,3 +6202,41 @@ Candidates for each, so the result can be read when it arrives:
 If it is the second, the fix is to skip the divider for whichever id that
 turns out to be — and identifying it would settle §25's remaining unknown as
 a side effect.
+
+### [M] The bisect: the clock tree is innocent, the module-clock step is not
+
+```
+neither step                boots, USB unstable
+FIRMBOOT_CLOCK_TREE=1       boots, USB unstable
+both                        does not boot
+```
+
+So `0x008206D0`'s whole clock sequence — source selects, rate, ROM-clock
+disables, flash-host writes, four dividers — is survivable by a payload and
+changes nothing about the application's USB. **The module-clock step is what
+breaks the boot**, and §25's worry that a divider might stop the core is
+retired: `ROM 0x289C(3, 2)` and its three companions run fine.
+
+There is a good reason ROM `0x3BFC` would break the application specifically.
+**Only the first `0x5862` bytes of FIRM are copied to SRAM.** The bulk of the
+application runs XIP from flash at `0x00C10000` — §5, and the reason
+`tools/sl6806-xref` scans that region at all. An application entered with the
+flash controller's module clock off faults the moment it branches into XIP.
+The bootloader survives the identical call because everything it needs
+afterwards it enables again by name, and it needs flash immediately: that is
+how it loads FIRM.
+
+But there is a second possibility with the opposite fix — that the payload
+never survives the call at all, since it runs from SRAM and calls into the
+mask ROM, and either could depend on a clock that goes off.
+
+`examples/ModulesOff` tells them apart in one run: snapshot the six
+registers, print them, call ROM `0x3BFC`, restore the snapshot immediately,
+print again. If the second block appears the payload survives and the
+application is starving; if the console never returns, the payload cannot
+make the call.
+
+It also records something nobody has: **which module clocks the boot ROM
+leaves running in bootloader mode.** That set is the answer to "what does
+bootloader mode withhold" in its most literal form, and the ids in it are the
+candidates for whichever one is the flash controller.
