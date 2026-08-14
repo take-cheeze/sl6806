@@ -1342,3 +1342,42 @@ promoted several of those to conclusions it had to withdraw. But it is the
 first thing found in the fetch path that the driver demonstrably does not do,
 and it is cheap to try: submit 16 bytes with START already set, wait, then
 submit the real buffer and see whether the retire time moves off 43 µs.
+
+### The priming path, read carefully — and what of it can actually be tried
+
+`0x00D97A20` looked like a hardware handshake. It is not, and the difference
+matters enough to state before anyone builds on it.
+
+```
+[state + 0x128] = 1
+TX_CTRL |= 0x10                       START set FIRST
+submit(state + 0x118, len = 16)       a SIXTEEN-BYTE descriptor
+while ([state + 0x128]) ;             spin
+0x00D94B0C()
+```
+
+The base is `[0x0082B310]`, the audio driver's **state pointer** — and two
+instructions earlier the callback `0x0080D955` is stored into the same struct.
+So `+0x128` is a flag the vendor's *interrupt handler* clears, not a register,
+and `+0x10C` in that routine is a state byte rather than `TX_ADDR`. A probe
+that spun on those addresses as MMIO would be reading SRAM and would either
+hang or quietly measure nothing.
+
+That is worth recording as a near miss: the byte-width accesses (`strb` into a
+register block that is otherwise all 32-bit) were the tell, and they were
+visible in the first disassembly.
+
+**What remains testable is real, though, and it is two things:**
+
+1. **START before the descriptor.** The vendor has the channel running when the
+   descriptor lands. `sl6806_audio_play()` writes the descriptor and starts
+   afterwards. If the block latches on a running channel rather than on the
+   START edge, that is the difference.
+2. **A 16-byte primer** submitted before the real buffer.
+
+Both are in `examples/AudioPrime`, with a fourth mode that primes before *every*
+buffer in case the primer arms a single fetch rather than the channel.
+
+The detector needs no judgement: 23040 bytes is 120 ms of audio, unpaced
+retires in ~43 µs, and a factor of **2791** is not something anyone has to
+squint at.
