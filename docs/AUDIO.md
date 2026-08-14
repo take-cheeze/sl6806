@@ -1301,3 +1301,44 @@ That second branch is the point of writing it now. It is the regression that
 will announce success without being modified, the day someone finds what makes
 the block fetch. A demo that prints "playing!" and makes no sound would be
 worse than no demo at all.
+
+### [M] `AudioBeep` confirms the model, and a new lead in the submit path
+
+Four notes, 23040 bytes each, retiring in 43–44 µs against 120 ms of audio.
+**536 B/µs** — another point on the same line, at a length nothing had tested,
+and the sketch correctly printed `NOT PLAYING` with the number rather than
+claiming anything.
+
+Reading the submit path afterwards, two things check out and one does not.
+
+**The descriptor is right.** The vendor's TX submit at `0x0080D9BC` is, exactly:
+`TX_ADDR = addr`; `TX_CTRL[31:16] = len`; then it assembles
+`(3 × len / 4) << 16 | 1` in a stack temporary and stores it to `TX_TRIG`.
+That is `sl6806_audio_trigger_word()` to the bit, three-quarter watermark and
+all.
+
+**The start is right.** `0x00D97A5E` is `TX_CTRL |= 0x10`, and its sibling
+branch does the same to `RX_CTRL` at `+0x208`.
+
+**But there is a priming path the driver has never performed.** At
+`0x00D97A20`, before any of that:
+
+```
+[driver_state + 0x128] = r7          ; a flag, not MMIO
+TX_CTRL |= 0x10                      ; START set FIRST
+submit(0x0080D9BC, buf = state+0x118, len = 16)   ; a SIXTEEN-BYTE descriptor
+while ([driver_state + 0x128]) ;     ; spin until an ISR clears the flag
+0x00D94B0C()
+```
+
+So the vendor **sets START before the descriptor**, submits a 16-byte primer
+from a buffer inside its own driver state, and then *waits for the completion
+interrupt to fire* before doing anything else. `sl6806_audio_play()` writes the
+descriptor and then sets START, never primes, and has no interrupt at all.
+
+Whether a 16-byte primer with START pre-set is what arms the fetch is not
+established — it is one reading of one call site, and this document has
+promoted several of those to conclusions it had to withdraw. But it is the
+first thing found in the fetch path that the driver demonstrably does not do,
+and it is cheap to try: submit 16 bytes with START already set, wait, then
+submit the real buffer and see whether the retire time moves off 43 µs.
