@@ -1,64 +1,66 @@
 /*
- * ToneDemo - push a sine wave through the audio DMA and find the output route.
+ * ToneDemo - a 440 Hz sine into the audio block, and what still will not pace it.
  *
  * ---------------------------------------------------------------------
- *  MEASURED 2026-08-13: THE DMA RUNS. THE OUTPUT STAGE IS OFF.
+ *  [!] REWRITTEN. THIS SKETCH'S OLD PREMISE WAS RETRACTED.
  * ---------------------------------------------------------------------
- * The first version of this sketch got a complete transfer on the first try:
+ * The header this replaces argued, at length, that a 4796-byte descriptor
+ * retiring in 10 us meant nothing was being transferred - 480 MB/s on a
+ * 64 MHz core being impossible. Both halves of that are now wrong:
  *
- *     buffer 1: completion flag set after 1 ms, ctrl=0x12BC0910
+ *   [M] The DMA MOVES DATA. examples/AudioLen swept the descriptor length,
+ *   which none of the twelve-combination runs ever did, and completion time is
+ *   LINEAR IN LENGTH across 500:1 - us = 0.001926 * len + 1.43, ~519 bytes/us.
+ *   A descriptor retired without doing anything takes CONSTANT time. This does
+ *   not. Every sweep behind the old conclusion varied routes, clock sources and
+ *   all 32 bits of 0x400E0000 while holding the length at 4796 bytes, so the
+ *   one variable that could have exposed it was never moved.
  *
- * `0x12BC` is 4796, which is exactly the buffer length in bytes - so the
- * descriptor path is real, the length register holds, and the completion flag
- * comes back on its own. That is the whole data path working.
+ *   [M] And 64 MHz was the wrong clock to call it impossible against. Notes 30
+ *   measured the PLL already running at 192 MHz; ~130 M words/s is two thirds
+ *   of a word per cycle on such a bus, an ordinary DMA rate.
  *
- * It also made no sound, and the line above it says why:
+ * WHAT IS TRUE INSTEAD, and it is more useful than the negative was: the DMA
+ * runs at bus speed and NOTHING PACES IT AT THE SAMPLE RATE. Real time for
+ * 48 kHz stereo 16-bit is 192 KB/s; the measured rate is 2667x that, and the
+ * ratio is constant at every length. That is a DMA draining into a sink which
+ * never back-pressures.
  *
- *     DAC (+0x008) = 0x0
+ * SUSPECTS THIS SKETCH NO LONGER CARRIES, because they are eliminated:
  *
- * The output route register was never written, by this sketch or by
- * sl6806_audio_begin(), so the DAC had no path selected. The corroborating
- * number is the timing: 4796 bytes of 48 kHz 16-bit stereo is **25 ms** of
- * audio, and it was completing in under one. A DMA that drains that fast is
- * not being paced by a sample clock; it is emptying into nothing.
+ *   - "the audio PLL may not be locking". It is at exactly 24.576 MHz.
+ *     0x40080014 reads 0x8C498C00, bit-for-bit what audio_pll_set() writes for
+ *     the 48 kHz family - which is also the point: our own driver sets it from
+ *     sl6806_audio_begin(), so this confirms the decode rather than the chip's
+ *     reset state. See docs/AUDIO.md.
+ *   - the four output routes and the three source modes. Twelve combinations,
+ *     every one still unpaced. That negative was correctly measured: a paced
+ *     DMA would have jumped to 25 ms and none did.
+ *   - the vendor's wider clock chain - romclk 0, module 87, romclk 31 (a ROM
+ *     no-op), romclk 56, and 0x4009B000. examples/AudioPll applied all of it
+ *     with readback on every step and the sweep did not move.
  *
- * ---------------------------------------------------------------------
- *  AND THE SECOND RUN: THE ROUTES WERE NOT THE WHOLE STORY
- * ---------------------------------------------------------------------
- * With the route written and the DAC enabled, all four routes still came back
- * at a **mean of 10 microseconds**. 4796 bytes in 10 us is 480 MB/s on a
- * 64 MHz Cortex-M4 - not a transfer, a descriptor being retired as fast as it
- * can be read. Nothing was clocking the output stage.
+ * SO WHAT THIS SKETCH DOES NOW. It stops re-running the twelve and goes after
+ * the three things that have never been examined, with an instrument that
+ * cannot report a constant when it should report a slope:
  *
- * That run also had a bug worth knowing about: the sweep OR'd each route on
- * top of the last, because the vendor's setter is a read-modify-write and
- * this never cleared +0x08 between attempts. Route 1 should have been 0x2043
- * and read 0x20C3. Only route 0 was actually tested. Fixed here.
+ *   A. Report state, and CENSUS the two registers in the pacing path that have
+ *      never had their implemented bits read back - 0x40080094, the bit clock,
+ *      and 0x4009B000. A census is what found four hidden bits in the PWM's
+ *      pair register after a year of that register being "known".
+ *   B. Establish pacing with TWO lengths, not one. The ratio is the detector:
+ *      real time is 1x, and anything that introduces pacing moves the slope by
+ *      a factor of 2667. A single length is what hid this for four sessions.
+ *   C. Sweep the bit clock divider. sl6806_audio.c hardcodes 8 into
+ *      0x40080094[10:8] because the vendor writes 8; the field is three bits
+ *      and the other seven values have never been tried.
+ *   D. Cycle module 2 off and on rather than bare-enabling it, which is the
+ *      one difference between the vendor's stream start and ours that has
+ *      never been reproduced.
  *
- * The missing piece was the vendor's *stream start* at 0x00D9662C, a
- * different routine from the init - it enables module clock 2, sets a divider
- * of 8 into 0x40080094 and enables it, sets 0x40009400 bit 7, and moves one
- * of three 3-bit source fields from 4 to 6. The divider is the giveaway:
- * 24.576 MHz / 8 and 22.579 MHz / 8 are both exactly 64 fs, which is the bit
- * clock for 32-bit stereo frames.
- *
- * So this sketch now sweeps **three source modes against four routes**,
- * clearing +0x08 between each, and reports the mean completion time for all
- * twelve.
- *
- * WHAT TO WATCH FOR, in order of how much it settles:
- *
- *   1. **A completion time near 25000 us.** That is the DMA being paced by a
- *      real sample clock, which would mean the route is live and the rate is
- *      right. It is a stronger result than hearing something, because it is a
- *      number rather than an impression - and it says which route.
- *   2. **Sound**, on any route, even wrong-pitched or distorted.
- *   3. **All twelve still at 10 us.** The bit clock is not the whole story
- *      either. Next suspects: the module-2 clock needing the vendor's
- *      off-then-on cycle rather than a bare enable, the audio PLL not
- *      actually locking (the sketch prints CRU +0x10/+0x14 so you can see
- *      what it holds), or the amplifier enable this board has and nobody has
- *      found (the settings partition has a `spk_switch` key; §7k).
+ * The sine plays throughout. If anything ever paces the DMA you will hear it
+ * before you read it - but the ratio is the result, because five rounds of the
+ * PWM investigation were lost to trusting an impression over a number.
  *
  * Plug headphones in. The speaker may need an enable that is not in the
  * variant's pad map; the headphone jack is at least wired to something, since
@@ -66,14 +68,11 @@
  *
  * WHAT IS STILL A GUESS
  *
- *   - **The sample format.** 16-bit stereo little-endian is what the vendor's
- *     config struct looks like it carries, but the byte that would settle it
- *     comes from a caller this analysis did not follow. Wrong pitch or noise
- *     points here first: try mono, try 8-bit.
- *   - **The `trim` field** at +0x08 [12:8]. The vendor takes it from its own
- *     driver state; this passes 0.
- *   - **There is no interrupt.** The vendor refills from IRQ 30 at the
- *     three-quarter mark. This polls and re-submits, so it will gap between
+ *   - The sample format. 16-bit stereo little-endian is what the vendor's
+ *     config struct looks like it carries. Wrong pitch or noise points here
+ *     first: try mono, try 8-bit.
+ *   - There is no interrupt. The vendor refills from IRQ 30 at the
+ *     three-quarter mark; this polls and re-submits, so it will gap between
  *     buffers even when everything else is right. A gapped tone is a success.
  *
  *     make SKETCH=examples/ToneDemo RUN_MODE=poll run
@@ -84,6 +83,8 @@
 
 #include <Arduino.h>
 #include "sl6806_audio.h"
+#include "sl6806_module.h"
+#include "sl6806_mmio.h"
 
 #define RATE      48000u
 #define TONE_HZ   440u
@@ -150,165 +151,196 @@ static void report(const char *what, uint32_t v)
 }
 
 static bool up;
-static unsigned route;
-static unsigned mode;
-static unsigned nbuf;
-static unsigned long total_us;
-static unsigned timeouts;
+static int  phase = -1;
+static int  step;
 
 /*
- * How long one buffer takes, in microseconds. millis() was useless here: the
- * first run printed "0 ms" for every buffer, and the interesting question is
- * whether the answer is 0.5 ms or 25 ms.
+ * TWO LENGTHS, AND THE RATIO IS THE RESULT.
+ *
+ * A single length cannot tell "the DMA is unpaced" from "the DMA is not
+ * running", because both give a small constant. Two lengths can: an unpaced
+ * DMA's time is proportional to length at bus speed, a paced one at 192 KB/s,
+ * and those differ by 2667x. Reported as bytes/us so the comparison needs no
+ * arithmetic from the reader.
  *
  * Bounded well under the host's ~1 s SCSI timeout, because in RUN_MODE=poll
- * this runs inside the boot ROM's USB command handler.
+ * this runs inside the boot ROM's USB command handler. 60 ms is also more than
+ * twice the 25 ms a real-time buffer would take, so a paced transfer has room
+ * to finish rather than reading as a timeout.
  */
-static unsigned long playOne(void)
+static unsigned long timeLen(uint32_t len)
 {
     unsigned long start;
 
-    if (sl6806_audio_play(wave, sizeof(wave)) != 0)
-        return 0;
-
+    if (sl6806_audio_play(wave, len) != 0)
+        return 0;                        /* rejected - never a measurement */
     start = micros();
-    while (micros() - start < 200000ul) {
+    while (micros() - start < 60000ul)
         if (sl6806_audio_done())
             return micros() - start;
-    }
-    return 0;                           /* did not finish */
+    return 60000ul;
 }
 
-static void startCombo(unsigned m, unsigned r)
+static void pace(const char *tag)
 {
-    Serial.println();
-    Serial.print("--- source mode ");
-    Serial.print(m);
-    Serial.print(", route ");
-    Serial.print(r);
-    Serial.println(" ---");
+    const uint32_t small = 4796u, big = (uint32_t)sizeof(wave);
+    unsigned long a = timeLen(small), b = timeLen(big);
 
-    /*
-     * Clear +0x08 first. The vendor's route setter is a read-modify-write and
-     * expects to start from whatever its own driver left; sweeping without
-     * clearing OR's each route on top of the last, which is what made the
-     * previous run's routes 1..3 untested.
-     */
-    sl6806_mmio_write(SL6806_AUD_DAC, 0);
-    sl6806_audio_route(0, r, 0);
-    sl6806_audio_route(1, r, 0);
-    sl6806_audio_clock_start(m);
+    Serial.printf("  %-22s %5lu B/%lu us   %5lu B/%lu us",
+                  tag, (unsigned long)small, a, (unsigned long)big, b);
+    if (!a || !b) {
+        Serial.println("   REJECTED - not a measurement");
+        return;
+    }
+    Serial.printf("   %lu B/us  %lux real time\n",
+                  (unsigned long)(big / (b ? b : 1)),
+                  (unsigned long)((big * 1000ul / 192ul) / (b ? b : 1)));
+}
 
-    report("  DAC    (+0x008)", sl6806_mmio_read(SL6806_AUD_DAC));
-    report("  bitclk 40080094", sl6806_mmio_read(SL6806_AUD_BITCLK_REG));
+/*
+ * An implemented-bit census, one bit at a time with a restore after each.
+ *
+ * All-ones in one write would be quicker and is how the PWM's pair register
+ * was first "measured" - with 0x3F0F, which does not set bits [7:4] at all, so
+ * four implemented bits went unseen for a year. One bit at a time cannot make
+ * that mistake, and on a CRU register it also never holds an unknown bit for
+ * more than a single write.
+ */
+static void census(const char *name, uint32_t reg)
+{
+    uint32_t saved = sl6806_mmio_read(reg);
+    uint32_t mask = 0;
+    unsigned b;
 
-    nbuf = 0;
-    total_us = 0;
-    timeouts = 0;
+    for (b = 0; b < 32; b++) {
+        uint32_t m = 1u << b;
+
+        sl6806_mmio_write(reg, saved | m);
+        if (sl6806_mmio_read(reg) & m)
+            mask |= m;
+        sl6806_mmio_write(reg, saved);
+    }
+    Serial.printf("  %-14s %08x  holds %08x  implemented %08x\n",
+                  name, (unsigned)reg, (unsigned)saved, (unsigned)mask);
 }
 
 void setup()
 {
     Serial.begin(115200);
     Serial.println();
-    Serial.println("=== SL6806 tone demo ===");
-    Serial.println("440 Hz, 48 kHz, 16-bit stereo, into 0x40009000.");
-    Serial.println("A buffer is 25.0 ms of audio. Watch the completion time:");
-    Serial.println("near 25000 us means a sample clock is pacing the DMA.");
-    Serial.println();
+    Serial.println("=== SL6806 tone: what still will not pace the DMA ===");
+    Serial.println("read the header - the old 10 us conclusion is retracted.");
 
     fillTone();
-    Serial.print("buffer at 0x");
-    Serial.print((uint32_t)(uintptr_t)wave, HEX);
-    Serial.print(", ");
-    Serial.print((uint32_t)sizeof(wave));
-    Serial.println(" bytes");
+    Serial.printf("buffer at %08x, %lu bytes, %s\n",
+                  (unsigned)(uintptr_t)wave, (unsigned long)sizeof(wave),
+                  ((uintptr_t)wave & 3u) ? "NOT WORD ALIGNED - rows will be"
+                                           " rejected" : "word aligned");
 
     up = sl6806_audio_begin(RATE) != 0;
     Serial.print("sl6806_audio_begin(48000): ");
-    Serial.println(up ? "module clock acked, block configured"
-                      : "MODULE CLOCK REFUSED - stop here, see AudioProbe");
-
+    Serial.println(up ? "ok" : "MODULE CLOCK REFUSED - stop here, see AudioProbe");
     if (!up)
         return;
 
-    /* Everything audible at once, so silence is not a muted channel. */
     for (unsigned ch = 0; ch < SL6806_AUD_TX_CHANNELS; ch++) {
         sl6806_audio_volume(ch, SL6806_AUD_VOL_MAX);
         sl6806_audio_mute(ch, 0);
     }
+    sl6806_mmio_write(SL6806_AUD_DAC, 0);
+    sl6806_audio_route(0, 1, 0);
+    sl6806_audio_route(1, 1, 0);
+    sl6806_audio_clock_start(1);
 
-    report("PLL sel  (40080010)", sl6806_mmio_read(SL6806_AUD_PLL_SEL));
-    report("PLL rat  (40080014)", sl6806_mmio_read(SL6806_AUD_PLL_RATIO));
-
-    mode = 1;
-    /*
-     * The EQ sub-block's clocks, held rather than borrowed. Off by default so
-     * this sketch keeps measuring the same thing it measured before; build
-     * with -DTONEDEMO_EQ_HOLD=1 to add them. See sl6806_audio_eq_hold().
-     */
-#ifdef TONEDEMO_EQ_HOLD
-    sl6806_audio_eq_hold(1);
-    Serial.println("EQ sub-block clocks HELD (module 32, romclk 45, padmux 2)");
-    report("  0x40000020", sl6806_mmio_read(SL6806_AUD_PADMUX_REG));
-    report("  +0x400     ", sl6806_mmio_read(SL6806_AUD_EQ_CTRL));
-#endif
-
-    route = 0;
-    startCombo(mode, route);
+    Serial.println("'a' state+census  'b' baseline pace  'c' divider sweep"
+                   "  'd' module 2 cycle  'q' stop");
 }
 
 void loop()
 {
-    unsigned long us;
+    int key = Serial.read();
 
     if (!up)
         return;
-
-    us = playOne();
-    if (us)
-        total_us += us;
-    else
-        timeouts++;
-    nbuf++;
-
-    if (nbuf < BUFFERS_PER_ROUTE)
+    if (key == 'q') { phase = -1; Serial.println("stopped."); return; }
+    if (key == 'a' || key == 'b' || key == 'c' || key == 'd') {
+        phase = key; step = 0;
+    }
+    if (phase < 0)
         return;
 
-    /*
-     * One summary line per route rather than one per buffer. The first run
-     * printed a line per buffer, outran the monitor's poll rate and lost
-     * output - and forty identical lines say nothing one mean does not.
-     */
-    Serial.print("  ");
-    Serial.print(nbuf);
-    Serial.print(" buffers, mean ");
-    Serial.print(total_us / nbuf);
-    Serial.print(" us (25000 us would be real-time)");
-    if (timeouts) {
-        Serial.print(", ");
-        Serial.print(timeouts);
-        Serial.print(" never finished");
-    }
-    Serial.println();
-    report("  ctrl (+0x108)", sl6806_mmio_read(SL6806_AUD_TX_CTRL));
+    switch (phase) {
+    case 'a':
+        Serial.println("\n--- state, and a census of the pacing path");
+        report("  PLL sel  40080010", sl6806_mmio_read(SL6806_AUD_PLL_SEL));
+        report("  PLL rat  40080014", sl6806_mmio_read(SL6806_AUD_PLL_RATIO));
+        report("  DAC      +0x008  ", sl6806_mmio_read(SL6806_AUD_DAC));
+        report("  TX ctrl  +0x108  ", sl6806_mmio_read(SL6806_AUD_TX_CTRL));
+        Serial.println("  0x8C498C00 in PLL rat is the 48 kHz family - and is");
+        Serial.println("  our own audio_pll_set()'s write, not a reset value.");
+        Serial.println("  census (one bit at a time, restored after each):");
+        census("bit clock", SL6806_AUD_BITCLK_REG);
+        census("0x4009B040", 0x4009B040u);
+        census("0x4009B04C", 0x4009B04Cu);
+        census("0x4009B050", 0x4009B050u);
+        Serial.println("  any implemented bit outside what the driver writes is");
+        Serial.println("  a field nobody has tried.");
+        phase = -1;
+        break;
 
-    route++;
-    if (route >= SL6806_AUD_ROUTES) {
-        route = 0;
-        mode++;
-    }
-    if (mode <= SL6806_AUD_SRC_MODES) {
-        startCombo(mode, route);
-        return;
-    }
+    case 'b':
+        Serial.println("\n--- baseline pacing (two lengths; the ratio is the result)");
+        pace("as configured");
+        Serial.println("  2667x real time = unpaced. 1x = paced, and done.");
+        phase = -1;
+        break;
 
-    Serial.println();
-    Serial.println("twelve combinations tried. Two things to report:");
-    Serial.println(" - any that sounded, and what it sounded like;");
-    Serial.println(" - any whose mean moved off 10 us at all. 25000 us is");
-    Serial.println("   real time; even 2000 would mean something is pacing.");
-    sl6806_audio_clock_stop();
-    sl6806_audio_end();
-    up = false;
+    case 'c':
+        /*
+         * The field is three bits and the driver writes DIV - 1, so field N
+         * divides by N + 1. The vendor's 8 is field 7, and fields 0..6 -
+         * divide by 1 through 7 - have never been tried. 24.576 MHz / 8 is
+         * 64 fs for 32-bit stereo frames, which is why 8 was believed right;
+         * that reasoning assumes a frame size nothing has confirmed.
+         */
+        if (step == 0)
+            Serial.println("\n--- bit clock divider sweep, 0x40080094[10:8]"
+                           "  (field N = divide by N+1; the driver uses 7)");
+        if (step > 7) { phase = -1; break; }
+        sl6806_mmio_field(SL6806_AUD_BITCLK_REG, SL6806_AUD_BITCLK_DIV_SHIFT,
+                          SL6806_AUD_BITCLK_DIV_BITS, (uint32_t)step);
+        sl6806_mmio_set(SL6806_AUD_BITCLK_REG, SL6806_AUD_BITCLK_ENABLE);
+        {
+            /* step is 0..7 by construction, so the two digits are the whole
+             * range - but say so rather than rely on the compiler agreeing. */
+            static const char *const tags[8] = {
+                "field 0 = /1", "field 1 = /2", "field 2 = /3", "field 3 = /4",
+                "field 4 = /5", "field 5 = /6", "field 6 = /7", "field 7 = /8",
+            };
+            pace(tags[step & 7]);
+        }
+        step++;
+        break;
+
+    case 'd':
+        /*
+         * The vendor's stream start cycles this module rather than bare
+         * enabling it, and sl6806_module.h records that the disable direction
+         * is the dangerous one - so this only ever switches off an id it is
+         * about to switch back on, in that order, and nothing else.
+         */
+        Serial.println("\n--- module 2 off-then-on, then measure");
+        sl6806_module_disable(2);
+        Serial.printf("  module 2 off, enabled: %s\n",
+                      sl6806_module_enabled(2) ? "STILL ON" : "off");
+        Serial.printf("  module 2 on: %s\n",
+                      sl6806_module_enable(2) ? "acked" : "REFUSED");
+        pace("after the cycle");
+        phase = -1;
+        break;
+
+    default:
+        phase = -1;
+        break;
+    }
 }

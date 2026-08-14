@@ -915,3 +915,41 @@ and the three registers in `0x4009B000` — that block really is unnamed
 anywhere in this tree, and none of that chain is performed by
 `sl6806_audio_begin()`. So does the negative: applying all of it, with
 readback confirming each step, moved the length sweep not at all.
+
+## `examples/ToneDemo`, rewritten around what is left
+
+The old sketch re-ran twelve route/source combinations against a single
+descriptor length and reported a mean. That is the measurement whose constant
+10 µs was mistaken for a negative, and re-running it would only reproduce the
+mistake — so the sketch now goes after the parts of the pacing path that have
+never been examined, with an instrument that cannot report a constant where a
+slope belongs.
+
+**A — state, and a census of the pacing path.** One bit at a time, restored
+after each, on `0x40080094` and on the three `0x4009B000` registers the vendor
+writes. All-ones in a single write would be quicker and is exactly how the
+PWM's pair register came to be recorded as `0x10F` for a year when it is
+`0x1FF`: the probe wrote `0x3F0F`, which does not set bits [7:4] at all. Any
+implemented bit outside what the driver writes is a field nobody has tried.
+
+**B — pacing, measured at two lengths.** A single length cannot separate "the
+DMA is unpaced" from "the DMA is not running" — both give a small constant.
+Two can: unpaced is bus speed, paced is 192 KB/s, and the two differ by 2667×.
+Reported as bytes/µs and as a multiple of real time so the comparison needs no
+arithmetic from the reader.
+
+**C — the bit clock divider.** `sl6806_audio.c` writes `DIV - 1 = 7` into
+`0x40080094[10:8]`, so the vendor's divide-by-8 is field 7 and fields 0..6 —
+divide by 1 through 7 — have never been tried. The justification for 8 is that
+24.576 MHz / 8 is 64 fs for 32-bit stereo frames, which assumes a frame size
+nothing has confirmed.
+
+**D — module 2 cycled off and on**, which is the one difference between the
+vendor's stream start and ours that has never been reproduced. It only ever
+switches off an id it immediately switches back on; `sl6806_module.h` records
+that the disable direction is the dangerous one.
+
+The sine still plays throughout, so a success is audible before it is
+readable — but **the ratio is the result**. Five rounds of the PWM work were
+lost to trusting an impression over a number, and one of them to a panel that
+was blinking rather than dimming.
