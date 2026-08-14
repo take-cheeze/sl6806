@@ -356,6 +356,22 @@ int sl6806_sd_controller_begin(uint32_t edge, uint32_t clkcr);
 int sl6806_sd_read_block(uint32_t lba, void *buf);
 
 /*
+ * The same read, without requiring a successful sl6806_sd_begin().
+ *
+ * FOR PROBES ONLY, and it exists because of a specific dead end: on this
+ * board no command has ever completed, so `begin()` never succeeds, so
+ * sl6806_sd_read_block() refuses before it touches the bus and nothing
+ * downstream can be tested at all. This issues the read anyway - data-enable,
+ * block size, length, CMD17, drain - and reports what the data path does.
+ *
+ * `high_capacity` picks the addressing, since identification never got far
+ * enough to determine it: non-zero passes `lba` through, zero multiplies by
+ * 512. Guess wrong on a working card and you read the wrong sector; guess
+ * wrong on this one and nothing happens either way.
+ */
+int sl6806_sd_read_block_unchecked(uint32_t lba, void *buf, int high_capacity);
+
+/*
  * Read `count` consecutive blocks, one CMD17 each. Not CMD18: multi-block
  * needs the stop command and its own status handling, and single-block reads
  * are the thing worth getting working first. Returns on the first failure,

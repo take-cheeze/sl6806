@@ -11,7 +11,7 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
 TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
-         test_regfile test_audio test_bt test_sd
+         test_regfile test_audio test_bt test_sd test_fat
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -44,6 +44,9 @@ run-test_bt: test_bt
 	./$<
 
 run-test_sd: test_sd
+	./$<
+
+run-test_fat: test_fat
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -106,6 +109,12 @@ test_bt: test_bt.c $(CORE)/sl6806_bt.c $(CORE)/sl6806_module.c
 test_sd: test_sd.c $(CORE)/sl6806_sd.c $(CORE)/sl6806_module.c \
          $(CORE)/sl6806_padctl.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
+
+# The FAT reader against FAT16 and FAT32 volumes built in memory. It takes a
+# block-reader callback and knows nothing about SD, which is the whole reason
+# it can be tested at all - the SD host has never completed a command.
+test_fat: test_fat.c $(CORE)/sl6806_fat.c
+	$(CC) $(CFLAGS) $^ -o $@
 
 clean:
 	rm -f $(TESTS) *.ppm

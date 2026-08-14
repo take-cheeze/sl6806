@@ -790,19 +790,11 @@ static int sd_drain(uint32_t *p)
     return SL6806_SD_OK;
 }
 
-int sl6806_sd_read_block(uint32_t lba, void *buf)
+/* The body of both read entry points. `addr` is already in the card's own
+ * units - blocks for high capacity, bytes for everything else. */
+static int sd_read_at(uint32_t addr, void *buf)
 {
-    uint32_t addr;
     int err;
-
-    if (!g_ready)
-        return SL6806_SD_ERR_STATE;
-    if (!buf || ((uintptr_t)buf & 3u))
-        return SL6806_SD_ERR_STATE;
-
-    /* [V] ROM 0x00004790: everything but a high-capacity card is addressed
-     * in bytes. */
-    addr = (g_card.type == SL6806_SD_TYPE_SDHC) ? lba : (lba << 9);
 
     sd_clear(SL6806_SD_STA_CLEAR_ALL);
 
@@ -821,6 +813,26 @@ int sl6806_sd_read_block(uint32_t lba, void *buf)
         return err;
 
     return sd_drain((uint32_t *)buf);
+}
+
+int sl6806_sd_read_block(uint32_t lba, void *buf)
+{
+    if (!g_ready)
+        return SL6806_SD_ERR_STATE;
+    if (!buf || ((uintptr_t)buf & 3u))
+        return SL6806_SD_ERR_STATE;
+
+    /* [V] ROM 0x00004790: everything but a high-capacity card is addressed
+     * in bytes. */
+    return sd_read_at((g_card.type == SL6806_SD_TYPE_SDHC) ? lba : (lba << 9),
+                      buf);
+}
+
+int sl6806_sd_read_block_unchecked(uint32_t lba, void *buf, int high_capacity)
+{
+    if (!buf || ((uintptr_t)buf & 3u))
+        return SL6806_SD_ERR_STATE;
+    return sd_read_at(high_capacity ? lba : (lba << 9), buf);
 }
 
 int sl6806_sd_read_blocks(uint32_t lba, void *buf, uint32_t count,

@@ -657,6 +657,37 @@ Three readings of its output:
    attributed, and a rail that is off would explain why even the ROM's own
    CMD0 timed out with no card present.
 
+## Reading the filesystem
+
+`cores/sl6806_fat.[ch]` is a read-only FAT16/FAT32 reader — mount through an
+MBR or a bare boot sector, directory listing, file read by cluster chain. It
+takes a **block-reader callback and knows nothing about SD**, which is the
+only reason it can be checked at all: `tests/host/test_fat.c` builds real
+FAT16 and FAT32 volumes in memory and reads them back, 43 checks. The FAT
+width comes from the cluster count rather than the string in the boot sector,
+long-name entries are skipped rather than parsed as files, and chains are
+followed for both files and directories.
+
+```sh
+make SKETCH=examples/SdFiles RUN_MODE=poll run
+```
+
+walks the whole stack and reports where it stops — bring-up, identification,
+the block read, the partition table, the boot sector, the directory. **It will
+stop at the block read on this board**, because no command has ever completed;
+it goes through `sl6806_sd_read_block_unchecked()` so that a failed
+identification does not prevent the data phase from being tried, since
+identification needs six commands to work and a data phase needs one.
+
+So the stack is one unknown — does a sector arrive — with a tested reader
+waiting behind it. Nothing here writes.
+
+**If you only want the files off the card**, plug the device in without
+holding a boot key: the stock firmware enumerates as USB mass storage
+(`301a:2801`) and the card mounts on the host. That also happens to be a
+measurement worth taking, since it would show the socket, the card and the SD
+host all working under the vendor's own firmware.
+
 ## What is not done
 
 - **Writing.** CMD24 and CMD25 are in the ROM's table and nothing else is
