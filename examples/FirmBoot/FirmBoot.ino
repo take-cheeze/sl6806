@@ -111,9 +111,15 @@ extern "C" {
  * already set the clock tree, which this did not.
  *
  * So this now does, by calling the mask ROM's own routines
- * (sl6806_hwinit_clocks()). Build with -DFIRMBOOT_CLOCKS=0 to go back to the
- * behaviour that booted but enumerated badly - worth having, because it is
- * the known-working half of a comparison.
+ * (sl6806_hwinit_clocks()). It also switches every module clock off first, which is what
+ * hardware_init does before anything else (ROM 0x3BFC) and which is the
+ * likeliest reason the application's USB was unstable: it expects a chip
+ * whose peripherals are all off, and a payload hands it one where the boot
+ * ROM's USB is enumerated and talking.
+ *
+ * Build with -DFIRMBOOT_CLOCKS=0 to go back to the behaviour that booted but
+ * enumerated badly - worth having, because it is the known-working half of a
+ * comparison.
  */
 #ifndef FIRMBOOT_CLOCKS
 #define FIRMBOOT_CLOCKS 1
@@ -249,11 +255,13 @@ void loop()
 
 #if FIRMBOOT_CLOCKS
     /*
-     * Last thing before the handover, and deliberately after the flush: this
-     * changes clocks the boot ROM's USB may be running on, so anything not
-     * already collected is lost either way. The application is about to
-     * reconfigure all of it regardless.
+     * hardware_init's order, and the first step is the one that was missing:
+     * every module clock off, then the clock tree, then the jump. Both take
+     * the console with them - USB's module clock is among the ninety-six -
+     * which is why they come after the flush and immediately before the
+     * handover.
      */
+    sl6806_hwinit_modules_off();
     sl6806_hwinit_clocks();
 #endif
 

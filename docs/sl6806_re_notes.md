@@ -6087,3 +6087,45 @@ and the card question can finally be asked.
 Detaching properly before jumping would need the USB controller's registers,
 which this project does not have — §7l looked at `0x40040000`, called it
 "most likely a USB controller", and left it there.
+
+### [V] ROM 0x3BFC switches off every module clock — and that is what FirmBoot was missing
+
+Reading the three unread steps of `hardware_init` (§24) after a second and
+third unstable-USB result. Two are unremarkable and the first is the answer.
+
+| Step | What it is |
+|---|---|
+| `0x00820284` | `cpsie i`. One instruction. |
+| `0x00820DF8(24)` | ROM `0xBAC8`: module 69, clock id 52 at divider 24, then rate-derived tick constants. A system timer. |
+| **ROM `0x3BFC`** | **zeroes CRU `+0x60`, `+0x64`, `+0x68`, `+0x70`, `+0x74`, `+0x78`, then delays** |
+
+Those six registers are §15b's module-clock gates and shadows — three banks of
+32 ids, gate and shadow each. **ROM `0x3BFC` switches off every module clock
+on the chip**, and it is the *first* thing `hardware_init` does after the
+NVIC setup. Everything the bootloader wants afterwards it enables again by
+name, which is why §24's phase list reads as a sequence of enables.
+
+`examples/FirmBoot` did none of that. The application starts expecting a chip
+whose peripherals are all switched off; entered from a payload it finds
+instead whatever the boot ROM left running — **USB enumerated and
+mid-conversation with a host** — plus whatever the payload itself woke, which
+by then included the SD host and the serial port. An application initialising
+a USB controller that is already running and enumerated is a good description
+of the instability measured three times, and it explains why replugging the
+cable did not help: the controller's state was wrong before the host ever
+looked.
+
+`sl6806_hwinit_modules_off()` calls ROM `0x3BFC` — the ROM rather than six
+stores of zero, because it also waits afterwards and the length of that wait
+is part of what makes turning ninety-six clocks off at once safe. Guessing the
+delay would be inventing the important half.
+
+`FirmBoot` now performs `hardware_init`'s order: **modules off, then the clock
+tree, then the jump**, all after the final flush, because the first step takes
+the console with it — USB's module clock is one of the ninety-six.
+
+If this is right, the next run enumerates cleanly and the card question can
+finally be asked. If it is not, what is left of `hardware_init` is fully read
+and the difference is somewhere else entirely — and the instrument for finding
+it is the serial port, because the application *prints* its own startup, in
+detail, to `0x40091000`.

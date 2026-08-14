@@ -168,6 +168,30 @@ uint32_t sl6806_pll_set_divider(unsigned d);
  */
 uint32_t sl6806_hwinit_clocks(void);
 
+/*
+ * Switch off every module clock on the chip — ROM 0x3BFC, which is the first
+ * thing the bootloader's hardware_init does after the NVIC.
+ *
+ * It zeroes the CRU's six module-gate and shadow registers (`+0x60`, `+0x64`,
+ * `+0x68`, `+0x70`, `+0x74`, `+0x78` — §15b's three banks of 32 ids, gate and
+ * shadow) and waits. Everything the bootloader wants afterwards it enables
+ * again by name.
+ *
+ * **This is the difference examples/FirmBoot was missing.** The application
+ * starts expecting a chip whose peripherals are all switched off, and enables
+ * what it needs from there. Entered from a payload it finds instead whatever
+ * the boot ROM left running - USB enumerated and mid-conversation with a host
+ * - plus whatever the payload itself woke. An application initialising a USB
+ * controller that is already running is a good description of the unstable
+ * enumeration measured twice.
+ *
+ * ⚠ **This takes the console with it, immediately and by design.** USB's
+ * module clock is among the ninety-six. Call it only as the last thing before
+ * sl6806_firm_boot(), after everything has been printed and flushed. There is
+ * no way back except the jump or a power cycle.
+ */
+void sl6806_hwinit_modules_off(void);
+
 #ifdef __cplusplus
 }
 #endif

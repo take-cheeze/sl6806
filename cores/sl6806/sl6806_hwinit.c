@@ -78,6 +78,10 @@ typedef void (*rom_1_t)(uint32_t);
 #define ROM_CLK_DISABLE ((rom_1_t)0x000024C5u)
 #define ROM_SET_DIVIDER ((rom_2_t)0x0000289Du)
 
+/* [V] ROM 0x3BFC: zero the six module gate/shadow registers, then delay. */
+typedef void (*rom_0_t)(void);
+#define ROM_MODULES_OFF ((rom_0_t)0x00003BFDu)
+
 #define FLASH_HOST 0x400F7000u
 
 uint32_t sl6806_hwinit_clocks(void)
@@ -106,4 +110,16 @@ uint32_t sl6806_hwinit_clocks(void)
     ROM_SET_DIVIDER(6u, SL6806_PLL_TARGET_HZ / 32000000u);   /* 12 */
 
     return sl6806_pll_hz();
+}
+
+void sl6806_hwinit_modules_off(void)
+{
+    /*
+     * The ROM's own routine rather than six stores of zero, for the same
+     * reason sl6806_hwinit_clocks() calls the ROM: it also waits afterwards,
+     * and the length of that wait is part of what makes it safe to turn
+     * ninety-six clocks off at once. Transcribing the stores and guessing the
+     * delay would be inventing the important half.
+     */
+    ROM_MODULES_OFF();
 }
