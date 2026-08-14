@@ -573,7 +573,9 @@ void loop()
         static const struct { const char *name; uint32_t addr; } src[] = {
             { "SRAM (wave)",   0 },                 /* filled in below */
             { "XIP flash",     0x00C10000u },
-            { "mask ROM",      0x00000000u },
+            /* Not 0: sl6806_audio_play() rejects a NULL buffer, which is
+             * correct of it and cost this row on the first run. */
+            { "mask ROM",      0x00000100u },
         };
         unsigned i;
 

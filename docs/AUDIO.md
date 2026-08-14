@@ -1208,3 +1208,67 @@ are plainly readable, so nothing can fault.
 
 Same shape as the length sweep that started this, moved to the one variable
 nothing has ever varied.
+
+## [M] SETTLED — the DMA does not read its source. The original negative was right.
+
+```
+SRAM (wave)  00838b38  4796 bytes in 9 us  (532 B/us)
+XIP flash    00c10000  4796 bytes in 9 us  (532 B/us)
+```
+
+**Identical.** XIP flash is off-chip SPI, and the bootloader sets that clock to
+32 MHz (`romclk_set(6, 12)`, 384 MHz / 12). Reading 4796 bytes from it:
+
+| mode | rate | time |
+|---|---|---|
+| single-bit SPI | 4 MB/s | 1199 µs |
+| dual | 8 MB/s | 600 µs |
+| quad | 16 MB/s | 300 µs |
+| **measured** | | **9 µs** |
+
+532 MB/s out of SPI flash is impossible by any margin, cache or not. A transfer's
+time depends on how fast its source can be read; this one does not depend on it
+at all. **The DMA does not read its source.**
+
+(The mask ROM row was rejected: `sl6806_audio_play()` refuses a NULL buffer,
+which is correct of it. The sketch now uses `0x00000100`. Two sources four
+orders of magnitude apart already settle it.)
+
+### So the retraction is itself retracted
+
+`docs/AUDIO.md`'s original conclusion — *the block accepts a descriptor and
+retires it having moved nothing* — **was right.** What was wrong was only its
+reasoning: 480 MB/s was called impossible against a 64 MHz core, and §30 had
+already measured the bus PLL at 192 MHz, where that rate is unremarkable. The
+conclusion survived its own bad argument.
+
+And my replacement was worse, because it was confidently stated: *linear in
+length, therefore data moves.* A length counter decrementing at bus rate is
+linear in length too. ~519 B/µs is about 130 M words/s, which against a 192 MHz
+bus is a counter retiring roughly one word per one-and-a-half cycles — exactly
+what a descriptor being read down without any fetch looks like.
+
+The state of the block, on evidence that now holds:
+
+| | |
+|---|---|
+| TX descriptor | retires in time linear in length, **independent of source memory** — an internal counter |
+| RX descriptor | never retires at all |
+| memory | never observed to change, in either direction |
+| routes, source modes, `0x400E0000`, bit clock divider and bit 4, module 2 cycle, the vendor's wider clock chain, audio PLL | all applied with readback, all negative |
+
+So `0x40009000` is configured, its registers hold what the vendor's code puts
+there, and **nothing in it fetches**. The question is no longer "what paces the
+DMA" — it is "what makes the DMA fetch at all", which is a different and
+earlier question than this document has been asking since the beginning.
+
+### What that leaves
+
+The census already mapped the unexplored surface: 25 implemented-but-never-written
+bits in `0x4009B04C`, four in `0x4009B050`, three in `0x4009B040`. Beyond that,
+the audio block's own registers have never had an implemented-bit census of
+their own — only `0x40009400` and `0x4000940C` have been read, and the reset
+values of thirty others were recorded without ever asking which of their bits
+are writable.
+
+That is where a fetch enable would be, if it is anywhere reachable.
