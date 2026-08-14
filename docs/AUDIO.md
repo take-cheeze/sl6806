@@ -1272,3 +1272,32 @@ values of thirty others were recorded without ever asking which of their bits
 are writable.
 
 That is where a fetch enable would be, if it is anywhere reachable.
+
+## `examples/AudioBeep` — the demo, and why it is honest about being silent
+
+`examples/ToneDemo` is now seven phases of instrumentation and is unreadable as
+an example. `AudioBeep` is the twenty-line version: begin, route, volume,
+unmute, `sl6806_audio_play()`, four notes of an arpeggio.
+
+**It makes no sound today**, because the block does not fetch — and it says so
+rather than leaving the reader to suspect their headphones. It measures instead
+of claiming:
+
+> A buffer of N bytes of 48 kHz 16-bit stereo is N/192 ms of audio. If the
+> hardware is really playing it, the completion **cannot arrive sooner than
+> that** — a DAC consuming at 48 kHz is what paces the DMA, and that is exactly
+> what "it works" means here.
+
+So each note prints its retire time against the 120 ms it lasts, and the sketch
+ends with one of two verdicts:
+
+- **NOT PLAYING** — with the fastest retire quoted, and a pointer to this
+  document. Expected today.
+- **PACED AT REAL TIME** — the block is playing. If nothing is audible at that
+  point the fault has moved *past* the DMA to routing, the amplifier enable or
+  the jack, which is a different and much shorter search.
+
+That second branch is the point of writing it now. It is the regression that
+will announce success without being modified, the day someone finds what makes
+the block fetch. A demo that prints "playing!" and makes no sound would be
+worse than no demo at all.
