@@ -104,6 +104,14 @@
 #define FRAMES    (PERIOD * 11u)
 static int16_t wave[FRAMES * CHANNELS] __attribute__((aligned(4)));
 
+/*
+ * A separate buffer for the capture test, pre-filled with an address-derived
+ * pattern so a partial or shifted write is as visible as a full one - the
+ * rule docs/sl6806_re_notes.md 3 gives for any memory probe.
+ */
+#define CAP_BYTES 2048u
+static uint32_t capbuf[CAP_BYTES / 4] __attribute__((aligned(4)));
+
 /* 25 ms a buffer if it is ever paced; 20 per combination, 12 combinations. */
 #define BUFFERS_PER_ROUTE  20u
 
@@ -288,7 +296,9 @@ void setup()
     sl6806_audio_clock_start(1);
 
     Serial.println("'a' state+census  'b' baseline pace  'c' divider sweep"
-                   "  'd' module 2 cycle  'e' bit clock bit 4  'q' stop");
+                   "  'd' module 2 cycle  'e' bit clock bit 4\n"
+                   "'f' DOES THE DMA TOUCH MEMORY (capture, RX enabled)"
+                   "  'q' stop");
 }
 
 void loop()
@@ -310,12 +320,12 @@ void loop()
      * unhandled key now says so instead of being swallowed.
      */
     if (key >= 0) {
-        if (key >= 'a' && key <= 'e') {
+        if (key >= 'a' && key <= 'f') {
             phase = key;
             step = 0;
             Serial.printf("\n[%c]\n", key);
         } else if (key != '\r' && key != '\n') {
-            Serial.printf("unknown key '%c' - try a b c d e q\n", key);
+            Serial.printf("unknown key '%c' - try a b c d e f q\n", key);
             return;
         }
     }
@@ -447,6 +457,82 @@ void loop()
         Serial.println("  if either row moves off 2667x, that is the pacing.");
         phase = -1;
         break;
+
+    case 'f': {
+        /*
+         * [!] THE TEST THAT SETTLES WHAT LINEARITY DOES NOT.
+         *
+         * docs/AUDIO.md - and this sketch's header - argue that completion
+         * time being linear in length proves the DMA moves data, because a
+         * descriptor retired without doing anything would take constant time.
+         * That does not follow. A hardware LENGTH COUNTER decrementing at bus
+         * speed is also linear in length and reads no memory at all.
+         * Linearity proves the block processes the length; it does not prove
+         * it touches RAM.
+         *
+         * Only a test that OBSERVES MEMORY separates the two, and a TX engine
+         * cannot be caught in the act - only RX can. The one capture test ever
+         * run is already recorded as weak, and now the reason is exact:
+         * sl6806_audio_begin() sets TX_ENABLE bit 0 at sl6806_audio.c:154 and
+         * NEVER TOUCHES RX_ENABLE, so that test submitted a capture descriptor
+         * to a disabled direction.
+         *
+         * Both ways round, because "memory changed" is only evidence if it
+         * does not also change with the direction switched off.
+         */
+        unsigned pass;
+
+        Serial.println("\n--- does the DMA touch memory? capture, both ways");
+        for (pass = 0; pass < 2; pass++) {
+            unsigned i, changed = 0, first = 0;
+            unsigned long start;
+            int done = 0;
+
+            for (i = 0; i < CAP_BYTES / 4; i++)
+                capbuf[i] = 0xA5000000u | i;      /* address-derived */
+
+            if (pass)
+                sl6806_mmio_set(SL6806_AUD_RX_ENABLE, SL6806_AUD_TX_EN_BIT);
+            else
+                sl6806_mmio_clr(SL6806_AUD_RX_ENABLE, SL6806_AUD_TX_EN_BIT);
+
+            Serial.printf("  RX enable %s -> +0x200 = %08x\n",
+                          pass ? "SET  " : "clear",
+                          (unsigned)sl6806_mmio_read(SL6806_AUD_RX_ENABLE));
+
+            if (sl6806_audio_capture(capbuf, CAP_BYTES) != 0) {
+                Serial.println("    capture REJECTED - not a measurement");
+                continue;
+            }
+            start = micros();
+            while (micros() - start < 60000ul)
+                if (sl6806_audio_capture_done()) { done = 1; break; }
+
+            for (i = 0; i < CAP_BYTES / 4; i++)
+                if (capbuf[i] != (0xA5000000u | i)) {
+                    if (!changed)
+                        first = i;
+                    changed++;
+                }
+            Serial.printf("    %s after %lu us, %u of %u words changed",
+                          done ? "completed" : "TIMED OUT",
+                          (unsigned long)(micros() - start),
+                          changed, (unsigned)(CAP_BYTES / 4));
+            if (changed)
+                Serial.printf(", first at %u: %08x\n", first,
+                              (unsigned)capbuf[first]);
+            else
+                Serial.println();
+            settle();
+        }
+        Serial.println("  changed with RX SET and not clear -> the DMA really");
+        Serial.println("  moves memory, and only the pacing is missing.");
+        Serial.println("  unchanged both ways -> the length is a counter and");
+        Serial.println("  nothing has ever been transferred. That would retract");
+        Serial.println("  the linearity argument in docs/AUDIO.md.");
+        phase = -1;
+        break;
+    }
 
     default:
         /* Reachable only if a phase key exists with no case. Say so. */

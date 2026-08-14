@@ -1108,3 +1108,56 @@ Two gaps, and the second is the larger:
    plausibly the coefficient load rather than pacing — but "plausibly" is how
    four wrong conclusions in this file started, so the sketch now reads it and
    prints whether bit 31 is set.
+
+### [M] Everything on the list is now negative — and the linearity argument does not prove what it claimed
+
+The full sweep, all with a verified two-length instrument and readback on every
+applied change:
+
+| Tried | Result |
+|---|---|
+| four output routes, three source modes | 2270× |
+| all 32 bits of `0x400E0000` | 2270× |
+| bit clock divider, all 8 fields | 2270× |
+| module 2, bare off/on | 2270× |
+| module 2, the vendor's cycle **with both `delay(10)`s** | 2270× |
+| bit clock `0x40080094` **bit 4**, clear and set | 2270× |
+| the vendor's wider clock chain (romclk 0/31/56, module 87, `0x4009B000`) | 2270× |
+| audio PLL | already correct |
+
+And `+0x40C` reads `0x02200000` — **bit 31 clear**, so the vendor skips its
+twenty-one extra calls in this state too. That is not an untried difference; it
+is no difference at all.
+
+#### [!] The linearity argument is weaker than this document now claims
+
+The retraction above says: *a descriptor retired without doing anything takes
+constant time; completion is linear in length; therefore data moves.* **That
+does not follow.** Two things are linear in length:
+
+1. a DMA reading N bytes of SRAM at bus speed;
+2. a hardware **length counter** decrementing at bus speed, reading nothing.
+
+Linearity proves the block *processes the length*. It does not prove it touches
+RAM. The retraction of "nothing is transferred" was right to reject the old
+480 MB/s reasoning — that was computed against the wrong clock — but it
+replaced it with a conclusion its evidence does not carry.
+
+Only a test that **observes memory** separates the two, and a TX engine cannot
+be caught in the act; RX can. The single capture test ever run is already
+recorded here as weak, and the reason is now exact: `sl6806_audio_begin()` sets
+`TX_ENABLE` bit 0 at `sl6806_audio.c:154` and **never touches `RX_ENABLE`**, so
+that test submitted a capture descriptor to a disabled direction.
+
+`ToneDemo` phase `f` runs it properly — an address-derived pattern in a
+dedicated buffer, `RX_ENABLE` bit 0 set, and the same test repeated with it
+clear, because "memory changed" is only evidence if it does not also change
+with the direction switched off.
+
+| Outcome | Meaning |
+|---|---|
+| changed with RX set, unchanged with it clear | the DMA really moves memory; only the pacing is missing, and the retraction stands on proper evidence |
+| unchanged both ways | the length is a counter and nothing has ever been transferred — which would retract the retraction |
+
+That is the question this block has actually been sitting on since the
+beginning, and nothing has ever asked it with the capture direction enabled.
