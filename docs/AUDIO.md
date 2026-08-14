@@ -1161,3 +1161,50 @@ with the direction switched off.
 
 That is the question this block has actually been sitting on since the
 beginning, and nothing has ever asked it with the capture direction enabled.
+
+### [M] Capture never runs — and phase `f` answered a different question than it asked
+
+```
+RX enable clear -> +0x200 = 02300700   TIMED OUT after 60081 us, 0 of 512 changed
+RX enable SET   -> +0x200 = 02300701   TIMED OUT after 60082 us, 0 of 512 changed
+```
+
+Two findings, and a flaw in the test.
+
+**The capture direction does not retire at all.** 60 ms, no completion flag,
+against a TX direction that retires in 10 µs. That asymmetry is itself
+informative: a generic length counter would retire on *both* directions, since
+it is the same mechanism one page apart. So TX's retire is not simply a
+counter running down.
+
+**`+0x200` bit 0 does not clear.** The second run of the phase read `02300701`
+on its "clear" row, so both rows had RX enabled and its control was not a
+control. Only the first run's pair is valid. The sketch now prints the register
+beside the intent and flags a row whose write did not take, because reporting
+what was *meant* rather than what *happened* is how a non-control gets read as
+a control.
+
+**And the test cannot answer its own question.** Watching a capture buffer says
+nothing about whether the DMA reads memory when the direction being watched
+never runs. `f` established that RX does not work; it did not establish
+anything about TX.
+
+#### The test it should have been: vary the source, not the destination
+
+The question is whether the direction that *does* complete reads its source.
+That needs no second direction and no memory to be written:
+
+> A transfer's time depends on how fast its **source** can be read.
+> A length counter's does not.
+
+Phase `g` submits the same length from three sources of very different speed —
+SRAM, XIP flash (off-chip over SPI, far slower), and the mask ROM. All three
+are plainly readable, so nothing can fault.
+
+| Outcome | Meaning |
+|---|---|
+| times differ by source | the DMA reads memory — settled, and only the pacing is missing |
+| times identical | it reads nothing, the length is a counter, and the retraction in this document is itself retracted |
+
+Same shape as the length sweep that started this, moved to the one variable
+nothing has ever varied.

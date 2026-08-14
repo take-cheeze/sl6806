@@ -298,7 +298,7 @@ void setup()
     Serial.println("'a' state+census  'b' baseline pace  'c' divider sweep"
                    "  'd' module 2 cycle  'e' bit clock bit 4\n"
                    "'f' DOES THE DMA TOUCH MEMORY (capture, RX enabled)"
-                   "  'q' stop");
+                   "  'g' SOURCE MEMORY  'q' stop");
 }
 
 void loop()
@@ -320,12 +320,12 @@ void loop()
      * unhandled key now says so instead of being swallowed.
      */
     if (key >= 0) {
-        if (key >= 'a' && key <= 'f') {
+        if (key >= 'a' && key <= 'g') {
             phase = key;
             step = 0;
             Serial.printf("\n[%c]\n", key);
         } else if (key != '\r' && key != '\n') {
-            Serial.printf("unknown key '%c' - try a b c d e f q\n", key);
+            Serial.printf("unknown key '%c' - try a b c d e f g q\n", key);
             return;
         }
     }
@@ -496,9 +496,17 @@ void loop()
             else
                 sl6806_mmio_clr(SL6806_AUD_RX_ENABLE, SL6806_AUD_TX_EN_BIT);
 
-            Serial.printf("  RX enable %s -> +0x200 = %08x\n",
+            /* [M] Bit 0 of +0x200 does NOT clear: the second run of this
+             * phase read 02300701 on the "clear" row, so both its rows had RX
+             * enabled and its control was not one. Report the register rather
+             * than the intent, so a write that did not take is visible. */
+            Serial.printf("  RX enable %s -> +0x200 = %08x%s\n",
                           pass ? "SET  " : "clear",
-                          (unsigned)sl6806_mmio_read(SL6806_AUD_RX_ENABLE));
+                          (unsigned)sl6806_mmio_read(SL6806_AUD_RX_ENABLE),
+                          (!pass && (sl6806_mmio_read(SL6806_AUD_RX_ENABLE)
+                                     & SL6806_AUD_TX_EN_BIT))
+                              ? "   <- DID NOT CLEAR, this row is not a control"
+                              : "");
 
             if (sl6806_audio_capture(capbuf, CAP_BYTES) != 0) {
                 Serial.println("    capture REJECTED - not a measurement");
@@ -530,6 +538,72 @@ void loop()
         Serial.println("  unchanged both ways -> the length is a counter and");
         Serial.println("  nothing has ever been transferred. That would retract");
         Serial.println("  the linearity argument in docs/AUDIO.md.");
+        phase = -1;
+        break;
+    }
+
+    case 'g': {
+        /*
+         * [!] THE TEST PHASE f SHOULD HAVE BEEN.
+         *
+         * f asked "does the DMA touch memory" by watching a capture buffer.
+         * It could not answer: the capture direction never retires at all -
+         * 60 ms timeout on every row - so watching its destination says
+         * nothing about whether a COMPLETING direction reads its source.
+         *
+         * This asks the same question of the direction that does complete,
+         * and it needs no second direction and no memory to be written.
+         *
+         *   A transfer's time depends on how fast its SOURCE can be read.
+         *   A length counter's does not.
+         *
+         * Same length, three sources at very different speeds: SRAM, XIP
+         * flash - which is off-chip over SPI and far slower than SRAM - and
+         * the mask ROM. All three are plainly readable, so nothing here can
+         * fault.
+         *
+         *   times differ by source  -> the DMA reads memory. Settled.
+         *   times identical         -> it reads nothing, the length is a
+         *                              counter, and the retraction in
+         *                              docs/AUDIO.md is itself retracted.
+         *
+         * This is the same shape as the length sweep that started all this,
+         * moved to the one variable nothing has ever varied.
+         */
+        static const struct { const char *name; uint32_t addr; } src[] = {
+            { "SRAM (wave)",   0 },                 /* filled in below */
+            { "XIP flash",     0x00C10000u },
+            { "mask ROM",      0x00000000u },
+        };
+        unsigned i;
+
+        Serial.println("\n--- does completion depend on the SOURCE memory?");
+        Serial.println("    same length, three sources of very different speed");
+        for (i = 0; i < 3; i++) {
+            uint32_t a = i ? src[i].addr : (uint32_t)(uintptr_t)wave;
+            unsigned long start, us;
+            unsigned n = 0;
+
+            if (sl6806_audio_play((const void *)(uintptr_t)a,
+                                  (uint32_t)sizeof(wave)) != 0) {
+                Serial.printf("    %-12s REJECTED - not a measurement\n",
+                              src[i].name);
+                continue;
+            }
+            start = micros();
+            while ((us = micros() - start) < 60000ul) {
+                n++;
+                if (sl6806_audio_done())
+                    break;
+            }
+            Serial.printf("    %-12s %08x  %lu bytes in %lu us  (%lu B/us)\n",
+                          src[i].name, (unsigned)a,
+                          (unsigned long)sizeof(wave), us,
+                          us ? (unsigned long)(sizeof(wave) / us) : 0ul);
+            settle();
+        }
+        Serial.println("    differ -> it reads memory. identical -> it does not,");
+        Serial.println("    and the linearity argument was measuring a counter.");
         phase = -1;
         break;
     }
