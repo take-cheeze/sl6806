@@ -11,7 +11,7 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
 TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
-         test_regfile test_audio test_bt test_sd test_fat test_uart
+         test_regfile test_audio test_bt test_sd test_fat test_uart test_firm
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -50,6 +50,9 @@ run-test_fat: test_fat
 	./$<
 
 run-test_uart: test_uart
+	./$<
+
+run-test_firm: test_firm
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -126,6 +129,14 @@ test_fat: test_fat.c $(CORE)/sl6806_fat.c
 test_uart: test_uart.c $(CORE)/sl6806_uart.c $(CORE)/sl6806_module.c \
            $(CORE)/sl6806_padctl.c $(CORE)/sl6806_console.c
 	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
+
+# The FIRM header parse. The jump cannot be tested - it ends with the
+# application running and USB gone - so what these cover is everything that
+# decides whether to jump, which is where the damage would be.
+# SL6806_FIRM_HOSTED drops the two device-only functions - the XIP read and
+# the jump, which is Cortex-M inline assembly - and leaves the parse.
+test_firm: test_firm.c $(CORE)/sl6806_firm.c
+	$(CC) $(CFLAGS) -DSL6806_FIRM_HOSTED=1 $^ -o $@
 
 clean:
 	rm -f $(TESTS) *.ppm

@@ -5772,3 +5772,74 @@ solve.
 What is still unproven is the last hop: whether those bytes leave the chip on
 a pin, at a rate and framing something can read. The block accepting them is
 not the same claim.
+
+## 28. Semi-firmware: starting the vendor's application from a payload
+
+`cores/sl6806/sl6806_firm.[ch]` and `examples/FirmBoot`. 15 host tests.
+
+The SD investigation has run out of software experiments (§"the cheap
+software experiments are exhausted"), and the one structural difference left
+between this framework and the code that demonstrably reads cards is that a
+payload runs in **bootloader mode**. Two things measured this session make
+that concrete rather than hand-waving:
+
+- **the mask ROM does not touch the SD host in bootloader mode** — cold
+  registers read zero and writes are dropped until a payload gates it;
+- **it does not touch the serial port either** — both its clocks read
+  disabled on a cold device.
+
+Two blocks the ROM leaves off, both of which a payload can wake, and one of
+which still will not run a command. So the question is what else bootloader
+mode withholds, and the cheapest way to ask it is to leave.
+
+### What it does
+
+```
+read the FIRM header from XIP 0x00C10000
+copy its segment to SRAM
+set VTOR, set MSP from vector 0
+branch to the entry
+```
+
+**Nothing persistent is written.** The application is copied out of the flash
+image already on the device, into RAM, and entered; a power cycle restores
+bootloader mode with nothing changed. That is the whole safety argument, and
+it is why this exists before `MODE=firmware` does — `MODE=firmware` is the one
+thing in this tree that can leave a device that does not boot, and this is the
+half of it that cannot.
+
+### The load address is derived, and then checked
+
+The header names an entry (`+0x14` = `0x00804C01`) and a length (`+0x1C` =
+`0x5862`). It does **not** name a load address: §6 read `+0x10` as
+"loadToRam" and §7m corrected that — the segment opens with a full 256-entry
+vector table, so the load address is the entry less `0x400`, which is
+`0x00804800`, confirmed there by counting which candidate base put SRAM call
+targets on function prologues.
+
+Getting that wrong copies the image `0x400` bytes off and branches into the
+middle of a function: a hard fault with the USB link already gone, no console,
+no message. So the parse derives the load address and then **checks it against
+the image** — the segment's word 1 must be the entry the header named
+(`0x00804C01`), and word 0 must be a plausible SRAM stack pointer
+(`0x0082D63C`). Both hold. A build that disagreed would be refused.
+
+The host tests are all refusals plus one acceptance, because the refusals are
+where the damage would be.
+
+### What a run answers
+
+| Outcome | What it means |
+|---|---|
+| the panel shows the P20 interface | the application boots from a payload — never established before |
+| the host enumerates `301a:2801` and the card mounts | **the socket, the card and the SD host all work under the vendor's firmware**, and §23 becomes "what does bootloader mode withhold" rather than "is the block broken" |
+| nothing | the application needs more of `hardware_init` than this does, and §25's PLL at 384 MHz is the first candidate |
+
+The third outcome is the likeliest first result and is not a failure: this
+deliberately does *not* replicate `hardware_init`, so that a working boot
+tells you the ROM's own state was sufficient, and a dead one tells you which
+part of §24's phase list to add next.
+
+The observable is the device and the USB bus, not the console — the
+application re-initialises USB as a card reader, so the link is gone the
+moment it starts.
