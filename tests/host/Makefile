@@ -11,7 +11,7 @@ CFLAGS := -std=gnu11 -Wall -Wextra -O1 -g -fsanitize=address,undefined \
           -I. -I$(CORE) -I$(VARIANT) -include host_stub.h
 
 TESTS := test_console test_gfx test_panel test_lcdc test_adc test_pwm \
-         test_regfile test_audio test_bt test_sd test_fat test_uart test_firm
+         test_regfile test_audio test_bt test_sd test_fat test_uart test_firm test_hwinit
 
 .PHONY: all clean
 all: $(addprefix run-,$(TESTS))
@@ -53,6 +53,9 @@ run-test_uart: test_uart
 	./$<
 
 run-test_firm: test_firm
+	./$<
+
+run-test_hwinit: test_hwinit
 	./$<
 
 test_console: test_console.c $(CORE)/sl6806_console.c
@@ -137,6 +140,12 @@ test_uart: test_uart.c $(CORE)/sl6806_uart.c $(CORE)/sl6806_module.c \
 # the jump, which is Cortex-M inline assembly - and leaves the parse.
 test_firm: test_firm.c $(CORE)/sl6806_firm.c
 	$(CC) $(CFLAGS) -DSL6806_FIRM_HOSTED=1 $^ -o $@
+
+# The PLL rate decode and the two masked writes. Both would be silently
+# wrong on hardware: a bad decode gives a plausible number, and a widened
+# mask clears a field nothing here knows the meaning of.
+test_hwinit: test_hwinit.c $(CORE)/sl6806_hwinit.c
+	$(CC) $(CFLAGS) -DSL6806_MMIO_HOOKED $^ -o $@
 
 clean:
 	rm -f $(TESTS) *.ppm

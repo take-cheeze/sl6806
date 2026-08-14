@@ -5843,3 +5843,58 @@ part of §24's phase list to add next.
 The observable is the device and the USB bus, not the console — the
 application re-initialises USB as a card reader, so the link is gone the
 moment it starts.
+
+## 29. The other half of semi-firmware: build the environment, do not leave for it
+
+`examples/FirmBoot` (§28) answers "does the product work" and costs
+everything — USB, the console, and the ability to upload another sketch. The
+inverse is more useful for the question actually open: **perform the parts of
+the bootloader's `hardware_init` a payload can perform, and return.**
+
+`cores/sl6806/sl6806_hwinit.[ch]` is the first piece, the PLL:
+
+```
+sl6806_pll_hz()       ROM 0x1FB8's decode: ((v >> 8) & 0xFF) * 48 / (v & 0xF) MHz
+sl6806_pll_set_384()  ROM 0x1F6C's two masked writes, verified by that decode
+```
+
+11 host tests, covering the decode and — more importantly — that the two
+writes preserve the fields the vendor's masks preserve. `0xFC1F0000` and
+`0x00003800` are not "clear everything"; they keep fields nothing in this
+project understands, and widening either would clear one silently.
+
+### Why the PLL is the last software hypothesis for §23
+
+Seven are closed by measurement. What survives is that a payload runs in
+bootloader mode, and this session established that state is genuinely
+different rather than merely suspicious: the mask ROM leaves **both** the SD
+host and the serial port switched off there, and both come up when a payload
+gates them — but only one of them then works.
+
+**Nothing has ever started the PLL from a payload.** The bootloader sets it
+to 384 MHz before touching any peripheral (§25). If the SD command state
+machine is fed from a domain that PLL drives, a payload is asking it to shift
+48 bits out with nothing to shift them on, and the measured behaviour is
+exactly that: the command register takes the word, the busy bit drops inside
+300 ns, the status register says nothing.
+
+`examples/SdWithPll` sends CMD0, sets the PLL, and sends CMD0 again.
+
+It may take the console with it — nothing establishes where the boot ROM
+clocks USB from — so it says everything first and then reports whether it
+still has a console, which is itself a measurement nobody has taken. Either
+way it is recoverable by unplugging, and nothing writes flash.
+
+### And this is the answer to "can sketches stay uploadable"
+
+Not while the vendor's application runs: there is one USB device and the
+application takes it, re-enumerating as a card reader. `MODE=firmware` has
+the same property by construction.
+
+But that was the wrong thing to want. What a payload needs is not to *be* the
+firmware, it is the environment the firmware runs in — and §24's phase list
+says what that environment consists of, one step at a time, each of which can
+be performed in place. The PLL is the first and the most likely to matter.
+The console at `0x40091000` is the second, and is already driven. What is
+left of `hardware_init` after those two is `0x00820DF8(24)`, `0x00820284`,
+and ROM `0x3BFC` — all still unread.
