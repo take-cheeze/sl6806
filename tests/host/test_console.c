@@ -156,8 +156,13 @@ static void test_wraparound(void)
 
 static void test_overflow_reported(void)
 {
-    char buf[8192];
-    char big[SL6806_CONSOLE_SIZE + 500];
+    /* Static and ring-sized: these two tests are the only ones that have to
+     * hold an entire ring, and the ring is now 64 KB (sl6806_console.h). A
+     * fixed 8 KB buffer silently truncated the drain and made the assertion
+     * below fail for a reason that had nothing to do with the console - which
+     * is exactly what happened when the ring grew. */
+    static char buf[SL6806_CONSOLE_SIZE + 512];
+    static char big[SL6806_CONSOLE_SIZE + 500];
 
     reset();
     memset(big, 'z', sizeof(big));
@@ -180,7 +185,7 @@ static void test_overflow_reported(void)
 
     /* Only the most recent SL6806_CONSOLE_SIZE bytes survive. */
     reset();
-    char tagged[SL6806_CONSOLE_SIZE + 16];
+    static char tagged[SL6806_CONSOLE_SIZE + 16];
     memset(tagged, '.', sizeof(tagged));
     memcpy(tagged + sizeof(tagged) - 5, "TAIL!", 5);
     sl6806_console_write((const uint8_t *)tagged, sizeof(tagged));
@@ -194,8 +199,8 @@ static void test_overflow_reported(void)
 
 static void test_oversized_single_write(void)
 {
-    char buf[8192];
-    char huge[SL6806_CONSOLE_SIZE * 3];
+    static char buf[SL6806_CONSOLE_SIZE + 512];
+    static char huge[SL6806_CONSOLE_SIZE * 3];
 
     reset();
     memset(huge, 'q', sizeof(huge));

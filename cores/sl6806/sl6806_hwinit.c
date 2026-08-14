@@ -40,3 +40,20 @@ int sl6806_pll_set_384(void)
 
     return sl6806_pll_hz() == SL6806_PLL_TARGET_HZ;
 }
+
+uint32_t sl6806_pll_set_divider(unsigned d)
+{
+    uint32_t v;
+
+    if (d == 0u || d > 0xFu)
+        return 0u;
+
+    /* Read-modify-write the divider alone. Every other bit of this register
+     * is either the multiplier, the lock (bit 28, §17) or something nobody
+     * here has decoded, and clearing any of them to set four bits would be
+     * the mistake §30 already recorded once. */
+    v = sl6806_mmio_read(SL6806_PLL_STATUS);
+    sl6806_mmio_write(SL6806_PLL_STATUS, (v & ~0xFu) | (uint32_t)d);
+
+    return sl6806_pll_hz();
+}

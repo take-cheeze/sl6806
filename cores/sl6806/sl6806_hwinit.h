@@ -110,6 +110,30 @@ uint32_t sl6806_pll_hz(void);
  */
 int sl6806_pll_set_384(void);
 
+/*
+ * Set the PLL's divider field directly, in the register whose rate readback
+ * is confirmed - `0x40080000` bits [3:0]. The rate is `m * 48 / d` MHz, so
+ * with the measured m = 8 a divider of 2 is 192 MHz and 1 is 384.
+ *
+ * This exists because sl6806_pll_set_384() writes what the vendor writes and
+ * that provably does not move this register (§30). Writing the field the
+ * readback actually reads is the blunt alternative, and it is the one that
+ * can be checked: the return value is the rate afterwards, in Hz, read back
+ * through the same decode. Zero means the write did not take.
+ *
+ * ⚠ **This changes the core clock.** At m = 8, going from d = 2 to d = 1
+ * doubles it: every delay() in flight becomes half as long, millis() runs at
+ * twice the rate, and anything the boot ROM clocks from the same tree - USB
+ * very much included - is asked to keep up. Recoverable by unplugging, but
+ * call it last, after everything has been printed and flushed.
+ *
+ * [M] Why you might want to: examples/FirmBoot starts the stock application
+ * and its USB came up unstable (§30a). The bootloader sets 384 MHz before it
+ * starts anything, this does not, and a USB clock divided from the wrong PLL
+ * rate is exactly what unstable enumeration looks like.
+ */
+uint32_t sl6806_pll_set_divider(unsigned d);
+
 #ifdef __cplusplus
 }
 #endif

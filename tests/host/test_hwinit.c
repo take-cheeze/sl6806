@@ -40,6 +40,7 @@ uint32_t sl6806_mmio_read(uint32_t addr)
 
 void sl6806_mmio_write(uint32_t addr, uint32_t value)
 {
+    if (addr == SL6806_PLL_STATUS) { status = value; return; }
     if (addr == SL6806_PLL_CTRL) { ctrl = value; return; }
     if (addr == SL6806_PLL_MUL)  { mul = value; return; }
 }
@@ -79,6 +80,20 @@ int main(void)
 
     status = 0;
     CHECK(sl6806_pll_set_384() == 0, "and it reports failure when it does not");
+
+    printf("setting the divider directly\n");
+    /* The register the readback actually reads. Model it as writable so the
+     * arithmetic is checked; on hardware the return value says whether it
+     * took. */
+    status = (8u << 8) | 2u | 0xD0010000u;
+    CHECK(sl6806_pll_set_divider(1) == 384000000u,
+          "divider 1 with multiplier 8 is 384 MHz");
+    CHECK((status & 0xFFFFFFF0u) == 0xD0010800u,
+          "and every other bit survived - multiplier, lock, and the rest");
+    CHECK(sl6806_pll_set_divider(2) == 192000000u, "divider 2 is back to 192");
+    CHECK(sl6806_pll_set_divider(0) == 0u, "a zero divider is refused, not written");
+    CHECK((status & 0xFu) == 2u, "and the register was left alone");
+    CHECK(sl6806_pll_set_divider(16) == 0u, "so is one that does not fit the field");
 
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
