@@ -173,7 +173,7 @@ void setup()
     sl6806_audio_clock_start(1);
     Serial.println("'b' baseline  'm' module ids  'r' romclk ids"
                    "  'c' census the audio block\n"
-                   "'a' does TX_ADDR ADVANCE?  'q' stop");
+                   "'a' TX_ADDR advance  'x' BUS CONTENTION  'q' stop");
 }
 
 void loop()
@@ -183,11 +183,11 @@ void loop()
     if (!up)
         return;
     if (key == 'q') { phase = -1; Serial.println("stopped."); return; }
-    if (key == 'b' || key == 'm' || key == 'r' || key == 'c' || key == 'a') {
+    if (key == 'b' || key == 'm' || key == 'r' || key == 'c' || key == 'a' || key == 'x') {
         phase = key; idx = 0; hits = 0; announced = false;
         Serial.printf("\n[%c]\n", key);
     } else if (key >= 0 && key != '\r' && key != '\n') {
-        Serial.printf("unknown key '%c' - try b m r c a q\n", key);
+        Serial.printf("unknown key '%c' - try b m r c a x q\n", key);
         return;
     }
     if (phase < 0)
@@ -347,6 +347,73 @@ void loop()
             Serial.println("    ADVANCED BY THE LENGTH - IT READS MEMORY.");
         else
             Serial.println("    moved, but not by the length - worth explaining");
+        phase = -1;
+        break;
+    }
+
+    case 'x': {
+        /*
+         * BUS CONTENTION - the one detector that depends on no register
+         * semantics whatever.
+         *
+         * Every other test has been undone by an assumption about a register:
+         * the source comparison by an address field that silently truncates,
+         * the capture test by a direction that never retires, the address
+         * advance by engines that keep the programmed base and walk a shadow
+         * pointer - which is why "unchanged" is weak evidence and not proof.
+         *
+         * This one asks the bus instead. 4796 bytes in 9 us is ~533 MB/s of
+         * SRAM traffic. A CPU loop reading SRAM at the same moment cannot help
+         * but slow down if that traffic is real, and cannot be affected at all
+         * if the block is only counting a register down.
+         *
+         *   loop slower during a transfer  -> the DMA is really moving data
+         *   loop identical                 -> it is not touching the bus
+         *
+         * The longest descriptor the length field takes is used, to make the
+         * window as wide as possible: 65532 bytes is ~123 us, comfortably
+         * longer than the loop below.
+         */
+        volatile uint32_t sink = 0;
+        unsigned long idle, busy;
+        unsigned i, k;
+
+        Serial.println("\n--- bus contention: does a transfer slow the CPU?");
+
+        /* Calibrate: the same loop with nothing in flight. */
+        idle = micros();
+        for (k = 0; k < 8; k++)
+            for (i = 0; i < TESTLEN / 4; i++)
+                sink += ((volatile uint32_t *)wave)[i];
+        idle = micros() - idle;
+
+        settle();
+
+        /* And again with the largest transfer the descriptor allows running
+         * underneath it. Started first so the window covers the loop. */
+        if (sl6806_audio_play(wave, 0xFFFCu) != 0) {
+            Serial.println("    play() refused 0xFFFC - not a measurement");
+            phase = -1;
+            break;
+        }
+        busy = micros();
+        for (k = 0; k < 8; k++)
+            for (i = 0; i < TESTLEN / 4; i++)
+                sink += ((volatile uint32_t *)wave)[i];
+        busy = micros() - busy;
+        (void)sl6806_audio_done();
+        settle();
+
+        Serial.printf("    idle %6lu us   during transfer %6lu us   %+ld%%\n",
+                      idle, busy,
+                      idle ? (long)((busy * 100ul) / idle) - 100l : 0l);
+        if (busy > idle + (idle / 20u) + 2u) {
+            Serial.println("    SLOWED - the DMA is contending for the bus, so it");
+            Serial.println("    really moves data and the question is pacing.");
+        } else {
+            Serial.println("    identical - no bus traffic. The block counts the");
+            Serial.println("    length down and never reaches memory.");
+        }
         phase = -1;
         break;
     }

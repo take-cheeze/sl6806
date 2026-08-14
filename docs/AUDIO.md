@@ -1606,3 +1606,45 @@ phase `a`.
 Other unwritten fields the census turned up, for later: `+0x000` bits [11:0]
 and [31:26]; `+0x108` bits 2, 5, 6 and [31:16] beyond the length; `+0x200` and
 `+0x208` broadly. The `unwritten` column of each row is the search space.
+
+### [M] TX_ADDR does not advance — but that is weak evidence, not proof
+
+```
+before 00837980   after 00837980   delta 0   (len 4796, 9 us)
+```
+
+Consistent with the engine not walking the buffer. **It is not proof of it.**
+Many DMA engines keep the *programmed* base in the register and walk an
+internal shadow pointer; "unchanged" is what a non-fetching counter and an
+ordinary base-preserving DMA both look like. An **advance** would have been
+proof; the absence of one is not, and saying otherwise would be the same
+over-claim this document has had to withdraw four times.
+
+So the tally on "does the DMA read memory":
+
+| test | outcome |
+|---|---|
+| source-speed comparison | **void** — the address field truncated flash to SRAM |
+| capture into a patterned buffer | **inconclusive** — RX never retires |
+| does TX_ADDR advance | **weak** — negative, but a base-preserving engine looks identical |
+
+It is genuinely unresolved.
+
+### The one detector left that assumes nothing about a register
+
+Every test so far has been undone by an assumption about a register: the source
+comparison by an address field that silently truncates, the capture test by a
+direction that never retires, the address test by engines that keep their base.
+
+**Bus contention** asks the bus instead. 4796 bytes in 9 µs is ~533 MB/s of
+SRAM traffic; a CPU loop reading SRAM at the same moment cannot help but slow if
+that traffic is real, and cannot be affected at all if the block is only
+counting a register down.
+
+| result | meaning |
+|---|---|
+| the loop slows during a transfer | the DMA really moves data, and the question is pacing after all |
+| the loop is identical | it never reaches memory, and the counter model stands on evidence that does not depend on any register's meaning |
+
+`examples/AudioFetch` phase `x`, using the longest descriptor the length field
+accepts (65532 bytes, ~123 µs) so the window comfortably covers the loop.
