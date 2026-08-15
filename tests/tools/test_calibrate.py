@@ -201,31 +201,35 @@ def test_round_frequencies():
 
 # ------------------------------------------------------------- the whole tool
 #
-# WHY THE FAKE DEVICES BELOW ARE SHELL AND NOT PYTHON
+# HOW FAST A FAKE DEVICE STARTS IS PART OF WHAT THESE TESTS MEASURE
 #
 # The tool spawns its `smtlink_dump` once per poll, and refuses to report from
-# fewer than 8 samples. The tests give it a fixed wall-clock budget - 3 or 4
-# seconds - so the number of samples it manages is entirely a question of how
-# fast one fake device runs, and the margin is thinner than it looks.
+# fewer than 8 samples. The tests give it a fixed wall-clock budget, so the
+# number of samples it manages is entirely a question of how fast one fake
+# device runs, and the margin is thinner than it looks.
 #
-# These fakes used to be Python. A CPython start plus its imports is ~70 ms on
-# an idle developer machine, which fits ~14 polls into 3 s once the poll
-# interval is paid too. That was enough locally and not enough on a loaded CI
-# runner: on 2026-08-15 `test_a_frozen_counter_distinguishes_junk_from_ungated`
-# failed on GitHub Actions with three empty-stdout checks, because the run
-# collected fewer than 8 samples and the tool exited through
-# "only %d samples - not enough to measure anything" - which goes to *stderr*,
-# leaving the stdout the checks search completely empty. The same commit passed
-# on a re-run, which is what a timing race looks like.
+# Both fakes were Python. A CPython start plus its imports is ~70 ms on an idle
+# developer machine, which fits ~38 polls into 3 s. The floor is 8, so the
+# margin was about 5x, and a loaded shared runner eats 5x without trying. On
+# 2026-08-15 `test_a_frozen_counter_distinguishes_junk_from_ungated` failed on
+# GitHub Actions with three checks reporting empty output, because the run
+# collected fewer than 8 samples and the tool exited through "only %d samples -
+# not enough to measure anything", which goes to *stderr*: stdout is then empty
+# and the checks that search it have nothing to find. The same commit passed on
+# a re-run, which is what a timing race looks like.
 #
-# A POSIX shell fake starts in ~2 ms, so the same 3 s holds hundreds of polls
-# and the tests stop racing the machine. Nothing about what is being tested
-# changes - these emit the same status packets as before, byte for byte.
+# The frozen fake below is therefore POSIX shell, ~5.7 ms per spawn, so the
+# same 3 s holds ~191 samples. What is left of the budget is mostly the poll
+# interval the test asks for, which no machine can take away. It emits the same
+# status packet as the Python version did, byte for byte.
 #
-# Keeping them honest: the packing is `printf` with octal escapes, one escape
-# per byte, little-endian, and `$(( ))` arithmetic is 64-bit on every shell
-# this repository targets. `esc` is where a mistake would hide, so the
-# round-trip test below decodes what a fake actually writes.
+# FAKE_TOOL stayed Python on purpose - see the note above it. Converting a fake
+# that has to simulate a *clock* traded a timing race for a worse problem.
+#
+# Packing bytes in shell is where a silent mistake would hide, so
+# test_the_shell_fakes_pack_the_bytes_they_claim_to decodes what the fake
+# actually writes with the tool's own parser. `$(( ))` arithmetic is 64-bit on
+# every shell this repository targets.
 
 FAKE_PREAMBLE = r'''#!/bin/sh
 # Argument shape, from sl6806_dev.Device._run:
@@ -242,29 +246,48 @@ esc() {
 }
 '''
 
-FAKE_TOOL = FAKE_PREAMBLE + r'''
-# A fake smtlink_dump: one SL6806 running at exactly HZ, in bootloader mode.
-HZ=%(hz)d
-[ $(( $4 )) -eq %(addr)d ] || { echo "fake: nothing at $4" >&2; exit 1; }
+#
+# THIS ONE STAYS PYTHON, AND THE ATTEMPT TO CONVERT IT IS WHY THE NOTE EXISTS.
+#
+# It simulates a device running at a known clock, so unlike the frozen fake it
+# needs a timebase, and the whole point of the test is that the tool recovers
+# that clock to within 2%. A shell version was tried and measured 2.58% fast
+# on CI: `date` is another fork in the critical path and reads CLOCK_REALTIME
+# rather than a monotonic clock, and the tool's fit sees the difference.
+# time.monotonic() sampled once per poll is worth ~70 ms of startup here.
+#
+# Its own sample-count margin is the one this file otherwise worries about,
+# and it is handled by the duration below rather than by making the fake
+# cheaper - see test_end_to_end_against_a_simulated_device.
+FAKE_TOOL = r'''#!/usr/bin/env python3
+"""A fake smtlink_dump: one SL6806 running at exactly HZ, in bootloader mode."""
+import os, struct, sys, time
 
-now=$(date +%%s%%N)
-if [ -f "$STATE" ]; then
-    read t0 polls < "$STATE"
-    polls=$(( polls + 1 ))
-else
-    t0=$now
-    polls=1
-fi
-echo "$t0 $polls" > "$STATE"
+HZ = %(hz)d
+STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
 
-# Nanoseconds at full precision without overflowing: whole seconds and the
-# remainder are scaled separately, so the product never leaves 64-bit range.
-el=$(( now - t0 ))
-cycles=$(( HZ * (el / 1000000000) + HZ * (el %% 1000000000) / 1000000000 ))
+args = sys.argv[1:]
+if args[:2] != ["chip", "6806"]:
+    sys.exit("fake: unexpected invocation %%r" %% args)
+cmd, addr, size, out = args[2], int(args[3], 16), int(args[4], 16), args[5]
+if cmd != "read_mem2":
+    sys.exit("fake: unexpected command " + cmd)
 
-printf "$(esc %(magic)d)$(esc %(ver)d)$(esc $(( cycles & 4294967295 )))\
-$(esc $(( cycles >> 32 )))$(esc $polls)$(esc 0)$(esc 120000000)$(esc 2)\
-$(esc %(mask)d)$(esc %(raw)d)" > "$6"
+now = time.monotonic()
+if os.path.exists(STATE):
+    t0, polls = open(STATE).read().split()
+    t0, polls = float(t0), int(polls) + 1
+else:
+    t0, polls = now, 1
+open(STATE, "w").write("%%r %%d" %% (t0, polls))
+
+if addr != %(addr)d:
+    sys.exit("fake: nothing at 0x%%08X" %% addr)
+
+cycles = int(round(HZ * (now - t0)))
+open(out, "wb").write(struct.pack(
+    "<10I", %(magic)d, %(ver)d, cycles & 0xFFFFFFFF, cycles >> 32,
+    polls, 0, 120000000, 2, %(mask)d, %(raw)d)[:size])
 '''
 
 
@@ -279,9 +302,13 @@ def test_end_to_end_against_a_simulated_device():
                                  "mask": 0xFFFFFFFF, "raw": 0x1000})
         os.chmod(fake, 0o755)
 
+        # 8 s rather than the 4 s this used to ask for. The floor is 8 samples
+        # and a Python fake costs ~70 ms a poll, so 4 s was about a 7x margin -
+        # the same margin the frozen test had when it lost the race on CI. The
+        # extra seconds also tighten the fit this test is actually about.
         r = subprocess.run(
             [sys.executable, CALIBRATE, "--tool", fake, "--no-sudo", "--json",
-             "--duration", "4", "--interval", "0.05"],
+             "--duration", "8", "--interval", "0.05"],
             capture_output=True, text=True)
 
     if r.returncode != 0 or not r.stdout.strip():
@@ -290,7 +317,7 @@ def test_end_to_end_against_a_simulated_device():
         return
 
     got = json.loads(r.stdout)
-    check(got["samples"] >= 8, "only %d samples in 4 s", got["samples"])
+    check(got["samples"] >= 8, "only %d samples in 8 s", got["samples"])
     check(got["consistent"], "a well-behaved simulated device came out "
                              "inconsistent")
     err = abs(got["hz"] - hz) / hz
