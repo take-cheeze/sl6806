@@ -314,11 +314,154 @@ typedef struct {
  * the upper half is the same registers decoded twice rather than a second
  * channel. Worth knowing before anyone reads `+0x84` as a separate control.
  */
-#define SL6806_DVP_DMA_CTRL         0x30    /* [I] bits 0, 1, 3            */
+/*
+ * =====================================================================
+ *  [M] +0x30 IS NOT A LATCH - P20, 2026-08-15, examples/DvpDma
+ * =====================================================================
+ * The census above could not have found this, because it wrote each bit and
+ * read it back in the same breath. Every value below reads back correctly at
+ * 0 ms. Read the register again a millisecond later, with nothing else
+ * touching it, and some of the bits have cleared themselves:
+ *
+ *     write   1 ms later     write   1 ms later
+ *     0x1  -> 0x0            0x9  -> 0x9
+ *     0x2  -> 0x2            0xA  -> 0xA
+ *     0x8  -> 0x8            0xB  -> 0x9
+ *     0x3  -> 0x0
+ *
+ * All seven combinations, 107 rounds, across a power cycle and two different
+ * destination buffers: 749 readings, zero variance. Two rules cover every
+ * row and nothing contradicts them:
+ *
+ *     bit 0 clears itself, UNLESS bit 3 is set - then it stays.
+ *     bit 1 clears itself IF bit 0 is set - otherwise it stays.
+ *
+ * A bit that clears itself was cleared by hardware, and which bits clear
+ * depends on what the others hold. That is sequential logic, and it is the
+ * first thing established about this cluster that is not just "the register
+ * accepts a write". It reads naturally as bit 0 being a one-shot "go" that
+ * the block consumes, bit 3 holding it set (a continuous or enable mode),
+ * and bit 1 a second command taken at the same moment - but those names are
+ * [I]. The two rules are what was measured.
+ *
+ * IT DOES NOT MEAN A BYTE MOVED. The destination buffer never changed in any
+ * of the 749 readings, ADDR never advanced and LEN never counted down. On
+ * this board the sensor has never started and its outputs sit in Hi-Z, so a
+ * capture engine has no pixels to write and an unchanged buffer cannot tell
+ * a dead engine from a live one that was handed nothing. What clears a bit
+ * might be a transfer completing, a descriptor being refused, or an
+ * interlock with no data path involved at all.
+ */
+#define SL6806_DVP_DMA_CTRL         0x30    /* [M] bits 0, 1, 3; see above */
 #define SL6806_DVP_DMA_LEN24        0x34    /* [I] 24 bits                 */
 #define SL6806_DVP_DMA_ADDR         0x38    /* [M] SRAM pointer, [19:2]    */
 #define SL6806_DVP_DMA_LEN20        0x3C    /* [I] 20 bits                 */
 #define SL6806_DVP_ALIAS            0x80    /* [M] the block repeats here  */
+
+/* [M] +0x38's writable span, from the DvpProbe census: the top nibble is
+ * fixed at the SRAM base and only [19:2] takes writes - 1 MB at 4-byte
+ * alignment. */
+#define SL6806_DVP_SRAM_BASE        0x00800000u
+#define SL6806_DVP_SRAM_SPAN        (1u << 20)
+#define SL6806_DVP_DMA_ADDR_MASK    0x000FFFFCu
+
+/* [I] +0x3C's field, sized to match +0x38's 20-bit span - the best-supported
+ * reading of "a length over the same span". +0x34 is left alone by the
+ * driver below: the census cannot tell a byte count from a second address,
+ * and writing a length into what might be an address is a worse guess than
+ * writing nothing. */
+#define SL6806_DVP_DMA_LEN_MASK     0x000FFFFFu
+
+/* [M] The three writable bits of +0x30, from the census.
+ *
+ * START is all three, which was chosen when nothing was known about any of
+ * them and there was no vendor sequence to transcribe. The hardware run
+ * above refines what that does without yet justifying a different value:
+ * write 0x0B and the block settles to 0x09, consuming bit 1 and keeping
+ * bit 0 because bit 3 holds it.
+ *
+ * 0x09 is therefore the state a started descriptor actually rests in, and
+ * writing it directly is a plausible alternative default - but "plausible"
+ * is not a reason to change a driver's contract, and nothing has yet shown
+ * either value moving a byte. Use sl6806_dvp_capture_start_bits() to try
+ * one; this stays as it was until something discriminates. */
+#define SL6806_DVP_DMA_CTRL_MASK    0x0Bu
+#define SL6806_DVP_DMA_CTRL_START   SL6806_DVP_DMA_CTRL_MASK
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * sl6806_dvp_capture_start() - point the +0x30..0x3C cluster at a buffer
+ * and set every writable CTRL bit.
+ *
+ * This is this driver's own convention, not a transcription: address, then
+ * length, then start, matching the order every other DMA-shaped block in
+ * this tree uses (see sl6806_audio.c), because nothing in the vendor's own
+ * code ever touches these four registers to copy.
+ *
+ * dst must be a word-aligned address inside the chip's 1 MB SRAM span, and
+ * len must be a nonzero multiple of 4 that fits the 20-bit length field.
+ * Returns 0 on a syntactically valid request, -1 on a rejected one - neither
+ * says whether the hardware moves a single byte, which no register in this
+ * cluster reports (see sl6806_dvp_capture_writable()).
+ */
+int sl6806_dvp_capture_start(void *dst, uint32_t len);
+
+/*
+ * The same arm, with the caller choosing which of +0x30's three writable
+ * bits to set. sl6806_dvp_capture_start() is this with every bit set, which
+ * is a guess: the census says bits 0, 1 and 3 take writes and says nothing
+ * about what any one of them means, so setting all three cannot tell an
+ * enable from a start from a mode bit. Sweeping them one at a time can.
+ *
+ * ctrl must be nonzero and within SL6806_DVP_DMA_CTRL_MASK; anything else is
+ * refused, because a write to a bit the census measured as not sticking
+ * cannot support a conclusion either way.
+ */
+int sl6806_dvp_capture_start_bits(void *dst, uint32_t len, uint32_t ctrl);
+
+/* Clears the CTRL bits this driver sets. Does not touch ADDR or the length
+ * registers, so a stopped descriptor can be re-armed with the same
+ * geometry by calling sl6806_dvp_capture_start() again. */
+void sl6806_dvp_capture_stop(void);
+
+/*
+ * The write-and-read-back proof, same discipline as
+ * sl6806_audio_writable(): a gated block reads zero and drops every write,
+ * so a plausible-looking register proves nothing on its own. This writes a
+ * distinguishing test pattern into ADDR and the length field, reads it back,
+ * and restores whatever sl6806_dvp_capture_start() (or the cold reset value)
+ * held before returning. 1 if the descriptor registers hold what they are
+ * given, 0 if the block is gated or otherwise drops the write.
+ */
+int sl6806_dvp_capture_writable(void);
+
+/* Read back what the descriptor registers currently hold, decoded to plain
+ * values rather than the raw fixed-base/masked-field encoding. */
+void *sl6806_dvp_capture_addr(void);
+uint32_t sl6806_dvp_capture_len(void);
+
+/*
+ * +0x30 raw and unmasked, which is the point of it. This cluster has no
+ * known completion flag, so the buffer's contents were the only witness
+ * this driver had - and a buffer that does not change is a weak negative
+ * when nothing says whether the engine ever started.
+ *
+ * The register itself is a second witness and a better-behaved one. Written
+ * with the trigger and read straight back it answers a question the census
+ * could not: a value that comes back unchanged is an inert latch, one that
+ * self-clears was consumed by hardware, and a bit outside
+ * SL6806_DVP_DMA_CTRL_MASK appearing on its own is a status flag the census
+ * could not see (it only ever tested which bits accept a write - see the
+ * audio block's TRIG bit 0, which is real and reads back 0).
+ */
+uint32_t sl6806_dvp_capture_ctrl(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* [V] What the SENSOR's own init enables, which the DVP path does not  */
