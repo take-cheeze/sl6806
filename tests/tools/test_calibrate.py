@@ -200,36 +200,71 @@ def test_round_frequencies():
 
 
 # ------------------------------------------------------------- the whole tool
+#
+# WHY THE FAKE DEVICES BELOW ARE SHELL AND NOT PYTHON
+#
+# The tool spawns its `smtlink_dump` once per poll, and refuses to report from
+# fewer than 8 samples. The tests give it a fixed wall-clock budget - 3 or 4
+# seconds - so the number of samples it manages is entirely a question of how
+# fast one fake device runs, and the margin is thinner than it looks.
+#
+# These fakes used to be Python. A CPython start plus its imports is ~70 ms on
+# an idle developer machine, which fits ~14 polls into 3 s once the poll
+# interval is paid too. That was enough locally and not enough on a loaded CI
+# runner: on 2026-08-15 `test_a_frozen_counter_distinguishes_junk_from_ungated`
+# failed on GitHub Actions with three empty-stdout checks, because the run
+# collected fewer than 8 samples and the tool exited through
+# "only %d samples - not enough to measure anything" - which goes to *stderr*,
+# leaving the stdout the checks search completely empty. The same commit passed
+# on a re-run, which is what a timing race looks like.
+#
+# A POSIX shell fake starts in ~2 ms, so the same 3 s holds hundreds of polls
+# and the tests stop racing the machine. Nothing about what is being tested
+# changes - these emit the same status packets as before, byte for byte.
+#
+# Keeping them honest: the packing is `printf` with octal escapes, one escape
+# per byte, little-endian, and `$(( ))` arithmetic is 64-bit on every shell
+# this repository targets. `esc` is where a mistake would hide, so the
+# round-trip test below decodes what a fake actually writes.
 
-FAKE_TOOL = r'''#!/usr/bin/env python3
-"""A fake smtlink_dump: one SL6806 running at exactly HZ, in bootloader mode."""
-import os, struct, sys, time
+FAKE_PREAMBLE = r'''#!/bin/sh
+# Argument shape, from sl6806_dev.Device._run:
+#   $1 chip   $2 6806   $3 read_mem2   $4 addr   $5 size   $6 outfile
+[ "$1" = chip ] && [ "$2" = 6806 ] || { echo "fake: bad invocation" >&2; exit 1; }
+[ "$3" = read_mem2 ] || { echo "fake: unexpected command $3" >&2; exit 1; }
+STATE="$(dirname "$0")/state"
 
-HZ = %(hz)d
-STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
+# One little-endian u32 as four octal escapes, for a printf format string.
+esc() {
+    printf '\\%%03o\\%%03o\\%%03o\\%%03o' \
+        $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) \
+        $(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 ))
+}
+'''
 
-args = sys.argv[1:]
-if args[:2] != ["chip", "6806"]:
-    sys.exit("fake: unexpected invocation %%r" %% args)
-cmd, addr, size, out = args[2], int(args[3], 16), int(args[4], 16), args[5]
-if cmd != "read_mem2":
-    sys.exit("fake: unexpected command " + cmd)
+FAKE_TOOL = FAKE_PREAMBLE + r'''
+# A fake smtlink_dump: one SL6806 running at exactly HZ, in bootloader mode.
+HZ=%(hz)d
+[ $(( $4 )) -eq %(addr)d ] || { echo "fake: nothing at $4" >&2; exit 1; }
 
-now = time.monotonic()
-if os.path.exists(STATE):
-    t0, polls = open(STATE).read().split()
-    t0, polls = float(t0), int(polls) + 1
-else:
-    t0, polls = now, 1
-open(STATE, "w").write("%%r %%d" %% (t0, polls))
+now=$(date +%%s%%N)
+if [ -f "$STATE" ]; then
+    read t0 polls < "$STATE"
+    polls=$(( polls + 1 ))
+else
+    t0=$now
+    polls=1
+fi
+echo "$t0 $polls" > "$STATE"
 
-if addr != 0x53544154:
-    sys.exit("fake: nothing at 0x%%08X" %% addr)
+# Nanoseconds at full precision without overflowing: whole seconds and the
+# remainder are scaled separately, so the product never leaves 64-bit range.
+el=$(( now - t0 ))
+cycles=$(( HZ * (el / 1000000000) + HZ * (el %% 1000000000) / 1000000000 ))
 
-cycles = int(round(HZ * (now - t0)))
-open(out, "wb").write(struct.pack(
-    "<10I", 0x54415453, %(ver)d, cycles & 0xFFFFFFFF, cycles >> 32,
-    polls, 0, 120000000, 2, %(mask)d, %(raw)d)[:size])
+printf "$(esc %(magic)d)$(esc %(ver)d)$(esc $(( cycles & 4294967295 )))\
+$(esc $(( cycles >> 32 )))$(esc $polls)$(esc 0)$(esc 120000000)$(esc 2)\
+$(esc %(mask)d)$(esc %(raw)d)" > "$6"
 '''
 
 
@@ -240,6 +275,7 @@ def test_end_to_end_against_a_simulated_device():
         fake = os.path.join(d, "smtlink_dump")
         with open(fake, "w") as f:
             f.write(FAKE_TOOL % {"hz": hz, "ver": cal.STAT_VERSION,
+                                 "magic": cal.STAT_MAGIC, "addr": cal.STAT_ADDR,
                                  "mask": 0xFFFFFFFF, "raw": 0x1000})
         os.chmod(fake, 0o755)
 
@@ -350,19 +386,63 @@ def test_the_poll_rate_stays_inside_a_counter_wrap():
           "a device with no counter should not divide by zero")
 
 
-FAKE_FROZEN = r'''#!/usr/bin/env python3
-"""A device whose cycle counter never advances - what a real SL6806 does."""
-import os, struct, sys
+FAKE_FROZEN = FAKE_PREAMBLE + r'''
+# A device whose cycle counter never advances - what a real SL6806 does.
+polls=1
+[ -f "$STATE" ] && polls=$(( $(cat "$STATE") + 1 ))
+echo "$polls" > "$STATE"
 
-STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state")
-args = sys.argv[1:]
-size, out = int(args[4], 16), args[5]
-polls = (int(open(STATE).read()) if os.path.exists(STATE) else 0) + 1
-open(STATE, "w").write(str(polls))
-open(out, "wb").write(struct.pack(
-    "<10I", 0x54415453, %(ver)d, 0, 0, polls, 0, 120000000, 0,
-    %(mask)d, %(raw)d)[:size])
+printf "$(esc %(magic)d)$(esc %(ver)d)$(esc 0)$(esc 0)$(esc $polls)$(esc 0)\
+$(esc 120000000)$(esc 0)$(esc %(mask)d)$(esc %(raw)d)" > "$6"
 '''
+
+
+def test_the_shell_fakes_pack_the_bytes_they_claim_to():
+    """The fixtures are shell now, so their packing is testable and untested.
+
+    Every other test here reads a fake device through the whole tool, which
+    means a mis-packed byte surfaces as a confusing empty stdout rather than
+    as "the fake is wrong". This decodes what a fake actually writes, with
+    the tool's own parser, so `esc` cannot drift silently.
+    """
+    with tempfile.TemporaryDirectory(prefix="sl6806cal.") as d:
+        fake = os.path.join(d, "smtlink_dump")
+        with open(fake, "w") as f:
+            f.write(FAKE_FROZEN % {"ver": cal.STAT_VERSION, "mask": 0xFFFFFFFF,
+                                   "magic": cal.STAT_MAGIC, "raw": 0xDEADBEEF})
+        os.chmod(fake, 0o755)
+        out = os.path.join(d, "r.bin")
+        r = subprocess.run([fake, "chip", "6806", "read_mem2",
+                            hex(cal.STAT_ADDR), hex(cal.STAT_LEN), out],
+                           capture_output=True, text=True)
+        data = None
+        if os.path.isfile(out):
+            with open(out, "rb") as f:
+                data = f.read()
+
+    check(r.returncode == 0, "the fake exited %d: %s", r.returncode, r.stderr)
+    check(data is not None, "the fake wrote no output file at all")
+    if r.returncode != 0 or data is None:
+        return
+
+    check(len(data) == cal.STAT_LEN,
+          "the fake wrote %d bytes, the tool asks for %d",
+          len(data), cal.STAT_LEN)
+
+    st = cal.parse_stat(data)
+    check(st is not None, "the tool's own parser rejected the fake's packet")
+    if st is None:
+        return
+    # The high bits are the ones a byte-order or masking slip would lose.
+    check(st["tick_raw"] == 0xDEADBEEF,
+          "tick_raw round-tripped as 0x%08X", st["tick_raw"])
+    check(st["tick_mask"] == 0xFFFFFFFF,
+          "tick_mask round-tripped as 0x%08X", st["tick_mask"])
+    check(st["version"] == cal.STAT_VERSION, "version %r", st["version"])
+    check(st["f_cpu"] == 120000000, "f_cpu %r", st["f_cpu"])
+    check(st["cycles"] == 0, "a frozen counter should read 0, got %r",
+          st["cycles"])
+    check(st["polls"] == 1, "first poll should be 1, got %r", st["polls"])
 
 
 def frozen_run(mask, raw):
@@ -370,7 +450,7 @@ def frozen_run(mask, raw):
         fake = os.path.join(d, "smtlink_dump")
         with open(fake, "w") as f:
             f.write(FAKE_FROZEN % {"ver": cal.STAT_VERSION, "mask": mask,
-                                   "raw": raw})
+                                   "magic": cal.STAT_MAGIC, "raw": raw})
         os.chmod(fake, 0o755)
         return subprocess.run(
             [sys.executable, CALIBRATE, "--tool", fake, "--no-sudo",
